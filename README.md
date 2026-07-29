@@ -72,8 +72,52 @@ Ripple gets smarter the more you use it:
 - **Consumer graph** — Builds a persistent map of which services depend on which APIs. Updates on every push.
 - **Multi-invoker detection** — Warns when a shared config/schema has multiple consumers (prevents the "I deleted a block and broke an unrelated service" problem).
 - **Pattern playbooks** — Knows that proto changes also affect `*_pb2.py`, `*.pb.go`, and test files.
+- **Custom playbooks** — Define your own patterns in `.ripple.yaml` (see below).
 
 Result: 3x better consumer detection than grep alone.
+
+## Custom Playbooks
+
+Add a `.ripple.yaml` to your repo root to teach Ripple about YOUR codebase:
+
+```yaml
+playbooks:
+  - name: "Our API gateway"
+    trigger:
+      files: ["api/openapi.yaml"]
+      change_types: ["added_required_field", "removed_field"]
+    consumers:
+      - pattern: "sdk/python/**/*.py"
+        confidence: 0.95
+        reason: "Python SDK wraps this API"
+      - pattern: "sdk/node/**/*.ts"
+        confidence: 0.95
+        reason: "Node SDK wraps this API"
+      - pattern: "tests/integration/**/*"
+        confidence: 0.85
+        reason: "Integration tests call this API"
+
+  - name: "Database migrations"
+    trigger:
+      files: ["db/migrations/*.sql", "prisma/schema.prisma"]
+      change_types: ["*"]
+    consumers:
+      - pattern: "src/models/**/*"
+        confidence: 0.90
+        reason: "ORM models mirror DB schema"
+
+ignore:
+  - "*.lock"
+  - "node_modules/**"
+  - "dist/**"
+
+settings:
+  min_confidence: 0.6
+  auto_learn: true
+  max_prs_per_push: 10
+```
+
+Get the template: `GET /config/template`
 
 ## Supported Contracts
 

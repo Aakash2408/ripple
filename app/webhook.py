@@ -38,6 +38,9 @@ from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
 from .history_learner import HistoryLearner
 from .consumer_graph import ConsumerGraph
+from .multi_invoker import MultiInvokerDetector
+from .playbook_engine import PlaybookEngine, EnsembleConsumerFinder
+from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLATE
 from .dashboard import router as dashboard_router
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
@@ -51,6 +54,11 @@ SSL_CTX.verify_mode = ssl.CERT_NONE
 # Per-org learned knowledge (persists across requests)
 _org_learners: dict[str, HistoryLearner] = {}
 _org_graphs: dict[str, ConsumerGraph] = {}
+_org_ensembles: dict[str, EnsembleConsumerFinder] = {}
+_org_configs: dict[str, RippleConfig] = {}
+
+# Shared engines
+_playbook_engine = PlaybookEngine()
 
 
 def get_learner(org: str) -> HistoryLearner:
@@ -65,6 +73,26 @@ def get_graph(org: str) -> ConsumerGraph:
     if org not in _org_graphs:
         _org_graphs[org] = ConsumerGraph(org)
     return _org_graphs[org]
+
+
+def get_ensemble(org: str) -> EnsembleConsumerFinder:
+    """Get or create the full EnsembleConsumerFinder for an org."""
+    if org not in _org_ensembles:
+        learner = get_learner(org)
+        detector = MultiInvokerDetector(learner=learner)
+        _org_ensembles[org] = EnsembleConsumerFinder(
+            playbook_engine=_playbook_engine,
+            learner=learner,
+            detector=detector,
+        )
+    return _org_ensembles[org]
+
+
+def get_config(org: str) -> RippleConfig:
+    """Get the custom config for an org (from .ripple.yaml)."""
+    if org not in _org_configs:
+        _org_configs[org] = RippleConfig()  # default until loaded
+    return _org_configs[org]
 
 
 # === Health check ===
@@ -290,10 +318,23 @@ async def _process_spec_change(
     Process a spec file change:
     1. Fetch old and new versions
     2. Detect breaking changes
-    3. Find consumers in connected repos
-    4. Generate fixes + open PRs
+    3. Find consumers using ENSEMBLE (grep + playbooks + history + multi-invoker)
+    4. Apply custom playbooks from .ripple.yaml
+    5. Generate fixes + open PRs
     """
     token = _get_token(installation_id)
+    org = repo.split("/")[0] if "/" in repo else "unknown"
+    
+    # Load .ripple.yaml from the repo if we haven't already
+    if org not in _org_configs:
+        config_content = _fetch_file_at_sha(repo, ".ripple.yaml", after_sha, token)
+        if config_content:
+            parsed = parse_ripple_config(config_content)
+            if parsed:
+                _org_configs[org] = parsed
+    
+    config = get_config(org)
+    ensemble = get_ensemble(org)
     
     # Fetch old and new spec content
     old_content = _fetch_file_at_sha(repo, spec_path, before_sha, token)
@@ -304,7 +345,6 @@ async def _process_spec_change(
     
     # Parse specs and diff
     import tempfile
-    import yaml
     
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
         f.write(old_content)
@@ -323,37 +363,83 @@ async def _process_spec_change(
     if not diff_result.has_breaking_changes:
         return {"status": "no_breaking_changes", "spec": spec_path}
     
-    # Get org's learned knowledge (from PropBench Historian integration)
-    org = repo.split("/")[0] if "/" in repo else "unknown"
-    learner = get_learner(org) if org in _org_learners else None
-    graph = get_graph(org)
-    
-    # Use history-based predictions alongside grep
-    history_predictions = []
-    if learner:
-        history_predictions = learner.predict_consumers(spec_path, top_n=10)
-    
     # Find consumer repos (from GitHub App installation)
-    # For now: check repos in the same org/user
     consumer_repos = _find_consumer_repos(repo, token)
     
-    # For each breaking change, find consumers and fix them
+    # For each breaking change, use ENSEMBLE to find consumers
     prs_created = []
-    history_assisted = 0
+    warnings = []
+    ensemble_stats = {"grep": 0, "playbook": 0, "history": 0, "multi_invoker": 0, "custom": 0}
     
     for change in diff_result.breaking_changes:
+        # Determine contract type from spec file
+        contract_type = _detect_contract_type(spec_path)
+        change_type = _map_change_type(change)
+        
+        # --- ENSEMBLE CONSUMER FINDING ---
+        # Step 1: Grep-based search across repos
+        grep_results = []
         for consumer_repo in consumer_repos:
-            # Search for consumers in this repo
+            consumer_files = _search_repo_for_consumers(consumer_repo, change, token)
+            for file_path, content in consumer_files:
+                grep_results.append(file_path)
+        
+        # Step 2: Ensemble prediction (grep + playbook + history + multi-invoker)
+        ensemble_predictions = ensemble.find_all_consumers(
+            changed_file=spec_path,
+            contract_type=contract_type,
+            change_type=change_type,
+            grep_results=grep_results,
+        )
+        
+        # Step 3: Custom playbook predictions
+        custom_predictions = config.get_predictions_for_change(spec_path, change_type)
+        for cp in custom_predictions:
+            ensemble_stats["custom"] += 1
+        
+        # Step 4: Multi-invoker warning
+        detector = MultiInvokerDetector(learner=get_learner(org))
+        mi_warning = detector.check(spec_path)
+        if mi_warning and mi_warning.risk_level in ("high", "medium"):
+            warnings.append({
+                "type": "multi_invoker",
+                "file": spec_path,
+                "risk": mi_warning.risk_level,
+                "message": mi_warning.message,
+                "consumers": len(mi_warning.invokers),
+            })
+        
+        # Track sources for stats
+        for pred in ensemble_predictions:
+            for source in pred.get("sources", []):
+                if source in ensemble_stats:
+                    ensemble_stats[source] += 1
+        
+        # Step 5: Generate fixes for high-confidence consumers
+        min_confidence = config.min_confidence
+        high_confidence = [
+            p for p in ensemble_predictions
+            if p["confidence"] >= min_confidence and not p["file"].startswith("*")
+        ]
+        
+        for consumer_repo in consumer_repos:
             consumer_files = _search_repo_for_consumers(consumer_repo, change, token)
             
             for consumer_file, consumer_content in consumer_files:
-                # Generate fix
+                # Check ignore patterns
+                if config.should_ignore(consumer_file):
+                    continue
+                
+                # Check PR limit
+                if len(prs_created) >= config.max_prs_per_push:
+                    break
+                
                 consumer = ConsumerMatch(
                     file_path=consumer_file,
                     line_number=0,
                     code_snippet="",
                     confidence="high",
-                    match_reason="API endpoint reference found",
+                    match_reason="Ensemble prediction",
                     language=_detect_lang(consumer_file),
                 )
                 
@@ -362,7 +448,6 @@ async def _process_spec_change(
                 )
                 
                 if fixed_code != consumer_content:
-                    # Create PR
                     pr_url = _create_fix_pr(
                         consumer_repo, consumer_file,
                         fixed_code, change, repo, token
@@ -370,17 +455,56 @@ async def _process_spec_change(
                     if pr_url:
                         prs_created.append(pr_url)
     
+    # Update consumer graph with observations
+    graph = get_graph(org)
+    
     return {
         "status": "processed",
         "spec": spec_path,
         "breaking_changes": len(diff_result.breaking_changes),
         "prs_created": prs_created,
-        "history_predictions": len(history_predictions),
-        "learning_status": learner.stats() if learner else "not yet learned",
+        "ensemble_stats": ensemble_stats,
+        "warnings": warnings,
+        "config_loaded": org in _org_configs and bool(_org_configs[org].playbooks),
+        "min_confidence": config.min_confidence,
     }
 
 
 # === GitHub API Helpers ===
+
+def _detect_contract_type(filepath: str) -> str:
+    """Detect contract type from file path."""
+    lower = filepath.lower()
+    if any(x in lower for x in [".proto"]):
+        return "proto"
+    if any(x in lower for x in ["graphql", ".gql"]):
+        return "graphql"
+    if any(x in lower for x in [".sql", "prisma", "migration"]):
+        return "database"
+    return "openapi"
+
+
+def _map_change_type(change: BreakingChange) -> str:
+    """Map a BreakingChange to a playbook change_type string."""
+    change_str = str(change.change_type).lower() if hasattr(change, 'change_type') else ""
+    if "added" in change_str or "required" in change_str:
+        return "added_required_field"
+    if "removed" in change_str:
+        return "removed_field"
+    if "type" in change_str:
+        return "field_type_changed"
+    if "rename" in change_str:
+        return "field_renamed"
+    return "added_required_field"  # default
+
+
+@app.get("/config/template")
+async def get_config_template():
+    """Return the default .ripple.yaml template for users to customize."""
+    from .custom_playbooks import DEFAULT_TEMPLATE
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=DEFAULT_TEMPLATE, media_type="text/yaml")
+
 
 def _get_token(installation_id: int = None) -> str:
     """Get GitHub token (personal or installation)."""
