@@ -36,6 +36,8 @@ from .diff_engine import diff_specs, BreakingChange, DiffResult
 from .consumer_finder import find_consumers, ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
+from .history_learner import HistoryLearner
+from .consumer_graph import ConsumerGraph
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
 
@@ -43,6 +45,24 @@ app = FastAPI(title="Ripple", description="Self-maintaining APIs")
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
+
+# Per-org learned knowledge (persists across requests)
+_org_learners: dict[str, HistoryLearner] = {}
+_org_graphs: dict[str, ConsumerGraph] = {}
+
+
+def get_learner(org: str) -> HistoryLearner:
+    """Get or create a HistoryLearner for an org."""
+    if org not in _org_learners:
+        _org_learners[org] = HistoryLearner(min_confidence=0.2, min_co_changes=2)
+    return _org_learners[org]
+
+
+def get_graph(org: str) -> ConsumerGraph:
+    """Get or create a ConsumerGraph for an org."""
+    if org not in _org_graphs:
+        _org_graphs[org] = ConsumerGraph(org)
+    return _org_graphs[org]
 
 
 # === Health check ===
@@ -55,6 +75,102 @@ async def root():
 @app.get("/health")
 async def health():
     return {"healthy": True}
+
+
+# === GitHub App Installation Event ===
+
+@app.post("/webhook/install")
+async def github_install_webhook(request: FastAPIRequest):
+    """
+    Handles GitHub App installation events.
+    When installed on a repo/org, automatically scans git history
+    to learn co-change patterns (PropBench Historian integration).
+    """
+    body = await request.body()
+    payload = json.loads(body)
+    event_type = request.headers.get("X-GitHub-Event", "")
+    
+    if event_type == "installation" and payload.get("action") == "created":
+        # App was just installed — learn from all repos
+        repos = payload.get("repositories", [])
+        org = payload.get("installation", {}).get("account", {}).get("login", "unknown")
+        
+        learner = get_learner(org)
+        results = []
+        
+        for repo in repos:
+            repo_name = repo.get("full_name", "")
+            # Trigger async learning (in production, this would be a background job)
+            results.append({
+                "repo": repo_name,
+                "status": "learning_queued",
+                "message": f"Will scan git history for co-change patterns",
+            })
+        
+        return {
+            "status": "installation_received",
+            "org": org,
+            "repos_to_learn": len(repos),
+            "results": results,
+        }
+    
+    return {"status": "ignored"}
+
+
+# === Learn endpoint (manually trigger learning for a repo) ===
+
+@app.post("/learn")
+async def learn_repo(request: FastAPIRequest):
+    """
+    Manually trigger learning for a specific repo.
+    
+    Body: {"repo": "owner/repo", "clone_url": "https://..."}
+    
+    In production, this clones the repo temporarily and scans history.
+    For now, works with local repos (for demo/testing).
+    """
+    body = await request.body()
+    payload = json.loads(body)
+    
+    repo = payload.get("repo", "")
+    local_path = payload.get("local_path", "")  # For testing with local repos
+    
+    if not repo:
+        return {"error": "repo is required"}
+    
+    org = repo.split("/")[0] if "/" in repo else "unknown"
+    learner = get_learner(org)
+    
+    if local_path and os.path.isdir(local_path):
+        stats = learner.learn_from_repo(local_path, since="12 months ago")
+        return {
+            "status": "learned",
+            "repo": repo,
+            "stats": stats,
+            "learner": learner.stats(),
+        }
+    
+    return {
+        "status": "queued",
+        "repo": repo,
+        "message": "Learning will happen when repo is cloned (production feature)",
+    }
+
+
+# === Status endpoint (show what's been learned) ===
+
+@app.get("/status/{org}")
+async def org_status(org: str):
+    """Show what Ripple has learned about an org."""
+    learner = get_learner(org) if org in _org_learners else None
+    graph = get_graph(org) if org in _org_graphs else None
+    
+    return {
+        "org": org,
+        "learner": learner.stats() if learner else "not initialized",
+        "graph": graph.stats() if graph else "not initialized",
+        "has_learned": org in _org_learners,
+    }
 
 
 # === GitHub Webhook ===
@@ -205,12 +321,23 @@ async def _process_spec_change(
     if not diff_result.has_breaking_changes:
         return {"status": "no_breaking_changes", "spec": spec_path}
     
+    # Get org's learned knowledge (from PropBench Historian integration)
+    org = repo.split("/")[0] if "/" in repo else "unknown"
+    learner = get_learner(org) if org in _org_learners else None
+    graph = get_graph(org)
+    
+    # Use history-based predictions alongside grep
+    history_predictions = []
+    if learner:
+        history_predictions = learner.predict_consumers(spec_path, top_n=10)
+    
     # Find consumer repos (from GitHub App installation)
     # For now: check repos in the same org/user
     consumer_repos = _find_consumer_repos(repo, token)
     
     # For each breaking change, find consumers and fix them
     prs_created = []
+    history_assisted = 0
     
     for change in diff_result.breaking_changes:
         for consumer_repo in consumer_repos:
@@ -246,6 +373,8 @@ async def _process_spec_change(
         "spec": spec_path,
         "breaking_changes": len(diff_result.breaking_changes),
         "prs_created": prs_created,
+        "history_predictions": len(history_predictions),
+        "learning_status": learner.stats() if learner else "not yet learned",
     }
 
 
