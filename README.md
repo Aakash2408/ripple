@@ -30,9 +30,6 @@ $ ripple run old-spec.yaml new-spec.yaml --repos ./frontend ./mobile ./analytics
 ## Quick Start
 
 ```bash
-# Install
-pip install ripple-api  # coming soon
-
 # Or run from source
 git clone https://github.com/Aakash2408/ripple.git
 cd ripple
