@@ -86,6 +86,7 @@
     <h1>🌊 Ripple</h1>
     <p class="subtitle">When you change an API, we find every consumer and open PRs to fix them. In 15 seconds.</p>
     <a href="https://github.com/apps/ripple-api" class="cta">Install on GitHub</a>
+    <a href="https://github.com/Aakash2408/ripple" class="cta cta-secondary">View Source</a>
     <a href="#demo" class="cta cta-secondary">See it work</a>
     <div class="badges">
         <span class="badge badge-green">✓ 54 tests passing</span>
@@ -96,7 +97,7 @@
 
 <div class="demo" id="demo">
     <div class="demo-box">
-        <span class="comment"># You push a breaking change to your Payments API</span><br>
+        <span class="comment"># You push a breaking change to your API spec</span><br>
         <span class="info">$ git push origin main</span><br>
         <span class="comment"># Added required field 'idempotency_key' to POST /payments</span><br>
         <br>
@@ -107,21 +108,21 @@
         &nbsp;&nbsp;Found 3 consumers across 3 repos<br>
         <br>
         <span class="success">🔧 Generating fixes (validated ✓)...</span><br>
-        &nbsp;&nbsp;✅ ripple-sdk-python/client.py — parameter added<br>
-        &nbsp;&nbsp;✅ ripple-sdk-node/src/client.ts — interface updated<br>
-        &nbsp;&nbsp;✅ ripple-sdk-java/PaymentsClient.java — method signature fixed<br>
+        &nbsp;&nbsp;✅ Python SDK — parameter added to function + payload<br>
+        &nbsp;&nbsp;✅ Node SDK — TypeScript interface updated<br>
+        &nbsp;&nbsp;✅ Java SDK — method signature + JSON serialization fixed<br>
         <br>
         <span class="success">📤 Opening PRs...</span><br>
-        &nbsp;&nbsp;✅ PR #1 in ripple-sdk-python<br>
-        &nbsp;&nbsp;✅ PR #1 in ripple-sdk-node<br>
-        &nbsp;&nbsp;✅ PR #1 in ripple-sdk-java<br>
+        &nbsp;&nbsp;✅ PR opened in Python consumer<br>
+        &nbsp;&nbsp;✅ PR opened in Node consumer<br>
+        &nbsp;&nbsp;✅ PR opened in Java consumer<br>
         <br>
         <span class="success">🌊 Done in 15 seconds. Zero coordination needed.</span>
     </div>
     <div class="proof">
-        <a href="https://github.com/Aakash2408/ripple-sdk-python/pull/1">Python PR →</a>
-        <a href="https://github.com/Aakash2408/ripple-sdk-node/pull/1">Node PR →</a>
-        <a href="https://github.com/Aakash2408/ripple-sdk-java/pull/1">Java PR →</a>
+        <a href="https://github.com/Aakash2408/ripple-sdk-python/pull/1">See the Python fix →</a>
+        <a href="https://github.com/Aakash2408/ripple-sdk-node/pull/1">See the Node fix →</a>
+        <a href="https://github.com/Aakash2408/ripple-sdk-java/pull/1">See the Java fix →</a>
     </div>
 </div>
 
@@ -242,12 +243,12 @@
 <div class="section pricing">
     <h2>Pricing</h2>
     <div class="price-cards">
-        <div class="price-card">
+        <div class="price-card featured">
             <h3>Open Source</h3>
             <div class="price">Free</div>
             <p>Public repos<br>All contract types<br>Community support</p>
         </div>
-        <div class="price-card featured">
+        <div class="price-card">
             <h3>Team</h3>
             <div class="price">$49<span>/mo</span></div>
             <p>Private repos<br>Org-wide scanning<br>Priority support</p>
