@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 ripple/app/consumer_finder.py
 

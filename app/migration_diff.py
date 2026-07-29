@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 ripple/app/migration_diff.py
 
