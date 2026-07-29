@@ -1,0 +1,48 @@
+openapi: "3.0.3"
+info:
+  title: Users API
+  version: "2.0.0"
+paths:
+  /users:
+    post:
+      summary: Create a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - email
+                - country
+              properties:
+                name:
+                  type: string
+                email:
+                  type: string
+                country:
+                  type: string
+                  description: ISO 3166-1 country code
+                age:
+                  type: integer
+      responses:
+        "201":
+          description: User created
+    get:
+      summary: List users
+      responses:
+        "200":
+          description: List of users
+  /users/{id}:
+    get:
+      summary: Get user by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: User details

@@ -1,0 +1,319 @@
+"""
+ripple/app/fix_generator.py
+
+Fix Generator — generates code fixes for consumers affected by API breaking changes.
+
+Uses Claude API to generate minimal, correct fixes.
+Falls back to template-based fixes if no API key.
+
+For the YC demo: the magic moment is seeing actual code diffs appear.
+"""
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from .diff_engine import BreakingChange
+from .consumer_finder import ConsumerMatch
+
+
+@dataclass
+class GeneratedFix:
+    """A generated fix for one consumer file."""
+    consumer: ConsumerMatch
+    original_code: str
+    fixed_code: str
+    explanation: str
+    diff: str             # unified diff format
+
+
+def generate_fix(
+    consumer: ConsumerMatch,
+    breaking_change: BreakingChange,
+    use_llm: bool = True,
+) -> Optional[GeneratedFix]:
+    """
+    Generate a fix for a consumer affected by a breaking change.
+    
+    Strategy:
+    1. Read the full consumer file
+    2. Send to Claude: "This API changed. Fix this consumer code."
+    3. Return the fixed code + diff
+    """
+    # Read the consumer file
+    try:
+        with open(consumer.file_path, "r") as f:
+            original_code = f.read()
+    except IOError:
+        return None
+    
+    if use_llm and os.environ.get("ANTHROPIC_API_KEY"):
+        fixed_code, explanation = _generate_with_llm(
+            original_code, consumer, breaking_change
+        )
+    else:
+        fixed_code, explanation = _generate_with_template(
+            original_code, consumer, breaking_change
+        )
+    
+    if not fixed_code or fixed_code == original_code:
+        return None
+    
+    diff = _compute_diff(original_code, fixed_code, consumer.file_path)
+    
+    return GeneratedFix(
+        consumer=consumer,
+        original_code=original_code,
+        fixed_code=fixed_code,
+        explanation=explanation,
+        diff=diff,
+    )
+
+
+def generate_fixes(
+    consumers: list[ConsumerMatch],
+    breaking_change: BreakingChange,
+    use_llm: bool = True,
+    high_confidence_only: bool = True,
+) -> list[GeneratedFix]:
+    """Generate fixes for all consumers."""
+    fixes = []
+    
+    for consumer in consumers:
+        # Skip low-confidence matches
+        if high_confidence_only and consumer.confidence != "high":
+            continue
+        
+        fix = generate_fix(consumer, breaking_change, use_llm=use_llm)
+        if fix:
+            fixes.append(fix)
+    
+    return fixes
+
+
+def _generate_with_llm(
+    original_code: str,
+    consumer: ConsumerMatch,
+    breaking_change: BreakingChange,
+) -> tuple[str, str]:
+    """Use Claude API to generate the fix."""
+    try:
+        import anthropic
+    except ImportError:
+        print("  ⚠️  anthropic package not installed. Using template fix.")
+        return _generate_with_template(original_code, consumer, breaking_change)
+    
+    client = anthropic.Anthropic()
+    
+    prompt = f"""You are a code assistant. An API has a breaking change. Fix the consumer code.
+
+BREAKING CHANGE:
+- Endpoint: {breaking_change.method.upper()} {breaking_change.path}
+- Change: {breaking_change.change_type}
+- Field: "{breaking_change.field_name}" (type: {breaking_change.field_type})
+- Description: {breaking_change.description}
+
+CONSUMER CODE ({consumer.language}):
+```
+{original_code}
+```
+
+INSTRUCTIONS:
+1. Add the new required field "{breaking_change.field_name}" to the API call.
+2. Add it as a parameter/argument that callers must provide.
+3. Keep the fix minimal — only change what's necessary.
+4. Return ONLY the complete fixed file content, no explanation.
+5. Do NOT add comments explaining the fix.
+
+FIXED CODE:"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        
+        fixed_code = response.content[0].text.strip()
+        
+        # Strip markdown code fences if present
+        if fixed_code.startswith("```"):
+            lines = fixed_code.split("\n")
+            # Remove first and last lines (fences)
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            fixed_code = "\n".join(lines)
+        
+        explanation = f"Added required field '{breaking_change.field_name}' to {breaking_change.method.upper()} {breaking_change.path} call"
+        return fixed_code, explanation
+        
+    except Exception as e:
+        print(f"  ⚠️  LLM error: {e}. Using template fix.")
+        return _generate_with_template(original_code, consumer, breaking_change)
+
+
+def _generate_with_template(
+    original_code: str,
+    consumer: ConsumerMatch,
+    breaking_change: BreakingChange,
+) -> tuple[str, str]:
+    """
+    Template-based fix (no LLM needed).
+    Works for the common case: "add a field to a JSON payload."
+    """
+    field_name = breaking_change.field_name
+    field_type = breaking_change.field_type
+    
+    if breaking_change.change_type != "added_required_field":
+        return original_code, "Unsupported change type for template fix"
+    
+    fixed_code = original_code
+    explanation = ""
+    
+    if consumer.language == "typescript":
+        # Add to interface
+        interface_pattern = re.compile(
+            r'(interface\s+\w+Request\s*\{[^}]*?)(})',
+            re.DOTALL
+        )
+        ts_type = "string" if field_type == "string" else "number" if field_type == "integer" else "any"
+        match = interface_pattern.search(fixed_code)
+        if match:
+            fixed_code = interface_pattern.sub(
+                rf'\1  {field_name}: {ts_type};\n\2',
+                fixed_code
+            )
+        
+        # Add to API call payload — find the object being passed to .post()
+        # Look for the last property in the object literal before the closing }
+        payload_pattern = re.compile(
+            r'(\.post\([^{]*\{[^}]*?)(,?\n\s*\})',
+            re.DOTALL
+        )
+        match = payload_pattern.search(fixed_code)
+        if match:
+            fixed_code = payload_pattern.sub(
+                rf'\1,\n    {field_name}: data.{field_name}\2',
+                fixed_code
+            )
+        
+        explanation = f"Added '{field_name}' to interface and API call payload"
+    
+    elif consumer.language == "python":
+        # Add parameter to function
+        func_pattern = re.compile(
+            r'(def\s+create_\w+\([^)]*?)(,\s*age)',
+            re.DOTALL
+        )
+        match = func_pattern.search(fixed_code)
+        if match:
+            # Insert before the last optional param
+            fixed_code = func_pattern.sub(
+                rf'\1, {field_name}: str\2',
+                fixed_code
+            )
+        else:
+            # Fallback: add before closing paren
+            func_pattern2 = re.compile(r'(def\s+create_\w+\([^)]*?)(\)\s*[-:])')
+            fixed_code = func_pattern2.sub(
+                rf'\1, {field_name}: str\2',
+                fixed_code
+            )
+        
+        # Add to payload dict — insert before closing brace
+        payload_pattern = re.compile(
+            r'(payload\s*=\s*\{[^}]*?)(,?\n\s*\})',
+            re.DOTALL
+        )
+        match = payload_pattern.search(fixed_code)
+        if match:
+            fixed_code = payload_pattern.sub(
+                rf'\1,\n        "{field_name}": {field_name}\2',
+                fixed_code
+            )
+        
+        explanation = f"Added '{field_name}' parameter and included in request payload"
+    
+    elif consumer.language == "java":
+        # Add parameter to method
+        method_pattern = re.compile(
+            r'(public\s+\w+\s+create\w+\([^)]*)',
+            re.DOTALL
+        )
+        match = method_pattern.search(fixed_code)
+        if match:
+            insert_point = match.end()
+            fixed_code = (
+                fixed_code[:insert_point] +
+                f", String {field_name}" +
+                fixed_code[insert_point:]
+            )
+        
+        # Add to JSON payload
+        json_pattern = re.compile(
+            r'(String\.format\(\s*"[^"]*)',
+            re.DOTALL
+        )
+        match = json_pattern.search(fixed_code)
+        if match:
+            # Replace the JSON format string to include new field
+            old_json = match.group(0)
+            # Find the closing } in the JSON template
+            fixed_code = fixed_code.replace(
+                '{"name": "%s", "email": "%s"}',
+                '{"name": "%s", "email": "%s", "' + field_name + '": "%s"}'
+            )
+            # Add the parameter to String.format args
+            fixed_code = fixed_code.replace(
+                "name, email",
+                f"name, email, {field_name}"
+            )
+        
+        explanation = f"Added '{field_name}' parameter and included in JSON payload"
+    
+    else:
+        explanation = "Unsupported language for template fix"
+    
+    return fixed_code, explanation
+
+
+def _compute_diff(original: str, fixed: str, filepath: str) -> str:
+    """Compute a unified diff between original and fixed code."""
+    import difflib
+    
+    original_lines = original.splitlines(keepends=True)
+    fixed_lines = fixed.splitlines(keepends=True)
+    
+    diff = difflib.unified_diff(
+        original_lines,
+        fixed_lines,
+        fromfile=f"a/{filepath}",
+        tofile=f"b/{filepath}",
+        lineterm="",
+    )
+    
+    return "".join(diff)
+
+
+def format_fixes(fixes: list[GeneratedFix]) -> str:
+    """Format generated fixes for display."""
+    if not fixes:
+        return "  No fixes generated."
+    
+    lines = [
+        f"  Generated {len(fixes)} fix(es):",
+        "",
+    ]
+    
+    for i, fix in enumerate(fixes, 1):
+        lines.append(f"  ━━━ Fix [{i}]: {fix.consumer.file_path} ━━━")
+        lines.append(f"  Language: {fix.consumer.language}")
+        lines.append(f"  Explanation: {fix.explanation}")
+        lines.append("")
+        lines.append(fix.diff)
+        lines.append("")
+    
+    return "\n".join(lines)

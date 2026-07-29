@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ripple — Self-Maintaining APIs</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #1a1a1a; line-height: 1.6; }
+        
+        .hero { max-width: 800px; margin: 0 auto; padding: 80px 24px; text-align: center; }
+        h1 { font-size: 3rem; font-weight: 800; margin-bottom: 16px; letter-spacing: -1px; }
+        .subtitle { font-size: 1.3rem; color: #555; margin-bottom: 40px; max-width: 600px; margin-left: auto; margin-right: auto; }
+        
+        .cta { display: inline-block; background: #0066ff; color: white; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 1.1rem; transition: background 0.2s; }
+        .cta:hover { background: #0052cc; }
+        .cta-secondary { background: transparent; color: #0066ff; border: 2px solid #0066ff; margin-left: 12px; }
+        .cta-secondary:hover { background: #f0f7ff; }
+        
+        .demo { max-width: 800px; margin: 0 auto; padding: 40px 24px; }
+        .demo-box { background: #0d1117; color: #e6edf3; border-radius: 12px; padding: 32px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.85rem; line-height: 1.8; overflow-x: auto; }
+        .demo-box .comment { color: #8b949e; }
+        .demo-box .success { color: #3fb950; }
+        .demo-box .warning { color: #d29922; }
+        .demo-box .info { color: #58a6ff; }
+        
+        .features { max-width: 800px; margin: 0 auto; padding: 60px 24px; }
+        .features h2 { font-size: 2rem; margin-bottom: 32px; text-align: center; }
+        .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+        .feature { padding: 24px; border: 1px solid #e0e0e0; border-radius: 12px; }
+        .feature h3 { margin-bottom: 8px; }
+        .feature p { color: #555; font-size: 0.95rem; }
+        
+        .how { max-width: 800px; margin: 0 auto; padding: 60px 24px; text-align: center; }
+        .how h2 { font-size: 2rem; margin-bottom: 32px; }
+        .steps { display: flex; gap: 32px; justify-content: center; flex-wrap: wrap; }
+        .step { flex: 1; min-width: 200px; }
+        .step-num { width: 40px; height: 40px; background: #0066ff; color: white; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; margin-bottom: 12px; }
+        .step h4 { margin-bottom: 8px; }
+        .step p { color: #555; font-size: 0.9rem; }
+        
+        .pricing { max-width: 800px; margin: 0 auto; padding: 60px 24px; text-align: center; }
+        .pricing h2 { font-size: 2rem; margin-bottom: 32px; }
+        .price-cards { display: flex; gap: 24px; justify-content: center; flex-wrap: wrap; }
+        .price-card { border: 1px solid #e0e0e0; border-radius: 12px; padding: 32px 24px; flex: 1; min-width: 200px; max-width: 250px; }
+        .price-card.featured { border-color: #0066ff; box-shadow: 0 4px 12px rgba(0,102,255,0.1); }
+        .price { font-size: 2rem; font-weight: 700; margin: 12px 0; }
+        .price span { font-size: 1rem; color: #555; }
+        
+        .footer { text-align: center; padding: 40px 24px; color: #888; font-size: 0.9rem; }
+        
+        @media (max-width: 600px) {
+            h1 { font-size: 2rem; }
+            .feature-grid { grid-template-columns: 1fr; }
+            .steps { flex-direction: column; align-items: center; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="hero">
+    <h1>🌊 Ripple</h1>
+    <p class="subtitle">When you change an API, we find every consumer and open PRs to fix them. Automatically.</p>
+    <a href="#demo" class="cta">See the Demo</a>
+    <a href="https://github.com/apps/ripple-dev" class="cta cta-secondary">Install on GitHub</a>
+</div>
+
+<div class="demo" id="demo">
+    <div class="demo-box">
+        <span class="comment"># You push a breaking change to your API spec</span><br>
+        <span class="info">$ git push origin main</span><br>
+        <span class="comment"># Added required field 'country' to POST /users</span><br>
+        <br>
+        <span class="warning">⚠️  Ripple detected 1 breaking change:</span><br>
+        &nbsp;&nbsp;POST /users — added required field 'country' (string)<br>
+        <br>
+        <span class="info">🔍 Scanning consumers...</span><br>
+        &nbsp;&nbsp;Found 3 consumers in 3 repos<br>
+        <br>
+        <span class="success">🔧 Generating fixes...</span><br>
+        &nbsp;&nbsp;✅ frontend-client/src/api/users.ts — fixed<br>
+        &nbsp;&nbsp;✅ mobile-backend/services/user_service.py — fixed<br>
+        &nbsp;&nbsp;✅ analytics/src/UserClient.java — fixed<br>
+        <br>
+        <span class="success">📤 Opening PRs...</span><br>
+        &nbsp;&nbsp;✅ PR #12 in frontend-client<br>
+        &nbsp;&nbsp;✅ PR #8 in mobile-backend<br>
+        &nbsp;&nbsp;✅ PR #3 in analytics<br>
+        <br>
+        <span class="success">🌊 Done in 12 seconds.</span>
+    </div>
+</div>
+
+<div class="features">
+    <h2>Why Ripple?</h2>
+    <div class="feature-grid">
+        <div class="feature">
+            <h3>⚡ Instant</h3>
+            <p>Fixes appear seconds after you push, not days after a team discovers the break in production.</p>
+        </div>
+        <div class="feature">
+            <h3>🌐 Multi-language</h3>
+            <p>Generates correct fixes for TypeScript, Python, Java, Go — matches your consumer's language.</p>
+        </div>
+        <div class="feature">
+            <h3>🔍 Auto-discovery</h3>
+            <p>No configuration needed. Ripple finds consumers by scanning your org's repos automatically.</p>
+        </div>
+        <div class="feature">
+            <h3>🧠 Gets smarter</h3>
+            <p>Learns your org's dependency graph over time. The more you use it, the better it predicts.</p>
+        </div>
+    </div>
+</div>
+
+<div class="how">
+    <h2>How it works</h2>
+    <div class="steps">
+        <div class="step">
+            <div class="step-num">1</div>
+            <h4>Install</h4>
+            <p>Add Ripple to your GitHub org. One click, 30 seconds.</p>
+        </div>
+        <div class="step">
+            <div class="step-num">2</div>
+            <h4>Push</h4>
+            <p>Change your API spec as normal. Push to main.</p>
+        </div>
+        <div class="step">
+            <div class="step-num">3</div>
+            <h4>Relax</h4>
+            <p>Ripple opens fix PRs in every affected consumer repo. Review and merge.</p>
+        </div>
+    </div>
+</div>
+
+<div class="pricing">
+    <h2>Pricing</h2>
+    <div class="price-cards">
+        <div class="price-card">
+            <h3>Open Source</h3>
+            <div class="price">Free</div>
+            <p>Public repos<br>Unlimited specs<br>Community support</p>
+        </div>
+        <div class="price-card featured">
+            <h3>Team</h3>
+            <div class="price">$49<span>/mo</span></div>
+            <p>Private repos<br>Org-wide scanning<br>Priority support</p>
+        </div>
+        <div class="price-card">
+            <h3>Enterprise</h3>
+            <div class="price">Custom</div>
+            <p>SSO + audit log<br>Self-hosted option<br>Dedicated support</p>
+        </div>
+    </div>
+</div>
+
+<div class="footer">
+    <p>Built by <a href="https://github.com/Aakash2408">Aakash Sangwan</a> · <a href="https://github.com/Aakash2408/ripple-demo-frontend/pull/1">See a real PR →</a></p>
+</div>
+
+</body>
+</html>
