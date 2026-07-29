@@ -38,8 +38,10 @@ from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
 from .history_learner import HistoryLearner
 from .consumer_graph import ConsumerGraph
+from .dashboard import router as dashboard_router
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
+app.include_router(dashboard_router)
 
 # SSL context for GitHub API calls (Amazon dev desktop fix)
 SSL_CTX = ssl.create_default_context()
