@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ripple — Self-Maintaining APIs</title>
+    <meta name="description" content="When you change an API, Ripple finds every consumer and opens PRs to fix them. Automatically.">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #1a1a1a; line-height: 1.6; }
+        
+        .hero { max-width: 800px; margin: 0 auto; padding: 80px 24px; text-align: center; }
+        h1 { font-size: 3rem; font-weight: 800; margin-bottom: 16px; letter-spacing: -1px; }
+        .subtitle { font-size: 1.3rem; color: #555; margin-bottom: 40px; max-width: 600px; margin-left: auto; margin-right: auto; }
+        
+        .cta { display: inline-block; background: #0066ff; color: white; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 1.1rem; transition: background 0.2s; }
+        .cta:hover { background: #0052cc; }
+        .cta-secondary { background: transparent; color: #0066ff; border: 2px solid #0066ff; margin-left: 12px; }
+        .cta-secondary:hover { background: #f0f7ff; }
+        
+        .badges { margin-top: 24px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+        .badge { display: inline-block; padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+        .badge-green { background: #dcfce7; color: #166534; }
+        .badge-blue { background: #dbeafe; color: #1e40af; }
+        .badge-purple { background: #f3e8ff; color: #6b21a8; }
+        
+        .demo { max-width: 800px; margin: 0 auto; padding: 40px 24px; }
+        .demo-box { background: #0d1117; color: #e6edf3; border-radius: 12px; padding: 32px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.85rem; line-height: 1.8; overflow-x: auto; }
+        .demo-box .comment { color: #8b949e; }
+        .demo-box .success { color: #3fb950; }
+        .demo-box .warning { color: #d29922; }
+        .demo-box .info { color: #58a6ff; }
+        
+        .section { max-width: 800px; margin: 0 auto; padding: 60px 24px; }
+        .section h2 { font-size: 2rem; margin-bottom: 32px; text-align: center; }
+        
+        .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+        .feature { padding: 24px; border: 1px solid #e0e0e0; border-radius: 12px; }
+        .feature h3 { margin-bottom: 8px; }
+        .feature p { color: #555; font-size: 0.95rem; }
+        
+        .contracts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 24px; }
+        .contract { padding: 16px 20px; background: #f8f9fa; border-radius: 8px; display: flex; align-items: center; gap: 12px; }
+        .contract-icon { font-size: 1.5rem; }
+        .contract-name { font-weight: 600; }
+        .contract-status { font-size: 0.8rem; color: #16a34a; font-weight: 500; }
+        
+        .steps { display: flex; gap: 32px; justify-content: center; flex-wrap: wrap; }
+        .step { flex: 1; min-width: 200px; text-align: center; }
+        .step-num { width: 40px; height: 40px; background: #0066ff; color: white; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; margin-bottom: 12px; }
+        .step h4 { margin-bottom: 8px; }
+        .step p { color: #555; font-size: 0.9rem; }
+        
+        .learns { background: #f8f9fa; border-radius: 12px; padding: 32px; margin-top: 24px; }
+        .learns-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .learns-item { display: flex; gap: 12px; }
+        .learns-item strong { display: block; margin-bottom: 4px; }
+        .learns-item p { color: #555; font-size: 0.9rem; margin: 0; }
+        .learns-icon { font-size: 1.3rem; flex-shrink: 0; }
+        
+        .proof { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; margin-top: 24px; }
+        .proof a { padding: 10px 16px; background: #0d1117; color: #e6edf3; border-radius: 8px; text-decoration: none; font-family: monospace; font-size: 0.85rem; transition: opacity 0.2s; }
+        .proof a:hover { opacity: 0.8; }
+
+        .pricing { text-align: center; }
+        .price-cards { display: flex; gap: 24px; justify-content: center; flex-wrap: wrap; }
+        .price-card { border: 1px solid #e0e0e0; border-radius: 12px; padding: 32px 24px; flex: 1; min-width: 200px; max-width: 250px; }
+        .price-card.featured { border-color: #0066ff; box-shadow: 0 4px 12px rgba(0,102,255,0.1); }
+        .price { font-size: 2rem; font-weight: 700; margin: 12px 0; }
+        .price span { font-size: 1rem; color: #555; }
+        
+        .footer { text-align: center; padding: 40px 24px; color: #888; font-size: 0.9rem; border-top: 1px solid #eee; margin-top: 40px; }
+        .footer a { color: #0066ff; text-decoration: none; }
+        
+        @media (max-width: 600px) {
+            h1 { font-size: 2rem; }
+            .feature-grid, .contracts, .learns-grid { grid-template-columns: 1fr; }
+            .steps { flex-direction: column; align-items: center; }
+            .cta-secondary { margin-left: 0; margin-top: 12px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="hero">
+    <h1>🌊 Ripple</h1>
+    <p class="subtitle">When you change an API, we find every consumer and open PRs to fix them. In 15 seconds.</p>
+    <a href="https://github.com/apps/ripple-api" class="cta">Install on GitHub</a>
+    <a href="#demo" class="cta cta-secondary">See it work</a>
+    <div class="badges">
+        <span class="badge badge-green">✓ 54 tests passing</span>
+        <span class="badge badge-blue">✓ 4 contract types</span>
+        <span class="badge badge-purple">✓ Open source</span>
+    </div>
+</div>
+
+<div class="demo" id="demo">
+    <div class="demo-box">
+        <span class="comment"># You push a breaking change to your Payments API</span><br>
+        <span class="info">$ git push origin main</span><br>
+        <span class="comment"># Added required field 'idempotency_key' to POST /payments</span><br>
+        <br>
+        <span class="warning">⚠️  Ripple detected 1 breaking change:</span><br>
+        &nbsp;&nbsp;POST /payments — added required field 'idempotency_key' (string)<br>
+        <br>
+        <span class="info">🔍 Finding consumers (grep + history + playbooks)...</span><br>
+        &nbsp;&nbsp;Found 3 consumers across 3 repos<br>
+        <br>
+        <span class="success">🔧 Generating fixes (validated ✓)...</span><br>
+        &nbsp;&nbsp;✅ ripple-sdk-python/client.py — parameter added<br>
+        &nbsp;&nbsp;✅ ripple-sdk-node/src/client.ts — interface updated<br>
+        &nbsp;&nbsp;✅ ripple-sdk-java/PaymentsClient.java — method signature fixed<br>
+        <br>
+        <span class="success">📤 Opening PRs...</span><br>
+        &nbsp;&nbsp;✅ PR #1 in ripple-sdk-python<br>
+        &nbsp;&nbsp;✅ PR #1 in ripple-sdk-node<br>
+        &nbsp;&nbsp;✅ PR #1 in ripple-sdk-java<br>
+        <br>
+        <span class="success">🌊 Done in 15 seconds. Zero coordination needed.</span>
+    </div>
+    <div class="proof">
+        <a href="https://github.com/Aakash2408/ripple-sdk-python/pull/1">Python PR →</a>
+        <a href="https://github.com/Aakash2408/ripple-sdk-node/pull/1">Node PR →</a>
+        <a href="https://github.com/Aakash2408/ripple-sdk-java/pull/1">Java PR →</a>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Supported Contracts</h2>
+    <div class="contracts">
+        <div class="contract">
+            <span class="contract-icon">📄</span>
+            <div>
+                <div class="contract-name">OpenAPI / Swagger</div>
+                <div class="contract-status">Full pipeline (detect → find → fix → PR)</div>
+            </div>
+        </div>
+        <div class="contract">
+            <span class="contract-icon">⚡</span>
+            <div>
+                <div class="contract-name">Protobuf (gRPC)</div>
+                <div class="contract-status">Breaking change detection + fix</div>
+            </div>
+        </div>
+        <div class="contract">
+            <span class="contract-icon">🔮</span>
+            <div>
+                <div class="contract-name">GraphQL</div>
+                <div class="contract-status">Schema diff + consumer fixing</div>
+            </div>
+        </div>
+        <div class="contract">
+            <span class="contract-icon">🗄️</span>
+            <div>
+                <div class="contract-name">Database Schemas</div>
+                <div class="contract-status">SQL DDL + Prisma migrations</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>It Learns Your Codebase</h2>
+    <p style="text-align: center; color: #555; margin-bottom: 24px;">Ripple gets smarter every time you use it. 3x better consumer detection than grep alone.</p>
+    <div class="learns">
+        <div class="learns-grid">
+            <div class="learns-item">
+                <span class="learns-icon">🧬</span>
+                <div>
+                    <strong>Co-change Learning</strong>
+                    <p>Scans git history on install. If two files always changed together, Ripple knows they're related.</p>
+                </div>
+            </div>
+            <div class="learns-item">
+                <span class="learns-icon">🕸️</span>
+                <div>
+                    <strong>Consumer Graph</strong>
+                    <p>Builds a persistent dependency map. Updates on every push event.</p>
+                </div>
+            </div>
+            <div class="learns-item">
+                <span class="learns-icon">⚠️</span>
+                <div>
+                    <strong>Multi-Invoker Detection</strong>
+                    <p>Warns when a shared config has multiple consumers. Prevents silent breaks.</p>
+                </div>
+            </div>
+            <div class="learns-item">
+                <span class="learns-icon">📋</span>
+                <div>
+                    <strong>Custom Playbooks</strong>
+                    <p>Add a <code>.ripple.yaml</code> to teach Ripple YOUR codebase patterns.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>How it works</h2>
+    <div class="steps">
+        <div class="step">
+            <div class="step-num">1</div>
+            <h4>Install</h4>
+            <p>Add Ripple to your GitHub org. One click, 30 seconds.</p>
+        </div>
+        <div class="step">
+            <div class="step-num">2</div>
+            <h4>Push</h4>
+            <p>Change your API spec as normal. Push to main.</p>
+        </div>
+        <div class="step">
+            <div class="step-num">3</div>
+            <h4>Relax</h4>
+            <p>Fix PRs appear in every affected repo. Review and merge.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Why Ripple?</h2>
+    <div class="feature-grid">
+        <div class="feature">
+            <h3>⚡ Not Dependabot</h3>
+            <p>Dependabot bumps library versions. Ripple fixes YOUR code when YOUR APIs change.</p>
+        </div>
+        <div class="feature">
+            <h3>🔍 Not a linter</h3>
+            <p>Linters find style issues. Ripple finds breaking contract violations across repos.</p>
+        </div>
+        <div class="feature">
+            <h3>🤖 Not AI code review</h3>
+            <p>Code review finds bugs in what you wrote. Ripple fixes what you forgot to update.</p>
+        </div>
+        <div class="feature">
+            <h3>🏗️ Not SDK generation</h3>
+            <p>SDK generators rebuild from scratch. Ripple patches your EXISTING consumer code.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section pricing">
+    <h2>Pricing</h2>
+    <div class="price-cards">
+        <div class="price-card">
+            <h3>Open Source</h3>
+            <div class="price">Free</div>
+            <p>Public repos<br>All contract types<br>Community support</p>
+        </div>
+        <div class="price-card featured">
+            <h3>Team</h3>
+            <div class="price">$49<span>/mo</span></div>
+            <p>Private repos<br>Org-wide scanning<br>Priority support</p>
+        </div>
+        <div class="price-card">
+            <h3>Enterprise</h3>
+            <div class="price">Custom</div>
+            <p>SSO + audit log<br>Self-hosted option<br>Dedicated support</p>
+        </div>
+    </div>
+</div>
+
+<div class="footer">
+    <p>
+        Built by <a href="https://github.com/Aakash2408">Aakash Sangwan</a> · 
+        <a href="https://github.com/Aakash2408/ripple">Source Code</a> · 
+        <a href="https://ripple-production-be7f.up.railway.app/dashboard">Dashboard</a> · 
+        <a href="https://ripple-production-be7f.up.railway.app/docs">API Docs</a>
+    </p>
+</div>
+
+</body>
+</html>
