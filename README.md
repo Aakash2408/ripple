@@ -30,7 +30,7 @@ $ ripple run old-spec.yaml new-spec.yaml --repos ./frontend ./mobile ./analytics
 ## Quick Start
 
 ```bash
-# Or run from source
+# Clone and install
 git clone https://github.com/Aakash2408/ripple.git
 cd ripple
 pip install -r requirements.txt
@@ -47,10 +47,17 @@ uvicorn app.webhook:app --port 8000
 
 ## How It Works
 
-1. **Detect** — Parses OpenAPI specs, finds breaking changes (added required fields, removed fields, renames)
+1. **Detect** — Parses API contracts (OpenAPI, Protobuf, GraphQL, database schemas) and finds breaking changes
 2. **Find** — Scans your org's repos for code that calls the changed endpoint
-3. **Fix** — Generates the minimal code fix for each consumer (TypeScript, Python, Java, Go)
+3. **Fix** — Generates the minimal code fix for each consumer (TypeScript, Python, Java)
 4. **PR** — Opens a pull request with the fix + explanation
+
+## Supported Contracts
+
+- [x] OpenAPI / Swagger
+- [x] Protobuf (gRPC)
+- [x] GraphQL
+- [x] Database schemas (SQL DDL + Prisma)
 
 ## Supported Change Types
 
