@@ -127,6 +127,7 @@ Get the template: `GET /config/template`
 - [x] Protobuf (gRPC)
 - [x] GraphQL
 - [x] Database schemas (SQL DDL + Prisma)
+- [x] AsyncAPI (Kafka, SNS/SQS, RabbitMQ, MQTT, NATS, WebSockets)
 
 ## Supported Change Types
 
@@ -161,6 +162,14 @@ Get the template: `GET /config/template`
 - [x] Column made NOT NULL
 - [x] Table removed
 - [x] Table renamed
+
+**AsyncAPI:**
+- [x] Channel removed (subscribers stop receiving)
+- [x] Message payload field removed
+- [x] Message payload field type changed
+- [x] Required field added to message
+- [x] Message removed from components
+- [x] Server removed (connection config breaks)
 
 ## Supported Languages
 
