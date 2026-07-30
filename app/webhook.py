@@ -49,9 +49,13 @@ from .confidence import format_pr_body, classify_confidence, should_create_pr
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .gitlab_support import GitLabClient, parse_gitlab_push_event, verify_gitlab_signature, create_fix_mr
 from .dashboard import router as dashboard_router
+from .gitlab_setup import router as gitlab_setup_router
+from .gitlab_oauth import router as gitlab_oauth_router
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
 app.include_router(dashboard_router)
+app.include_router(gitlab_setup_router)
+app.include_router(gitlab_oauth_router)
 
 # SSL context for GitHub API calls (Amazon dev desktop fix)
 SSL_CTX = ssl.create_default_context()
