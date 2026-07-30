@@ -45,6 +45,9 @@ from .consumer_graph import ConsumerGraph
 from .multi_invoker import MultiInvokerDetector
 from .playbook_engine import PlaybookEngine, EnsembleConsumerFinder
 from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLATE
+from .confidence import format_pr_body, classify_confidence, should_create_pr
+from .rate_limiter import get_rate_limiter, get_github_rate_tracker
+from .gitlab_support import GitLabClient, parse_gitlab_push_event, verify_gitlab_signature, create_fix_mr
 from .dashboard import router as dashboard_router
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
@@ -241,8 +244,15 @@ async def github_webhook(request: FastAPIRequest):
     if not spec_files:
         return {"status": "ignored", "reason": "no spec files changed"}
     
-    # Process each changed spec
+    # Rate limit check
     repo_full_name = payload["repository"]["full_name"]
+    org = repo_full_name.split("/")[0] if "/" in repo_full_name else "unknown"
+    limiter = get_rate_limiter()
+    allowed, reason = limiter.check(org)
+    if not allowed:
+        return {"status": "rate_limited", "reason": reason, "org": org}
+    
+    # Process each changed spec
     results = []
     
     for spec_path, before_sha, after_sha in spec_files:
@@ -256,6 +266,136 @@ async def github_webhook(request: FastAPIRequest):
         results.append(result)
     
     return {"status": "processed", "results": results}
+
+
+# === GitLab Webhook ===
+
+@app.post("/webhook/gitlab")
+async def gitlab_webhook(request: FastAPIRequest):
+    """
+    Receives GitLab push events and triggers the Ripple pipeline.
+    
+    Setup: Add webhook URL to GitLab project Settings → Webhooks
+    URL: https://your-server/webhook/gitlab
+    Trigger: Push events
+    """
+    body = await request.body()
+    payload = json.loads(body)
+    
+    # Verify GitLab webhook token
+    secret = os.environ.get("GITLAB_WEBHOOK_SECRET", "")
+    token_header = request.headers.get("X-Gitlab-Token", "")
+    if not verify_gitlab_signature(body, secret, token_header):
+        raise HTTPException(status_code=401, detail="Invalid GitLab token")
+    
+    # Only handle push events
+    event_type = request.headers.get("X-Gitlab-Event", "")
+    if event_type != "Push Hook":
+        return {"status": "ignored", "reason": f"event_type={event_type}"}
+    
+    # Parse the event
+    event = parse_gitlab_push_event(payload)
+    
+    # Only handle default branch
+    if event["ref"] != f"refs/heads/{event['default_branch']}":
+        return {"status": "ignored", "reason": "not default branch"}
+    
+    # Rate limit check
+    org = event["project_name"].split("/")[0] if "/" in event["project_name"] else "unknown"
+    limiter = get_rate_limiter()
+    allowed, reason = limiter.check(org)
+    if not allowed:
+        return {"status": "rate_limited", "reason": reason}
+    
+    # Find spec files in changed files
+    spec_files = [f for f in event["changed_files"] if _is_spec_file(f)]
+    if not spec_files:
+        return {"status": "ignored", "reason": "no spec files changed"}
+    
+    # Process each spec change (reuses same diff engines)
+    client = GitLabClient()
+    results = []
+    
+    for spec_path in spec_files:
+        old_content = client.get_file_at_commit(event["project_id"], spec_path, event["before"])
+        new_content = client.get_file_at_commit(event["project_id"], spec_path, event["after"])
+        
+        if not old_content or not new_content:
+            results.append({"spec": spec_path, "status": "error", "reason": "could not fetch versions"})
+            continue
+        
+        # Route to correct diff engine
+        contract_type = _detect_contract_type(spec_path)
+        
+        if contract_type == "proto":
+            breaking_changes = diff_proto(old_content, new_content, file_path=spec_path)
+        elif contract_type == "graphql":
+            breaking_changes = diff_graphql(old_content, new_content, file_path=spec_path)
+        elif contract_type == "database":
+            breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
+        else:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(old_content)
+                old_path = f.name
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(new_content)
+                new_path = f.name
+            diff_result = diff_specs(old_path, new_path)
+            os.unlink(old_path)
+            os.unlink(new_path)
+            breaking_changes = diff_result.breaking_changes
+        
+        if not breaking_changes:
+            results.append({"spec": spec_path, "status": "no_breaking_changes"})
+            continue
+        
+        # Find consumers and create MRs
+        mrs_created = []
+        for change in breaking_changes:
+            # Search for consumers in the same project
+            consumers = client.search_code(event["project_id"], change.path)
+            for consumer in consumers[:5]:
+                consumer_path = consumer.get("path", "")
+                if consumer_path == spec_path:
+                    continue
+                # Fetch consumer content
+                consumer_content = client.get_file(event["project_id"], consumer_path)
+                if consumer_content:
+                    # Generate fix (reuse existing fix generator)
+                    consumer_match = ConsumerMatch(
+                        file_path=consumer_path, line_number=0, code_snippet="",
+                        confidence="high", match_reason="Code search match",
+                        language=_detect_lang(consumer_path),
+                    )
+                    fixed_code, explanation = _generate_with_template(consumer_content, consumer_match, change)
+                    if fixed_code != consumer_content:
+                        mr_url = create_fix_mr(
+                            client, event["project_id"], consumer_path,
+                            fixed_code, f"Add required field '{change.field_name}' to {change.method} {change.path}",
+                            event["project_name"],
+                        )
+                        if mr_url:
+                            mrs_created.append(mr_url)
+                            limiter.record_pr_opened(org)
+        
+        results.append({
+            "spec": spec_path,
+            "status": "processed",
+            "breaking_changes": len(breaking_changes),
+            "mrs_created": mrs_created,
+        })
+    
+    return {"status": "processed", "platform": "gitlab", "results": results}
+
+
+# === Rate Limit Status ===
+
+@app.get("/rate-limit/{org}")
+async def rate_limit_status(org: str):
+    """Check rate limit status for an org."""
+    limiter = get_rate_limiter()
+    return limiter.stats(org)
 
 
 # === Internal Logic ===
