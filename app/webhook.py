@@ -34,6 +34,9 @@ except ImportError:
     raise
 
 from .diff_engine import diff_specs, BreakingChange, DiffResult
+from .proto_diff import diff_proto
+from .graphql_diff import diff_graphql
+from .migration_diff import diff_schema
 from .consumer_finder import find_consumers, ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
@@ -294,17 +297,37 @@ def _find_changed_specs(payload: dict) -> list[tuple[str, str, str]]:
 
 
 def _is_spec_file(filepath: str) -> bool:
-    """Check if a file is likely an OpenAPI spec."""
+    """Check if a file is an API contract (OpenAPI, Proto, GraphQL, or DB schema)."""
     lower = filepath.lower()
-    spec_indicators = [
+    
+    # OpenAPI / Swagger
+    openapi_indicators = [
         "openapi", "swagger", "api-spec", "api_spec",
         "spec.yaml", "spec.yml", "spec.json",
     ]
-    if any(ind in lower for ind in spec_indicators):
+    if any(ind in lower for ind in openapi_indicators):
         return True
-    # Also match common patterns
     if lower.endswith((".yaml", ".yml", ".json")) and "api" in lower:
         return True
+    
+    # Protobuf
+    if lower.endswith(".proto"):
+        return True
+    
+    # GraphQL
+    if lower.endswith((".graphql", ".gql")):
+        return True
+    if "schema" in lower and lower.endswith(".graphql"):
+        return True
+    
+    # Database schemas
+    if lower.endswith((".sql",)) and any(x in lower for x in ["migration", "schema", "ddl"]):
+        return True
+    if "prisma" in lower and lower.endswith(".prisma"):
+        return True
+    if lower.endswith("schema.prisma"):
+        return True
+    
     return False
 
 
@@ -344,24 +367,31 @@ async def _process_spec_change(
     if not old_content or not new_content:
         return {"status": "error", "reason": "could not fetch spec versions"}
     
-    # Parse specs and diff
+    # Parse specs and diff -- route to correct engine based on contract type
     import tempfile
     
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-        f.write(old_content)
-        old_path = f.name
+    contract_type = _detect_contract_type(spec_path)
     
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-        f.write(new_content)
-        new_path = f.name
+    if contract_type == "proto":
+        breaking_changes = diff_proto(old_content, new_content, file_path=spec_path)
+    elif contract_type == "graphql":
+        breaking_changes = diff_graphql(old_content, new_content, file_path=spec_path)
+    elif contract_type == "database":
+        breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
+    else:
+        # OpenAPI — needs temp files (legacy interface)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(old_content)
+            old_path = f.name
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(new_content)
+            new_path = f.name
+        diff_result = diff_specs(old_path, new_path)
+        os.unlink(old_path)
+        os.unlink(new_path)
+        breaking_changes = diff_result.breaking_changes
     
-    diff_result = diff_specs(old_path, new_path)
-    
-    # Clean up temp files
-    os.unlink(old_path)
-    os.unlink(new_path)
-    
-    if not diff_result.has_breaking_changes:
+    if not breaking_changes:
         return {"status": "no_breaking_changes", "spec": spec_path}
     
     # Find consumer repos (from GitHub App installation)
@@ -372,7 +402,7 @@ async def _process_spec_change(
     warnings = []
     ensemble_stats = {"grep": 0, "playbook": 0, "history": 0, "multi_invoker": 0, "custom": 0}
     
-    for change in diff_result.breaking_changes:
+    for change in breaking_changes:
         # Determine contract type from spec file
         contract_type = _detect_contract_type(spec_path)
         change_type = _map_change_type(change)
@@ -462,7 +492,7 @@ async def _process_spec_change(
     return {
         "status": "processed",
         "spec": spec_path,
-        "breaking_changes": len(diff_result.breaking_changes),
+        "breaking_changes": len(breaking_changes),
         "prs_created": prs_created,
         "ensemble_stats": ensemble_stats,
         "warnings": warnings,
