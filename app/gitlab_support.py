@@ -43,12 +43,16 @@ class GitLabClient:
         self.api_url = f"{self.base_url}/api/v4"
     
     def _request(self, method: str, path: str, data: dict = None) -> dict:
-        """Make GitLab API request."""
+        """Make GitLab API request. Supports both PAT and OAuth tokens."""
         url = f"{self.api_url}{path}"
-        headers = {
-            "PRIVATE-TOKEN": self.token,
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        
+        # OAuth tokens (from auth flow) need Bearer auth
+        # Personal Access Tokens (glpat-) use PRIVATE-TOKEN header
+        if self.token.startswith("glpat-"):
+            headers["PRIVATE-TOKEN"] = self.token
+        else:
+            headers["Authorization"] = f"Bearer {self.token}"
         
         body = json.dumps(data).encode() if data else None
         req = Request(url, data=body, headers=headers, method=method)
