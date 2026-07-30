@@ -89,6 +89,25 @@ PLAYBOOKS = [
             {"pattern": "*seed*", "confidence": 0.60, "reason": "Seed/fixture data may reference changed columns"},
         ],
     },
+    {
+        "id": "asyncapi_event_change",
+        "trigger": {
+            "contract_type": "asyncapi",
+            "change_types": ["channel_removed", "message_field_removed", "field_type_changed", "required_field_added", "message_removed", "server_removed"],
+        },
+        "predictions": [
+            {"pattern": "*consumer*", "confidence": 0.90, "reason": "Event consumers parse the changed message payload"},
+            {"pattern": "*handler*", "confidence": 0.90, "reason": "Event handlers process messages from the changed channel"},
+            {"pattern": "*listener*", "confidence": 0.85, "reason": "Event listeners subscribe to the changed channel"},
+            {"pattern": "*subscriber*", "confidence": 0.85, "reason": "Subscribers receive messages from this channel"},
+            {"pattern": "*producer*", "confidence": 0.80, "reason": "Producers publish to the changed channel"},
+            {"pattern": "*publisher*", "confidence": 0.80, "reason": "Publishers must include new required fields"},
+            {"pattern": "*_test.*", "confidence": 0.75, "reason": "Tests with event fixtures need updating"},
+            {"pattern": "*schema*", "confidence": 0.70, "reason": "Schema validation files reference message structure"},
+            {"pattern": "*dto*", "confidence": 0.70, "reason": "DTOs/models mirror message payload structure"},
+            {"pattern": "*avro*", "confidence": 0.65, "reason": "Avro schema files may need updating"},
+        ],
+    },
 ]
 
 
