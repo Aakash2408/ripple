@@ -37,6 +37,7 @@ from .diff_engine import diff_specs, BreakingChange, DiffResult
 from .proto_diff import diff_proto
 from .graphql_diff import diff_graphql
 from .migration_diff import diff_schema
+from .asyncapi_diff import diff_asyncapi
 from .consumer_finder import find_consumers, ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
@@ -352,6 +353,8 @@ async def gitlab_webhook(request: FastAPIRequest):
             breaking_changes = diff_graphql(old_content, new_content, file_path=spec_path)
         elif contract_type == "database":
             breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
+        elif contract_type == "asyncapi":
+            breaking_changes = diff_asyncapi(old_content, new_content, file_path=spec_path)
         else:
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
@@ -487,6 +490,12 @@ def _is_spec_file(filepath: str) -> bool:
     if lower.endswith("schema.prisma"):
         return True
     
+    # AsyncAPI
+    if "asyncapi" in lower:
+        return True
+    if lower.endswith((".yaml", ".yml", ".json")) and any(x in lower for x in ["event", "message", "kafka", "sns", "sqs", "mqtt", "nats", "amqp"]):
+        return True
+    
     return False
 
 
@@ -537,6 +546,8 @@ async def _process_spec_change(
         breaking_changes = diff_graphql(old_content, new_content, file_path=spec_path)
     elif contract_type == "database":
         breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
+    elif contract_type == "asyncapi":
+        breaking_changes = diff_asyncapi(old_content, new_content, file_path=spec_path)
     else:
         # OpenAPI — needs temp files (legacy interface)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
@@ -690,6 +701,8 @@ def _detect_contract_type(filepath: str) -> str:
         return "graphql"
     if any(x in lower for x in [".sql", "prisma", "migration"]):
         return "database"
+    if "asyncapi" in lower or any(x in lower for x in ["event", "kafka", "sns", "sqs", "mqtt", "nats", "amqp"]):
+        return "asyncapi"
     return "openapi"
 
 
