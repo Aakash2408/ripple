@@ -133,6 +133,10 @@ Get the template: `GET /config/template`
 **OpenAPI:**
 - [x] Added required field
 - [x] Removed field
+- [x] Field type changed (string → integer breaks consumers)
+- [x] Endpoint removed (consumers get 404)
+- [x] Response field removed (consumers reading it get null)
+- [x] Required header added (requests rejected without it)
 
 **Protobuf:**
 - [x] Field removed
