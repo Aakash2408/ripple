@@ -317,16 +317,31 @@ async def gitlab_webhook(request: FastAPIRequest):
         return {"status": "ignored", "reason": "no spec files changed"}
     
     # Process each spec change (reuses same diff engines)
-    client = GitLabClient()
+    from .gitlab_oauth import get_token_for_project
+    project_token = get_token_for_project(event["project_id"])
+    # Fallback to env var if OAuth token not available
+    gitlab_token = project_token or os.environ.get("GITLAB_TOKEN", "")
+    client = GitLabClient(token=gitlab_token)
     results = []
     
     for spec_path in spec_files:
-        old_content = client.get_file_at_commit(event["project_id"], spec_path, event["before"])
-        new_content = client.get_file_at_commit(event["project_id"], spec_path, event["after"])
+        # Handle 'before' being all zeros (new branch/first push)
+        before_sha = event["before"]
+        after_sha = event["after"]
+        if before_sha == "0000000000000000000000000000000000000000":
+            # Can't diff against nothing — skip (file was just created, not modified)
+            results.append({"spec": spec_path, "status": "skipped", "reason": "new file (no previous version to diff)"})
+            continue
+        
+        old_content = client.get_file_at_commit(event["project_id"], spec_path, before_sha)
+        new_content = client.get_file_at_commit(event["project_id"], spec_path, after_sha)
         
         if not old_content or not new_content:
-            results.append({"spec": spec_path, "status": "error", "reason": "could not fetch versions"})
-            continue
+            # Try fetching new_content from default branch HEAD
+            new_content = client.get_file(event["project_id"], spec_path, ref=event["default_branch"])
+            if not old_content or not new_content:
+                results.append({"spec": spec_path, "status": "error", "reason": "could not fetch versions"})
+                continue
         
         # Route to correct diff engine
         contract_type = _detect_contract_type(spec_path)
