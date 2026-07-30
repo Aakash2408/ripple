@@ -130,11 +130,33 @@ Get the template: `GET /config/template`
 
 ## Supported Change Types
 
+**OpenAPI:**
 - [x] Added required field
 - [x] Removed field
-- [ ] Renamed field (coming soon)
-- [ ] Type change (coming soon)
-- [ ] Endpoint rename (coming soon)
+
+**Protobuf:**
+- [x] Field removed
+- [x] Field type changed
+- [x] Field number changed (wire incompatibility)
+- [x] Required field added
+- [x] Message removed
+- [x] Message renamed (detected via field overlap)
+
+**GraphQL:**
+- [x] Field removed from type
+- [x] Field made non-nullable (String → String!)
+- [x] Type removed
+- [x] Required argument added
+- [x] Enum value removed
+- [x] Union member removed
+
+**Database:**
+- [x] Column removed
+- [x] Column type changed
+- [x] NOT NULL column added (existing rows fail)
+- [x] Column made NOT NULL
+- [x] Table removed
+- [x] Table renamed
 
 ## Supported Languages
 

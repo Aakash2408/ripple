@@ -112,7 +112,7 @@ def diff_specs(old_path: str, new_path: str) -> DiffResult:
                     description=f"New required field '{field_name}' added to request body. All consumers must include this field.",
                 ))
     
-    # Also detect removed fields (V0.1)
+    # Detect removed fields
     for path, methods in old_paths.items():
         for method, operation in methods.items():
             if method.startswith("x-") or method == "parameters":
@@ -137,6 +137,100 @@ def diff_specs(old_path: str, new_path: str) -> DiffResult:
                     location="request_body",
                     severity="breaking",
                     description=f"Field '{field_name}' was removed from request body. Consumers still sending this field may get errors.",
+                ))
+    
+    # Detect field type changes
+    for path, methods in new_paths.items():
+        for method, operation in methods.items():
+            if method.startswith("x-") or method == "parameters":
+                continue
+            if path not in old_paths or method not in old_paths[path]:
+                continue
+            
+            old_operation = old_paths[path][method]
+            old_props = _get_body_properties(old_operation, old_spec)
+            new_props = _get_body_properties(operation, new_spec)
+            
+            for field_name in set(old_props.keys()) & set(new_props.keys()):
+                old_type = old_props[field_name].get("type", "")
+                new_type = new_props[field_name].get("type", "")
+                if old_type and new_type and old_type != new_type:
+                    result.breaking_changes.append(BreakingChange(
+                        change_type="field_type_changed",
+                        path=path,
+                        method=method,
+                        field_name=field_name,
+                        field_type=f"{old_type} -> {new_type}",
+                        location="request_body",
+                        severity="breaking",
+                        description=f"Field '{field_name}' type changed from '{old_type}' to '{new_type}'. Consumers sending the old type will get validation errors.",
+                    ))
+    
+    # Detect removed endpoints
+    for path, methods in old_paths.items():
+        for method, operation in methods.items():
+            if method.startswith("x-") or method == "parameters":
+                continue
+            if path not in new_paths or method not in new_paths.get(path, {}):
+                result.breaking_changes.append(BreakingChange(
+                    change_type="endpoint_removed",
+                    path=path,
+                    method=method,
+                    field_name=f"{method.upper()} {path}",
+                    field_type="endpoint",
+                    location="path",
+                    severity="breaking",
+                    description=f"Endpoint '{method.upper()} {path}' was removed. All consumers calling this endpoint will get 404.",
+                ))
+    
+    # Detect removed response fields
+    for path, methods in new_paths.items():
+        for method, operation in methods.items():
+            if method.startswith("x-") or method == "parameters":
+                continue
+            if path not in old_paths or method not in old_paths[path]:
+                continue
+            
+            old_operation = old_paths[path][method]
+            old_response_fields = _get_response_fields(old_operation, old_spec)
+            new_response_fields = _get_response_fields(operation, new_spec)
+            
+            removed_response = old_response_fields - new_response_fields
+            for field_name in removed_response:
+                result.breaking_changes.append(BreakingChange(
+                    change_type="response_field_removed",
+                    path=path,
+                    method=method,
+                    field_name=field_name,
+                    field_type="response",
+                    location="response_body",
+                    severity="breaking",
+                    description=f"Response field '{field_name}' was removed. Consumers reading this field will get null/undefined.",
+                ))
+    
+    # Detect required headers added
+    for path, methods in new_paths.items():
+        for method, operation in methods.items():
+            if method.startswith("x-") or method == "parameters":
+                continue
+            
+            new_required_params = _get_required_parameters(operation, new_spec, "header")
+            old_required_params = set()
+            
+            if path in old_paths and method in old_paths[path]:
+                old_required_params = _get_required_parameters(old_paths[path][method], old_spec, "header")
+            
+            added_headers = new_required_params - old_required_params
+            for header_name in added_headers:
+                result.breaking_changes.append(BreakingChange(
+                    change_type="required_header_added",
+                    path=path,
+                    method=method,
+                    field_name=header_name,
+                    field_type="header",
+                    location="parameter",
+                    severity="breaking",
+                    description=f"Required header '{header_name}' added. Requests without this header will be rejected.",
                 ))
     
     return result
@@ -201,6 +295,53 @@ def _get_field_type(operation: dict, spec: dict, field_name: str) -> str:
                 return properties[field_name].get("type", "unknown")
     
     return "unknown"
+
+
+
+def _get_body_properties(operation: dict, spec: dict) -> dict:
+    """Get all properties from request body schema as {name: schema_dict}."""
+    request_body = operation.get("requestBody", {})
+    if "$ref" in request_body:
+        request_body = _resolve_ref(request_body["$ref"], spec)
+    
+    content = request_body.get("content", {})
+    for media_type in ["application/json", "application/x-www-form-urlencoded"]:
+        if media_type in content:
+            schema = content[media_type].get("schema", {})
+            if "$ref" in schema:
+                schema = _resolve_ref(schema["$ref"], spec)
+            return schema.get("properties", {})
+    return {}
+
+
+def _get_response_fields(operation: dict, spec: dict) -> set:
+    """Get all field names from the 200/201 response schema."""
+    responses = operation.get("responses", {})
+    for status in ["200", "201", "2XX"]:
+        if status in responses:
+            response = responses[status]
+            if "$ref" in response:
+                response = _resolve_ref(response["$ref"], spec)
+            content = response.get("content", {})
+            for media_type in ["application/json"]:
+                if media_type in content:
+                    schema = content[media_type].get("schema", {})
+                    if "$ref" in schema:
+                        schema = _resolve_ref(schema["$ref"], spec)
+                    return set(schema.get("properties", {}).keys())
+    return set()
+
+
+def _get_required_parameters(operation: dict, spec: dict, location: str) -> set:
+    """Get required parameter names for a given location (header, query, path)."""
+    params = operation.get("parameters", [])
+    required = set()
+    for param in params:
+        if "$ref" in param:
+            param = _resolve_ref(param["$ref"], spec)
+        if param.get("in") == location and param.get("required", False):
+            required.add(param.get("name", ""))
+    return required
 
 
 def _resolve_ref(ref: str, spec: dict) -> dict:
