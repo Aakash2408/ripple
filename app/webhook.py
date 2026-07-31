@@ -48,6 +48,7 @@ from .playbook_engine import PlaybookEngine, EnsembleConsumerFinder
 from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLATE
 from .confidence import format_pr_body, classify_confidence, should_create_pr
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
+from .retry_queue import get_retry_queue, should_retry, should_retry_error
 from .gitlab_support import GitLabClient, parse_gitlab_push_event, verify_gitlab_signature, create_fix_mr
 from .dashboard import router as dashboard_router
 from .gitlab_setup import router as gitlab_setup_router
@@ -420,6 +421,30 @@ async def rate_limit_status(org: str):
     return limiter.stats(org)
 
 
+@app.get("/retry-queue")
+async def retry_queue_status():
+    """Check retry queue statistics."""
+    queue = get_retry_queue()
+    return queue.stats()
+
+
+@app.get("/retry-queue/dead-letter")
+async def retry_queue_dead_letter():
+    """Inspect failed jobs that exhausted all retries."""
+    queue = get_retry_queue()
+    return {"dead_letter_jobs": queue.dead_letter_jobs()}
+
+
+@app.post("/retry-queue/retry/{job_id}")
+async def retry_dead_letter_job(job_id: str):
+    """Move a dead-lettered job back to the queue for retry."""
+    queue = get_retry_queue()
+    success = queue.retry_dead_letter(job_id)
+    if success:
+        return {"status": "requeued", "job_id": job_id}
+    return JSONResponse(status_code=404, content={"error": f"Job {job_id} not found in dead letter queue"})
+
+
 # === Internal Logic ===
 
 def _verify_signature(request: FastAPIRequest, body: bytes):
@@ -581,7 +606,7 @@ async def _process_spec_change(
         # Step 1: Grep-based search across repos
         grep_results = []
         for consumer_repo in consumer_repos:
-            consumer_files = _search_repo_for_consumers(consumer_repo, change, token)
+            consumer_files = _search_repo_for_consumers(consumer_repo, change, token, exclude_path=spec_path)
             for file_path, content in consumer_files:
                 grep_results.append(file_path)
         
@@ -624,7 +649,7 @@ async def _process_spec_change(
         ]
         
         for consumer_repo in consumer_repos:
-            consumer_files = _search_repo_for_consumers(consumer_repo, change, token)
+            consumer_files = _search_repo_for_consumers(consumer_repo, change, token, exclude_path=spec_path)
             
             for consumer_file, consumer_content in consumer_files:
                 # Check ignore patterns
@@ -766,23 +791,33 @@ def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:
 
 
 def _find_consumer_repos(source_repo: str, token: str) -> list[str]:
-    """Find repos that might consume APIs from the source repo."""
-    # Get all repos for the user/org
+    """Find repos that might consume APIs from the source repo.
+    
+    Includes the source repo itself (monorepo support) — consumers
+    can live in the same repo as the spec.
+    """
+    # Always include the source repo (monorepo support)
+    repos = [source_repo]
+    
+    # Get all other repos for the user/org
     owner = source_repo.split("/")[0]
     data = _github_api("GET", f"/users/{owner}/repos?per_page=100", token)
     
     if isinstance(data, list):
-        return [
+        repos.extend([
             r["full_name"] for r in data
             if r["full_name"] != source_repo and not r.get("archived")
-        ]
-    return []
+        ])
+    return repos
 
 
-def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str) -> list[tuple[str, str]]:
-    """Search a repo for files that consume the changed endpoint."""
+def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, exclude_path: str = "") -> list[tuple[str, str]]:
+    """Search a repo for files that consume the changed endpoint.
+    
+    For monorepo support: exclude_path filters out the spec file itself
+    so we don't try to 'fix' the spec that was just changed.
+    """
     # Use GitHub code search or contents API
-    # For demo: search for the endpoint path in the repo
     endpoint = change.path  # e.g., "/users"
     
     # GitHub search API
@@ -796,6 +831,9 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str) ->
     if "items" in data:
         for item in data["items"][:5]:  # Limit to 5 files
             file_path = item["path"]
+            # Skip the spec file itself (monorepo: don't fix the source)
+            if file_path == exclude_path:
+                continue
             if _is_code_file(file_path):
                 # Fetch file content
                 file_data = _github_api("GET", f"/repos/{repo}/contents/{file_path}", token)
