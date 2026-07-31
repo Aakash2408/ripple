@@ -55,6 +55,15 @@ from .gitlab_setup import router as gitlab_setup_router
 from .gitlab_oauth import router as gitlab_oauth_router
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
+
+# CORS — allow PropBench UI (GitHub Pages) to POST results
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://aakash2408.github.io", "http://localhost:8080", "*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(dashboard_router)
 app.include_router(gitlab_setup_router)
 app.include_router(gitlab_oauth_router)
