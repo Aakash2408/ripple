@@ -115,7 +115,7 @@ async def dashboard():
 <body>
     <div class="container">
         <h1>🌊 Ripple Dashboard</h1>
-        <p class="subtitle">Self-maintaining APIs — contract change propagation</p>
+        <p class="subtitle">Self-maintaining APIs — 5 contract types, 30 breaking change detections, GitHub + GitLab + Self-Hosted</p>
         
         <div style="margin-bottom: 24px;">
             <div class="stat">
@@ -131,7 +131,7 @@ async def dashboard():
                 <div class="stat-label">Breaks Detected</div>
             </div>
             <div class="stat">
-                <div class="stat-value">4</div>
+                <div class="stat-value">5</div>
                 <div class="stat-label">Contract Types</div>
             </div>
         </div>
@@ -160,17 +160,22 @@ async def dashboard():
             <h2>🧠 Supported Contracts</h2>
             <table>
                 <tr><td>OpenAPI / Swagger</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
-                <tr><td>Protobuf (gRPC)</td><td><span class="badge">Active</span></td><td>Breaking change detection</td></tr>
-                <tr><td>GraphQL</td><td><span class="badge">Active</span></td><td>Breaking change detection</td></tr>
-                <tr><td>Database (SQL + Prisma)</td><td><span class="badge">Active</span></td><td>Breaking change detection</td></tr>
+                <tr><td>Protobuf (gRPC)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>GraphQL</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>Database (SQL + Prisma)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>AsyncAPI (Kafka, SNS, MQTT)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
             </table>
         </div>
 
         <div class="card">
             <h2>🔗 Links</h2>
             <ul>
+                <li><a href="https://aakash2408.github.io/ripple/" target="_blank">Landing Page</a></li>
                 <li><a href="/docs">API Documentation (Swagger UI)</a></li>
                 <li><a href="/health">Health Check</a></li>
+                <li><a href="/auth/gitlab">Install on GitLab</a></li>
+                <li><a href="/setup/gitlab">GitLab Manual Setup</a></li>
+                <li><a href="/rate-limit/unknown">Rate Limit Status</a></li>
                 <li><a href="https://github.com/Aakash2408/ripple" target="_blank">Source Code</a></li>
                 <li><a href="https://github.com/apps/ripple-api" target="_blank">Install GitHub App</a></li>
             </ul>
