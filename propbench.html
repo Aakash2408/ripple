@@ -111,7 +111,11 @@ const CHALLENGES = [
         consequences: [
             { package: "GAMCoreModel", files: ["configuration/SourceConfiguration.prototxt"], description: "Register WELLSPRING sources in proto config" },
             { package: "AteamIntegrationTests", files: ["tst/com/amazon/aas/integration/WellspringSourceTest.java"], description: "Integration test for WELLSPRING source" },
-        ]
+        ],
+        distractors: [
+            { package: "GeoStudioDeliveryHistoryLambda", description: "Processes delivery events (not related to attributes)" },
+            { package: "SmartAddressAssistantWebApp", description: "Frontend web app (doesn't touch attribute config)" },
+        ],
     },
     {
         id: "country-expansion-01",
@@ -127,7 +131,11 @@ const CHALLENGES = [
         consequences: [
             { package: "CdpModelGenerator", files: ["src/plainCdpConfig/PlainCdpModel.yaml"], description: "Root router must include PR or plain-CDP is unreachable" },
             { package: "CdpModelGenerator", files: ["src/personalizedCdpConfig/ExceptionDatesProvider.yaml"], description: "PR holidays must be added" },
-        ]
+        ],
+        distractors: [
+            { package: "SmartAddressAssistantWebApp", description: "Web app that renders CDP (server-side composition)" },
+            { package: "DeliveryHistoryService", description: "Tracks delivery history (no country config)" },
+        ],
     },
     {
         id: "proto-field-change-01",
@@ -144,7 +152,11 @@ const CHALLENGES = [
             { package: "user-client-python", files: ["client/user_client.py"], description: "Python client references user.age" },
             { package: "user-client-node", files: ["src/userClient.ts"], description: "TypeScript client has age in interface" },
             { package: "analytics-service", files: ["src/processors/userProcessor.java"], description: "Analytics reads user.getAge()" },
-        ]
+        ],
+        distractors: [
+            { package: "billing-service", description: "Handles payments (doesn't read User.age)" },
+            { package: "notification-service", description: "Sends emails/push (uses userId only)" },
+        ],
     },
     {
         id: "openapi-required-field-01",
@@ -161,7 +173,11 @@ const CHALLENGES = [
             { package: "frontend", files: ["src/api/users.ts"], description: "Frontend registration form needs phone field" },
             { package: "mobile-backend", files: ["services/user_service.py"], description: "Mobile backend creates users without phone" },
             { package: "integration-tests", files: ["tests/test_user_api.py"], description: "Tests create users without phone — will fail" },
-        ]
+        ],
+        distractors: [
+            { package: "auth-service", description: "Handles login/JWT (doesn't create users)" },
+            { package: "cdn-service", description: "Serves static assets (no user API calls)" },
+        ],
     },
     {
         id: "db-migration-01",
@@ -178,7 +194,11 @@ const CHALLENGES = [
             { package: "api-service", files: ["src/models/User.java"], description: "User model still maps nickname column" },
             { package: "api-service", files: ["src/repositories/UserRepository.java"], description: "Repository has findByNickname query" },
             { package: "data-export", files: ["src/exporters/userExport.py"], description: "CSV export includes nickname field" },
-        ]
+        ],
+        distractors: [
+            { package: "auth-service", description: "Authentication (doesn't query nickname)" },
+            { package: "notification-service", description: "Sends notifications (uses email only)" },
+        ],
     },
     {
         id: "graphql-field-removal-01",
@@ -195,7 +215,11 @@ const CHALLENGES = [
             { package: "frontend", files: ["src/components/UserProfile.tsx"], description: "Component queries user.avatar" },
             { package: "mobile-app", files: ["src/queries/userQueries.ts"], description: "GraphQL query includes avatar field" },
             { package: "api-gateway", files: ["tests/schema.test.ts"], description: "Schema snapshot tests include avatar" },
-        ]
+        ],
+        distractors: [
+            { package: "auth-service", description: "Handles authentication tokens (no avatar usage)" },
+            { package: "billing-service", description: "Processes payments (no user profile data)" },
+        ],
     },
     {
         id: "asyncapi-channel-01",
@@ -212,7 +236,11 @@ const CHALLENGES = [
             { package: "billing-service", files: ["src/consumers/userDeletedHandler.ts"], description: "Subscribes to user/deleted for cleanup" },
             { package: "analytics", files: ["src/processors/userEventProcessor.py"], description: "Processes user/deleted events for churn metrics" },
             { package: "email-service", files: ["src/handlers/accountClosure.ts"], description: "Sends farewell email on user/deleted" },
-        ]
+        ],
+        distractors: [
+            { package: "user-service", description: "CRUD operations on users (publisher, not subscriber)" },
+            { package: "frontend", description: "Web UI (doesn't subscribe to async events)" },
+        ],
     },
     {
         id: "cdk-iam-change-01",
@@ -229,7 +257,11 @@ const CHALLENGES = [
             { package: "OrderProcessorCDK", files: ["lib/iam-policies.ts"], description: "IAM role needs cross-account AssumeRole permission" },
             { package: "SharedInfraCDK", files: ["lib/ddb-stack.ts"], description: "DDB table resource policy must trust the new Lambda's account" },
             { package: "OrderProcessorCDK", files: ["test/order-processor-stack.test.ts"], description: "CDK snapshot test needs updating" },
-        ]
+        ],
+        distractors: [
+            { package: "FrontendCDK", description: "CloudFront + S3 static hosting (no DDB access)" },
+            { package: "MonitoringCDK", description: "CloudWatch dashboards and alarms (read-only)" },
+        ],
     },
     {
         id: "config-migration-01",
@@ -247,7 +279,11 @@ const CHALLENGES = [
             { package: "api-service", files: ["src/services/experimentService.ts"], description: "Uses flag values for A/B test routing" },
             { package: "api-service", files: ["tests/integration/features.test.ts"], description: "Tests mock the JSON file — need LaunchDarkly mock" },
             { package: "api-service", files: ["package.json"], description: "Need to add LaunchDarkly SDK dependency" },
-        ]
+        ],
+        distractors: [
+            { package: "api-service/src/routes/healthCheck.ts", description: "Health endpoint (no feature flag usage)" },
+            { package: "api-service/src/utils/logger.ts", description: "Logging utility (doesn't read flags)" },
+        ],
     },
     {
         id: "monorepo-shared-types-01",
@@ -265,7 +301,11 @@ const CHALLENGES = [
             { package: "packages/frontend", files: ["src/hooks/useAuth.ts"], description: "Auth hook returns userId from token" },
             { package: "packages/shared-types", files: ["src/models/Order.ts"], description: "Order type references userId for ownership" },
             { package: "packages/api", files: ["tests/users.test.ts"], description: "Tests assert on userId field" },
-        ]
+        ],
+        distractors: [
+            { package: "packages/docs", description: "Documentation site (doesn't import User type)" },
+            { package: "packages/design-system", description: "UI components (no user model dependency)" },
+        ],
     },
     {
         id: "dependency-major-bump-01",
@@ -282,7 +322,11 @@ const CHALLENGES = [
             { package: "frontend", files: ["src/api/client.ts"], description: "HTTP client setup uses old interceptor API" },
             { package: "frontend", files: ["src/api/errorHandler.ts"], description: "Error handler reads error.response.data (changed structure)" },
             { package: "frontend", files: ["tests/api/client.test.ts"], description: "Tests mock old axios response format" },
-        ]
+        ],
+        distractors: [
+            { package: "frontend/src/components/Button.tsx", description: "UI component (no HTTP calls)" },
+            { package: "frontend/src/utils/formatDate.ts", description: "Date formatting utility (no axios)" },
+        ],
     },
     {
         id: "env-var-rename-01",
@@ -299,7 +343,11 @@ const CHALLENGES = [
             { package: "api-service", files: ["src/db/connection.ts"], description: "Reads process.env.DATABASE_URL" },
             { package: "api-service", files: ["docker-compose.yml"], description: "Sets DATABASE_URL for local dev" },
             { package: "api-service", files: ["infrastructure/terraform/variables.tf"], description: "Terraform passes DATABASE_URL to ECS task" },
-        ]
+        ],
+        distractors: [
+            { package: "api-service/src/utils/logger.ts", description: "Logging config (uses LOG_LEVEL, not DB)" },
+            { package: "api-service/src/middleware/auth.ts", description: "Auth middleware (uses JWT_SECRET)" },
+        ],
     },
     {
         id: "api-versioning-01",
@@ -317,7 +365,11 @@ const CHALLENGES = [
             { package: "mobile-backend", files: ["src/services/paymentService.py"], description: "Uses /v1/payments endpoint" },
             { package: "payments-api", files: ["tests/e2e/v1-payments.test.ts"], description: "E2E tests hit /v1 — need v2 equivalents" },
             { package: "docs", files: ["api-reference/payments.md"], description: "API docs reference v1 format" },
-        ]
+        ],
+        distractors: [
+            { package: "user-service", description: "User CRUD (doesn't call payments API)" },
+            { package: "analytics-dashboard", description: "Internal reporting (reads DB directly, not API)" },
+        ],
     },
     {
         id: "proto-service-removal-01",
@@ -334,7 +386,11 @@ const CHALLENGES = [
             { package: "user-gateway", files: ["src/handlers/lookupHandler.go"], description: "gRPC handler implements UserLookup" },
             { package: "admin-panel", files: ["src/api/userApi.ts"], description: "Admin UI calls UserLookup for search" },
             { package: "proto-definitions", files: ["proto/user_service_test.go"], description: "Tests exercise UserLookup RPC" },
-        ]
+        ],
+        distractors: [
+            { package: "billing-service", description: "Payment processing (uses PaymentService, not UserService)" },
+            { package: "notification-service", description: "Sends alerts (uses NotificationService RPC)" },
+        ],
     }
 ];
 
@@ -406,15 +462,20 @@ function render() {
         
         <div class="card">
             <div class="prediction-area">
-                <label>What other packages/files need to change?</label>
-                <p class="help">Type a package name (or package:file/path). Press Enter or click Add. Predict as many as you think are affected.</p>
+                <label>Which of these consumers will BREAK because of this change?</label>
+                <p class="help">Select all that need updating. Some are affected, some are not.</p>
                 
-                <div class="prediction-input">
-                    <input type="text" id="pred-input" placeholder="e.g. GAMCoreModel or frontend/src/api.ts" onkeydown="if(event.key==='Enter')addPrediction()">
-                    <button onclick="addPrediction()">Add</button>
+                <div id="choices-list" style="margin: 16px 0;">
+                    ${(challenge.choices || challenge.consequences.concat(challenge.distractors || []).sort(() => Math.random() - 0.5)).map((c, i) => ` 
+                        <label style="display: flex; align-items: flex-start; gap: 10px; padding: 12px; margin-bottom: 8px; background: #f8fafc; border: 1.5px solid #e2e8f0; border-radius: 8px; cursor: pointer; transition: all 0.15s;" onmouseover="this.style.borderColor='#3b82f6'" onmouseout="this.style.borderColor='#e2e8f0'">
+                            <input type="checkbox" class="choice-cb" value="${c.package}" style="margin-top: 3px; width: 18px; height: 18px;">
+                            <div>
+                                <strong>${c.package}</strong>
+                                <div style="font-size: 0.85rem; color: #64748b;">${c.description || c.hint || ''}</div>
+                            </div>
+                        </label>
+                    `).join('')}
                 </div>
-                
-                <ul class="predictions-list" id="predictions-list"></ul>
                 
                 <div class="confidence-select">
                     <label>How confident are you overall?</label>
@@ -465,9 +526,13 @@ function submit() {
     const challenge = activeChallenges[currentIndex];
     const confidence = document.getElementById('confidence').value;
     
+    // Read selected checkboxes
+    const checkboxes = document.querySelectorAll('.choice-cb:checked');
+    userPredictions = Array.from(checkboxes).map(cb => cb.value);
+    
     // Score: compare predictions to ground truth
     const actualPackages = challenge.consequences.map(c => c.package.toLowerCase());
-    const predictedPackages = userPredictions.map(p => p.split(':')[0].split('/')[0].toLowerCase());
+    const predictedPackages = userPredictions.map(p => p.toLowerCase());
     
     const hits = predictedPackages.filter(p => actualPackages.some(a => a.includes(p) || p.includes(a)));
     const misses = actualPackages.filter(a => !predictedPackages.some(p => a.includes(p) || p.includes(a)));
