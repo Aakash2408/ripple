@@ -226,6 +226,39 @@
 </div>
 
 <div class="section">
+    <h2>Self-Hosted Agent</h2>
+    <p style="text-align: center; color: #555; margin-bottom: 24px;">For companies with custom code platforms, on-prem Git, or air-gapped networks.</p>
+    <div class="demo-box" style="font-size: 0.85rem;">
+        <span class="comment"># One-shot scan</span><br>
+        <span class="info">$ ripple-agent scan /path/to/repo --since "1 day ago"</span><br>
+        <br>
+        <span class="comment"># Watch mode (polls every 60s)</span><br>
+        <span class="info">$ ripple-agent watch /path/to/repos --interval 60</span><br>
+        <br>
+        <span class="comment"># Docker</span><br>
+        <span class="info">$ docker run -v /repos:/repos ripple-agent watch /repos</span><br>
+    </div>
+    <div style="margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div style="padding: 16px; background: #f8f9fa; border-radius: 8px;">
+            <strong>Generic Git</strong><br>
+            <span style="color: #555; font-size: 0.9rem;">Any git repo — creates branches with fixes</span>
+        </div>
+        <div style="padding: 16px; background: #f8f9fa; border-radius: 8px;">
+            <strong>Amazon CRUX</strong><br>
+            <span style="color: #555; font-size: 0.9rem;">Uses <code>cr</code> CLI for code reviews</span>
+        </div>
+        <div style="padding: 16px; background: #f8f9fa; border-radius: 8px;">
+            <strong>Phabricator</strong><br>
+            <span style="color: #555; font-size: 0.9rem;">Uses <code>arc diff</code> (coming soon)</span>
+        </div>
+        <div style="padding: 16px; background: #f8f9fa; border-radius: 8px;">
+            <strong>Gerrit</strong><br>
+            <span style="color: #555; font-size: 0.9rem;">REST API integration (coming soon)</span>
+        </div>
+    </div>
+</div>
+
+<div class="section">
     <h2>Why Ripple?</h2>
     <div class="feature-grid">
         <div class="feature">
