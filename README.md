@@ -2,7 +2,7 @@
 
 > When you change an API, Ripple finds every consumer and opens PRs to fix them. Automatically.
 
-### 🌐 [**Live Landing Page**](https://aakash2408.github.io/ripple/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Dashboard**](https://ripple-production-be7f.up.railway.app/dashboard)
+### 🌐 [**Live Landing Page**](https://aakash2408.github.io/ripple/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Install GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab) · [**Self-Hosted Agent**](#self-hosted-agent)
 
 [![Install GitHub App](https://img.shields.io/badge/Install-GitHub%20App-blue)](https://github.com/apps/ripple-api)
 [![Demo: Python](https://img.shields.io/badge/demo-Python%20PR-green)](https://github.com/Aakash2408/ripple-sdk-python/pull/1)
@@ -182,13 +182,60 @@ Get the template: `GET /config/template`
 ## Deploy
 
 ```bash
-# Docker
+# Docker (Cloud webhook server)
 docker build -t ripple .
 docker run -p 8000:8000 -e GITHUB_TOKEN=ghp_xxx ripple
 
 # Railway (one-click deploy)
 # Live: https://ripple-production-be7f.up.railway.app
 ```
+
+## Self-Hosted Agent
+
+For companies with **custom code platforms** (on-prem Git, Phabricator, Gerrit, Amazon CRUX, etc.) or air-gapped networks, Ripple runs as a self-hosted agent.
+
+**Quick start:**
+
+```bash
+# One-shot scan
+python -m agent.core scan /path/to/your/repo --since "1 day ago"
+
+# Watch mode (polls every 60 seconds)
+python -m agent.core watch /path/to/repos --interval 60
+
+# Docker
+docker build -f Dockerfile.agent -t ripple-agent .
+docker run -v /your/repos:/repos ripple-agent watch /repos --interval 60
+```
+
+**Generate sample config:**
+
+```bash
+python -m agent.core config > ripple-agent.yaml
+```
+
+**Config file (ripple-agent.yaml):**
+
+```yaml
+repos:
+  - /path/to/api-repo
+  - /path/to/another-repo
+interval: 60
+platform: generic-git  # or: crux, phabricator, gerrit
+min_confidence: 0.6
+max_fixes_per_scan: 10
+```
+
+**Platform adapters:**
+
+| Adapter | For | How it creates fixes |
+|---|---|---|
+| `generic-git` | Any git repo | Creates branch + commit |
+| `crux` | Amazon (code.amazon.com) | Uses `cr` CLI for code reviews |
+| `phabricator` | Meta, Uber, Pinterest | Uses `arc diff` (planned) |
+| `gerrit` | Google, Android | Uses Gerrit REST API (planned) |
+
+The agent uses the same 5 diff engines and 30 breaking change detections as the cloud version — just runs locally on your network.
 
 ## GitLab Support
 
