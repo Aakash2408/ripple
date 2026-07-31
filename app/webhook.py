@@ -753,6 +753,64 @@ async def get_config_template():
     return PlainTextResponse(content=DEFAULT_TEMPLATE, media_type="text/yaml")
 
 
+# === PropBench Human Baseline Collection ===
+
+_propbench_results: list[dict] = []
+
+@app.post("/propbench/submit")
+async def submit_propbench_results(request: FastAPIRequest):
+    """
+    Receive PropBench human baseline results from the UI.
+    Auto-called when participant finishes all challenges.
+    """
+    body = await request.body()
+    data = json.loads(body)
+    
+    # Validate minimal structure
+    if "session_id" not in data or "results" not in data:
+        return JSONResponse(status_code=400, content={"error": "Missing session_id or results"})
+    
+    _propbench_results.append(data)
+    
+    participant = data.get("participant", {})
+    n_challenges = len(data.get("results", []))
+    
+    return {
+        "status": "saved",
+        "participant": participant.get("name", "anonymous"),
+        "challenges_completed": n_challenges,
+        "total_submissions": len(_propbench_results),
+        "message": "Thank you! Your results have been recorded.",
+    }
+
+
+@app.get("/propbench/results")
+async def get_propbench_results():
+    """View all collected PropBench human baseline results."""
+    summaries = []
+    for r in _propbench_results:
+        participant = r.get("participant", {})
+        results = r.get("results", [])
+        completed = [x for x in results if not x.get("skipped")]
+        avg_recall = sum(x.get("recall", 0) for x in completed) / len(completed) if completed else 0
+        avg_precision = sum(x.get("precision", 0) for x in completed) / len(completed) if completed else 0
+        
+        summaries.append({
+            "name": participant.get("name", "anonymous"),
+            "role": participant.get("role", "unknown"),
+            "challenges": len(completed),
+            "skipped": len(results) - len(completed),
+            "avg_recall": f"{avg_recall:.0%}",
+            "avg_precision": f"{avg_precision:.0%}",
+            "timestamp": r.get("timestamp", ""),
+        })
+    
+    return {
+        "total_participants": len(_propbench_results),
+        "submissions": summaries,
+    }
+
+
 def _get_token(installation_id: int = None) -> str:
     """Get GitHub token (personal or installation)."""
     # For now: use personal token. With a real GitHub App, you'd exchange

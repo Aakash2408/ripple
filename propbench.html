@@ -179,8 +179,187 @@ const CHALLENGES = [
             { package: "api-service", files: ["src/repositories/UserRepository.java"], description: "Repository has findByNickname query" },
             { package: "data-export", files: ["src/exporters/userExport.py"], description: "CSV export includes nickname field" },
         ]
+    },
+    {
+        id: "graphql-field-removal-01",
+        title: "Remove 'avatar' field from User type in GraphQL schema",
+        family: "graphql-changes",
+        difficulty: "easy",
+        trigger: {
+            package: "api-gateway",
+            files: ["schema/user.graphql"],
+            intent: "Remove deprecated avatar field — replaced by profileImage with multiple sizes",
+            diff_summary: "Removed field 'avatar: String' from type User in GraphQL schema."
+        },
+        consequences: [
+            { package: "frontend", files: ["src/components/UserProfile.tsx"], description: "Component queries user.avatar" },
+            { package: "mobile-app", files: ["src/queries/userQueries.ts"], description: "GraphQL query includes avatar field" },
+            { package: "api-gateway", files: ["tests/schema.test.ts"], description: "Schema snapshot tests include avatar" },
+        ]
+    },
+    {
+        id: "asyncapi-channel-01",
+        title: "Remove 'user/deleted' channel from AsyncAPI spec",
+        family: "asyncapi-changes",
+        difficulty: "medium",
+        trigger: {
+            package: "event-platform",
+            files: ["specs/asyncapi.yaml"],
+            intent: "Remove user/deleted channel — user deletion now handled via user/updated with status=deleted",
+            diff_summary: "Removed channel 'user/deleted' and its message schema from AsyncAPI spec."
+        },
+        consequences: [
+            { package: "billing-service", files: ["src/consumers/userDeletedHandler.ts"], description: "Subscribes to user/deleted for cleanup" },
+            { package: "analytics", files: ["src/processors/userEventProcessor.py"], description: "Processes user/deleted events for churn metrics" },
+            { package: "email-service", files: ["src/handlers/accountClosure.ts"], description: "Sends farewell email on user/deleted" },
+        ]
+    },
+    {
+        id: "cdk-iam-change-01",
+        title: "Add new Lambda that needs cross-account DynamoDB access",
+        family: "cdk-changes",
+        difficulty: "hard",
+        trigger: {
+            package: "OrderProcessorCDK",
+            files: ["lib/order-processor-stack.ts"],
+            intent: "Add new Lambda function that reads from a DDB table in a different AWS account",
+            diff_summary: "Added new Lambda construct with environment variable pointing to cross-account DDB table ARN."
+        },
+        consequences: [
+            { package: "OrderProcessorCDK", files: ["lib/iam-policies.ts"], description: "IAM role needs cross-account AssumeRole permission" },
+            { package: "SharedInfraCDK", files: ["lib/ddb-stack.ts"], description: "DDB table resource policy must trust the new Lambda's account" },
+            { package: "OrderProcessorCDK", files: ["test/order-processor-stack.test.ts"], description: "CDK snapshot test needs updating" },
+        ]
+    },
+    {
+        id: "config-migration-01",
+        title: "Move feature flags from JSON file to LaunchDarkly",
+        family: "config-changes",
+        difficulty: "hard",
+        trigger: {
+            package: "api-service",
+            files: ["config/feature-flags.json"],
+            intent: "Migrate all feature flags to LaunchDarkly — delete local JSON config",
+            diff_summary: "Deleted config/feature-flags.json. All flag checks must use LaunchDarkly SDK instead."
+        },
+        consequences: [
+            { package: "api-service", files: ["src/middleware/featureGate.ts"], description: "Reads flags from JSON — needs LaunchDarkly client" },
+            { package: "api-service", files: ["src/services/experimentService.ts"], description: "Uses flag values for A/B test routing" },
+            { package: "api-service", files: ["tests/integration/features.test.ts"], description: "Tests mock the JSON file — need LaunchDarkly mock" },
+            { package: "api-service", files: ["package.json"], description: "Need to add LaunchDarkly SDK dependency" },
+        ]
+    },
+    {
+        id: "monorepo-shared-types-01",
+        title: "Rename 'userId' to 'accountId' in shared types package",
+        family: "monorepo-changes",
+        difficulty: "medium",
+        trigger: {
+            package: "packages/shared-types",
+            files: ["src/models/User.ts"],
+            intent: "Rename userId to accountId across the monorepo to align with new auth system naming",
+            diff_summary: "Renamed field 'userId: string' to 'accountId: string' in User interface."
+        },
+        consequences: [
+            { package: "packages/api", files: ["src/routes/users.ts"], description: "Route handlers reference user.userId" },
+            { package: "packages/frontend", files: ["src/hooks/useAuth.ts"], description: "Auth hook returns userId from token" },
+            { package: "packages/shared-types", files: ["src/models/Order.ts"], description: "Order type references userId for ownership" },
+            { package: "packages/api", files: ["tests/users.test.ts"], description: "Tests assert on userId field" },
+        ]
+    },
+    {
+        id: "dependency-major-bump-01",
+        title: "Upgrade axios from v0.x to v1.x (breaking changes)",
+        family: "dependency-changes",
+        difficulty: "medium",
+        trigger: {
+            package: "frontend",
+            files: ["package.json"],
+            intent: "Upgrade axios 0.27 → 1.6 — response.data structure changed, interceptors API changed",
+            diff_summary: "Changed axios version in package.json. v1.x changes: error.response.data → error.response, interceptor signature changed."
+        },
+        consequences: [
+            { package: "frontend", files: ["src/api/client.ts"], description: "HTTP client setup uses old interceptor API" },
+            { package: "frontend", files: ["src/api/errorHandler.ts"], description: "Error handler reads error.response.data (changed structure)" },
+            { package: "frontend", files: ["tests/api/client.test.ts"], description: "Tests mock old axios response format" },
+        ]
+    },
+    {
+        id: "env-var-rename-01",
+        title: "Rename DATABASE_URL to DB_CONNECTION_STRING",
+        family: "config-changes",
+        difficulty: "easy",
+        trigger: {
+            package: "api-service",
+            files: [".env.example", "docs/deployment.md"],
+            intent: "Standardize env var naming — DATABASE_URL is ambiguous when there are multiple databases",
+            diff_summary: "Renamed DATABASE_URL to DB_CONNECTION_STRING in .env.example and docs."
+        },
+        consequences: [
+            { package: "api-service", files: ["src/db/connection.ts"], description: "Reads process.env.DATABASE_URL" },
+            { package: "api-service", files: ["docker-compose.yml"], description: "Sets DATABASE_URL for local dev" },
+            { package: "api-service", files: ["infrastructure/terraform/variables.tf"], description: "Terraform passes DATABASE_URL to ECS task" },
+        ]
+    },
+    {
+        id: "api-versioning-01",
+        title: "Deprecate /v1/payments endpoint — migrate to /v2/payments",
+        family: "openapi-changes",
+        difficulty: "medium",
+        trigger: {
+            package: "payments-api",
+            files: ["specs/openapi.yaml"],
+            intent: "Mark /v1/payments as deprecated, add /v2/payments with new request/response format",
+            diff_summary: "Added deprecated: true to all /v1/payments operations. Added /v2/payments with restructured schema."
+        },
+        consequences: [
+            { package: "checkout-service", files: ["src/clients/paymentsClient.ts"], description: "Calls /v1/payments — needs migration to v2" },
+            { package: "mobile-backend", files: ["src/services/paymentService.py"], description: "Uses /v1/payments endpoint" },
+            { package: "payments-api", files: ["tests/e2e/v1-payments.test.ts"], description: "E2E tests hit /v1 — need v2 equivalents" },
+            { package: "docs", files: ["api-reference/payments.md"], description: "API docs reference v1 format" },
+        ]
+    },
+    {
+        id: "proto-service-removal-01",
+        title: "Remove UserLookup RPC from UserService proto",
+        family: "proto-changes",
+        difficulty: "medium",
+        trigger: {
+            package: "proto-definitions",
+            files: ["proto/user_service.proto"],
+            intent: "Remove deprecated UserLookup RPC — replaced by GetUser with richer response",
+            diff_summary: "Removed 'rpc UserLookup(UserLookupRequest) returns (UserLookupResponse)' from service UserService."
+        },
+        consequences: [
+            { package: "user-gateway", files: ["src/handlers/lookupHandler.go"], description: "gRPC handler implements UserLookup" },
+            { package: "admin-panel", files: ["src/api/userApi.ts"], description: "Admin UI calls UserLookup for search" },
+            { package: "proto-definitions", files: ["proto/user_service_test.go"], description: "Tests exercise UserLookup RPC" },
+        ]
     }
 ];
+
+// === RANDOMIZATION ===
+// Each participant gets 5 random challenges from the pool (shuffled)
+const CHALLENGES_PER_SESSION = 5;
+let activeChallenges = [];
+
+function shuffleArray(arr) {
+    const shuffled = [...arr];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+}
+
+function selectChallenges() {
+    // Shuffle all challenges and pick N
+    const shuffled = shuffleArray(CHALLENGES);
+    activeChallenges = shuffled.slice(0, CHALLENGES_PER_SESSION);
+}
+
+// Initialize on load
+selectChallenges();
 
 let currentIndex = 0;
 let userPredictions = [];
@@ -198,17 +377,17 @@ function render() {
         return;
     }
     
-    if (currentIndex >= CHALLENGES.length) {
+    if (currentIndex >= activeChallenges.length) {
         renderSummary(app);
         return;
     }
     
-    const challenge = CHALLENGES[currentIndex];
+    const challenge = activeChallenges[currentIndex];
     
     app.innerHTML = `
         <div class="progress">
-            <div class="progress-bar"><div class="progress-fill" style="width: ${(currentIndex / CHALLENGES.length) * 100}%"></div></div>
-            <div class="progress-text">${currentIndex + 1} / ${CHALLENGES.length}</div>
+            <div class="progress-bar"><div class="progress-fill" style="width: ${(currentIndex / activeChallenges.length) * 100}%"></div></div>
+            <div class="progress-text">${currentIndex + 1} / ${activeChallenges.length}</div>
         </div>
         
         <div class="card">
@@ -283,7 +462,7 @@ function removePrediction(index) {
 }
 
 function submit() {
-    const challenge = CHALLENGES[currentIndex];
+    const challenge = activeChallenges[currentIndex];
     const confidence = document.getElementById('confidence').value;
     
     // Score: compare predictions to ground truth
@@ -396,6 +575,9 @@ function startChallenge() {
 }
 
 function renderSummary(app) {
+    // Auto-submit results to server (zero friction for participants)
+    autoSubmitResults();
+    
     const completed = results.filter(r => !r.skipped);
     const avgRecall = completed.length > 0 ? completed.reduce((s, r) => s + r.recall, 0) / completed.length : 0;
     const avgPrecision = completed.length > 0 ? completed.reduce((s, r) => s + r.precision, 0) / completed.length : 0;
@@ -439,6 +621,25 @@ function downloadResults() {
     a.href = url;
     a.download = `propbench-human-${sessionId}.json`;
     a.click();
+}
+
+// Auto-submit results to server when challenges complete
+function autoSubmitResults() {
+    const data = { 
+        session_id: sessionId, 
+        timestamp: new Date().toISOString(), 
+        participant,
+        results 
+    };
+    fetch('https://ripple-production-be7f.up.railway.app/propbench/submit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    }).then(r => r.json()).then(d => {
+        console.log('Results submitted:', d);
+    }).catch(e => {
+        console.log('Auto-submit failed (offline?):', e);
+    });
 }
 
 // Start
