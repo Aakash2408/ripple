@@ -186,9 +186,17 @@ let currentIndex = 0;
 let userPredictions = [];
 let results = [];
 let sessionId = `human-${Date.now()}`;
+let participant = { name: '', role: '', yearsExp: '' };
+let started = false;
 
 function render() {
     const app = document.getElementById('app');
+    
+    // Show registration screen first
+    if (!started) {
+        renderRegistration(app);
+        return;
+    }
     
     if (currentIndex >= CHALLENGES.length) {
         renderSummary(app);
@@ -337,6 +345,56 @@ function next() {
     render();
 }
 
+function renderRegistration(app) {
+    app.innerHTML = `
+        <div class="card" style="max-width: 500px; margin: 0 auto;">
+            <h2 style="margin-bottom: 16px;">👋 Before we start</h2>
+            <p style="color: #64748b; margin-bottom: 20px;">Takes ~5 minutes. You'll see 5 code changes and predict what else needs updating.</p>
+            
+            <div style="margin-bottom: 16px;">
+                <label style="font-weight: 600; display: block; margin-bottom: 4px;">Name or alias</label>
+                <input type="text" id="reg-name" placeholder="e.g. Aakash" style="width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem;">
+            </div>
+            
+            <div style="margin-bottom: 16px;">
+                <label style="font-weight: 600; display: block; margin-bottom: 4px;">Role</label>
+                <select id="reg-role" style="width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem;">
+                    <option value="sde1">SDE I (0-2 years)</option>
+                    <option value="sde2" selected>SDE II (2-5 years)</option>
+                    <option value="sde3">Senior SDE (5-8 years)</option>
+                    <option value="principal">Principal+ (8+ years)</option>
+                    <option value="other">Other</option>
+                </select>
+            </div>
+            
+            <div style="margin-bottom: 16px;">
+                <label style="font-weight: 600; display: block; margin-bottom: 4px;">How many repos do you work with regularly?</label>
+                <select id="reg-repos" style="width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem;">
+                    <option value="1-3">1-3 repos</option>
+                    <option value="4-10" selected>4-10 repos</option>
+                    <option value="10-20">10-20 repos</option>
+                    <option value="20+">20+ repos</option>
+                </select>
+            </div>
+            
+            <button class="btn btn-primary" style="width: 100%;" onclick="startChallenge()">Start Challenge →</button>
+            
+            <p style="font-size: 0.8rem; color: #94a3b8; margin-top: 16px; text-align: center;">Your predictions are anonymous. Results are used for research on engineering judgment.</p>
+        </div>
+    `;
+}
+
+function startChallenge() {
+    const name = document.getElementById('reg-name').value.trim() || 'anonymous';
+    const role = document.getElementById('reg-role').value;
+    const repos = document.getElementById('reg-repos').value;
+    
+    participant = { name, role, repos };
+    sessionId = `${name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}`;
+    started = true;
+    render();
+}
+
 function renderSummary(app) {
     const completed = results.filter(r => !r.skipped);
     const avgRecall = completed.length > 0 ? completed.reduce((s, r) => s + r.recall, 0) / completed.length : 0;
@@ -369,7 +427,12 @@ function renderSummary(app) {
 }
 
 function downloadResults() {
-    const data = { session_id: sessionId, timestamp: new Date().toISOString(), results };
+    const data = { 
+        session_id: sessionId, 
+        timestamp: new Date().toISOString(), 
+        participant,
+        results 
+    };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
