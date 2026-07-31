@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install git (required for GenericGitAdapter)
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Copy application
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+COPY agent/ ./agent/
+
+# Default: watch mode
+ENTRYPOINT ["python", "-m", "agent.core"]
+CMD ["watch", "/repos", "--interval", "60"]
