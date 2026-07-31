@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PropBench — Human Baseline</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; color: #1a1a1a; line-height: 1.6; }
+        
+        .container { max-width: 800px; margin: 0 auto; padding: 24px; }
+        
+        header { text-align: center; padding: 40px 0 20px; border-bottom: 1px solid #e2e8f0; margin-bottom: 32px; }
+        header h1 { font-size: 1.8rem; margin-bottom: 8px; }
+        header p { color: #64748b; }
+        
+        .progress { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; padding: 12px 16px; background: white; border-radius: 8px; border: 1px solid #e2e8f0; }
+        .progress-bar { flex: 1; height: 6px; background: #e2e8f0; border-radius: 3px; }
+        .progress-fill { height: 100%; background: #3b82f6; border-radius: 3px; transition: width 0.3s; }
+        .progress-text { font-size: 0.85rem; color: #64748b; white-space: nowrap; }
+        
+        .card { background: white; border-radius: 12px; border: 1px solid #e2e8f0; padding: 28px; margin-bottom: 20px; }
+        .card h2 { font-size: 1.1rem; margin-bottom: 12px; color: #1e293b; }
+        .card h3 { font-size: 0.95rem; margin-bottom: 8px; color: #475569; }
+        
+        .trigger { border-left: 4px solid #3b82f6; padding-left: 16px; margin: 16px 0; }
+        .trigger .package { font-weight: 700; font-size: 1.05rem; color: #1e40af; }
+        .trigger .files { font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: #475569; margin: 8px 0; }
+        .trigger .files code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; display: block; margin: 4px 0; }
+        .trigger .intent { font-style: italic; color: #64748b; margin-top: 8px; }
+        
+        .prediction-area { margin-top: 20px; }
+        .prediction-area label { font-weight: 600; display: block; margin-bottom: 8px; }
+        .prediction-area .help { font-size: 0.85rem; color: #64748b; margin-bottom: 12px; }
+        
+        .prediction-input { display: flex; gap: 8px; margin-bottom: 12px; }
+        .prediction-input input { flex: 1; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem; }
+        .prediction-input input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
+        .prediction-input button { padding: 10px 16px; background: #3b82f6; color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
+        .prediction-input button:hover { background: #2563eb; }
+        
+        .predictions-list { list-style: none; margin: 12px 0; }
+        .predictions-list li { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #f8fafc; border-radius: 6px; margin-bottom: 6px; font-family: monospace; font-size: 0.9rem; }
+        .predictions-list li .remove { color: #ef4444; cursor: pointer; font-weight: 700; padding: 0 4px; }
+        
+        .confidence-select { margin-top: 12px; }
+        .confidence-select label { font-size: 0.9rem; color: #475569; }
+        .confidence-select select { padding: 6px 12px; border-radius: 6px; border: 1px solid #d1d5db; }
+        
+        .actions { display: flex; gap: 12px; margin-top: 24px; }
+        .btn { padding: 12px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; border: none; font-size: 1rem; transition: all 0.2s; }
+        .btn-primary { background: #3b82f6; color: white; }
+        .btn-primary:hover { background: #2563eb; transform: translateY(-1px); }
+        .btn-secondary { background: white; color: #475569; border: 1px solid #d1d5db; }
+        .btn-secondary:hover { background: #f8fafc; }
+        .btn-skip { background: #f1f5f9; color: #64748b; }
+        
+        .results { margin-top: 20px; padding: 20px; border-radius: 8px; }
+        .results.correct { background: #f0fdf4; border: 1px solid #86efac; }
+        .results.partial { background: #fffbeb; border: 1px solid #fcd34d; }
+        .results.missed { background: #fef2f2; border: 1px solid #fca5a5; }
+        .results h3 { margin-bottom: 8px; }
+        .results .score { font-size: 1.5rem; font-weight: 700; }
+        .results ul { margin-top: 8px; padding-left: 20px; }
+        .results li { margin: 4px 0; font-size: 0.9rem; }
+        .results .hit { color: #16a34a; }
+        .results .miss { color: #dc2626; }
+        .results .extra { color: #d97706; }
+        
+        .summary { text-align: center; padding: 40px; }
+        .summary h2 { margin-bottom: 16px; }
+        .summary .final-score { font-size: 3rem; font-weight: 800; color: #3b82f6; }
+        .summary .breakdown { margin-top: 20px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+        .summary .stat { padding: 16px; background: #f8fafc; border-radius: 8px; }
+        .summary .stat-value { font-size: 1.5rem; font-weight: 700; }
+        .summary .stat-label { font-size: 0.8rem; color: #64748b; }
+        
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>🧪 PropBench — Human Baseline</h1>
+        <p>Given a code change, predict what else needs to change. Your answers establish the human benchmark.</p>
+    </header>
+    
+    <div id="app">
+        <!-- Populated by JS -->
+        <div class="card" style="text-align: center; padding: 40px;">
+            <p>Loading challenges...</p>
+        </div>
+    </div>
+</div>
+
+<script>
+// Sample challenges (in production, loaded from API or YAML files)
+const CHALLENGES = [
+    {
+        id: "aas-onboarding-01",
+        title: "Onboard WELLSPRING source for address attributes",
+        family: "aas-onboarding",
+        difficulty: "medium",
+        trigger: {
+            package: "AIXAttributeConfigData",
+            files: ["configuration/attributes/DELIVERY_HINT.json", "configuration/attributes/SAFE_PLACE.json"],
+            intent: "Onboard WELLSPRING as a new attribute source for multiple attributes including DELIVERY_HINT and SAFE_PLACE",
+            diff_summary: "Added WELLSPRING to selectionConfig, strategyConfigEntry, and propagationConfig sections across multiple attribute JSON files."
+        },
+        consequences: [
+            { package: "GAMCoreModel", files: ["configuration/SourceConfiguration.prototxt"], description: "Register WELLSPRING sources in proto config" },
+            { package: "AteamIntegrationTests", files: ["tst/com/amazon/aas/integration/WellspringSourceTest.java"], description: "Integration test for WELLSPRING source" },
+        ]
+    },
+    {
+        id: "country-expansion-01",
+        title: "Add Puerto Rico to CdpModelGenerator",
+        family: "country-expansion",
+        difficulty: "hard",
+        trigger: {
+            package: "CdpModelGenerator",
+            files: ["src/personalizedCdpConfig/PropertyType/US/*.yaml"],
+            intent: "Add PR (Puerto Rico) as a new country with own-market configuration (not US-parity)",
+            diff_summary: "Added PR property-type blocks, safe-place values, holiday config, and PlainCdpModel routing entry."
+        },
+        consequences: [
+            { package: "CdpModelGenerator", files: ["src/plainCdpConfig/PlainCdpModel.yaml"], description: "Root router must include PR or plain-CDP is unreachable" },
+            { package: "CdpModelGenerator", files: ["src/personalizedCdpConfig/ExceptionDatesProvider.yaml"], description: "PR holidays must be added" },
+        ]
+    },
+    {
+        id: "proto-field-change-01",
+        title: "Remove 'age' field from User proto message",
+        family: "proto-changes",
+        difficulty: "easy",
+        trigger: {
+            package: "UserService",
+            files: ["proto/user.proto"],
+            intent: "Remove deprecated 'age' field from User message (replaced by date_of_birth)",
+            diff_summary: "Removed field 'age' (int32, field number 5) from message User in proto/user.proto."
+        },
+        consequences: [
+            { package: "user-client-python", files: ["client/user_client.py"], description: "Python client references user.age" },
+            { package: "user-client-node", files: ["src/userClient.ts"], description: "TypeScript client has age in interface" },
+            { package: "analytics-service", files: ["src/processors/userProcessor.java"], description: "Analytics reads user.getAge()" },
+        ]
+    },
+    {
+        id: "openapi-required-field-01",
+        title: "Add required field 'phone' to POST /users",
+        family: "openapi-changes",
+        difficulty: "easy",
+        trigger: {
+            package: "api-gateway",
+            files: ["specs/openapi.yaml"],
+            intent: "Add 'phone' as a required field for user registration",
+            diff_summary: "Added 'phone' (string) to required array and properties in POST /users request body schema."
+        },
+        consequences: [
+            { package: "frontend", files: ["src/api/users.ts"], description: "Frontend registration form needs phone field" },
+            { package: "mobile-backend", files: ["services/user_service.py"], description: "Mobile backend creates users without phone" },
+            { package: "integration-tests", files: ["tests/test_user_api.py"], description: "Tests create users without phone — will fail" },
+        ]
+    },
+    {
+        id: "db-migration-01",
+        title: "Drop 'nickname' column from users table",
+        family: "database-changes",
+        difficulty: "medium",
+        trigger: {
+            package: "api-service",
+            files: ["migrations/20260715_drop_nickname.sql"],
+            intent: "Remove deprecated nickname column (replaced by display_name)",
+            diff_summary: "ALTER TABLE users DROP COLUMN nickname;"
+        },
+        consequences: [
+            { package: "api-service", files: ["src/models/User.java"], description: "User model still maps nickname column" },
+            { package: "api-service", files: ["src/repositories/UserRepository.java"], description: "Repository has findByNickname query" },
+            { package: "data-export", files: ["src/exporters/userExport.py"], description: "CSV export includes nickname field" },
+        ]
+    }
+];
+
+let currentIndex = 0;
+let userPredictions = [];
+let results = [];
+let sessionId = `human-${Date.now()}`;
+
+function render() {
+    const app = document.getElementById('app');
+    
+    if (currentIndex >= CHALLENGES.length) {
+        renderSummary(app);
+        return;
+    }
+    
+    const challenge = CHALLENGES[currentIndex];
+    
+    app.innerHTML = `
+        <div class="progress">
+            <div class="progress-bar"><div class="progress-fill" style="width: ${(currentIndex / CHALLENGES.length) * 100}%"></div></div>
+            <div class="progress-text">${currentIndex + 1} / ${CHALLENGES.length}</div>
+        </div>
+        
+        <div class="card">
+            <h2>Challenge: ${challenge.title}</h2>
+            <span style="font-size: 0.8rem; padding: 3px 8px; background: #f1f5f9; border-radius: 4px; color: #64748b;">Difficulty: ${challenge.difficulty}</span>
+            
+            <div class="trigger">
+                <div class="package">${challenge.trigger.package}</div>
+                <div class="files">
+                    ${challenge.trigger.files.map(f => `<code>${f}</code>`).join('')}
+                </div>
+                <div class="intent">"${challenge.trigger.intent}"</div>
+                <p style="margin-top: 8px; font-size: 0.9rem; color: #334155;">${challenge.trigger.diff_summary}</p>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="prediction-area">
+                <label>What other packages/files need to change?</label>
+                <p class="help">Type a package name (or package:file/path). Press Enter or click Add. Predict as many as you think are affected.</p>
+                
+                <div class="prediction-input">
+                    <input type="text" id="pred-input" placeholder="e.g. GAMCoreModel or frontend/src/api.ts" onkeydown="if(event.key==='Enter')addPrediction()">
+                    <button onclick="addPrediction()">Add</button>
+                </div>
+                
+                <ul class="predictions-list" id="predictions-list"></ul>
+                
+                <div class="confidence-select">
+                    <label>How confident are you overall?</label>
+                    <select id="confidence">
+                        <option value="high">High — I've done this before, I know what breaks</option>
+                        <option value="medium" selected>Medium — Educated guess based on experience</option>
+                        <option value="low">Low — Guessing, not sure what's downstream</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="actions">
+                <button class="btn btn-primary" onclick="submit()">Submit Prediction</button>
+                <button class="btn btn-skip" onclick="skip()">Skip (don't know)</button>
+            </div>
+            
+            <div id="results-area" class="hidden"></div>
+        </div>
+    `;
+    
+    document.getElementById('pred-input').focus();
+}
+
+function addPrediction() {
+    const input = document.getElementById('pred-input');
+    const value = input.value.trim();
+    if (!value) return;
+    
+    userPredictions.push(value);
+    input.value = '';
+    input.focus();
+    
+    const list = document.getElementById('predictions-list');
+    list.innerHTML = userPredictions.map((p, i) => 
+        `<li>${p} <span class="remove" onclick="removePrediction(${i})">×</span></li>`
+    ).join('');
+}
+
+function removePrediction(index) {
+    userPredictions.splice(index, 1);
+    const list = document.getElementById('predictions-list');
+    list.innerHTML = userPredictions.map((p, i) => 
+        `<li>${p} <span class="remove" onclick="removePrediction(${i})">×</span></li>`
+    ).join('');
+}
+
+function submit() {
+    const challenge = CHALLENGES[currentIndex];
+    const confidence = document.getElementById('confidence').value;
+    
+    // Score: compare predictions to ground truth
+    const actualPackages = challenge.consequences.map(c => c.package.toLowerCase());
+    const predictedPackages = userPredictions.map(p => p.split(':')[0].split('/')[0].toLowerCase());
+    
+    const hits = predictedPackages.filter(p => actualPackages.some(a => a.includes(p) || p.includes(a)));
+    const misses = actualPackages.filter(a => !predictedPackages.some(p => a.includes(p) || p.includes(a)));
+    const extras = predictedPackages.filter(p => !actualPackages.some(a => a.includes(p) || p.includes(a)));
+    
+    const precision = predictedPackages.length > 0 ? hits.length / predictedPackages.length : 0;
+    const recall = actualPackages.length > 0 ? hits.length / actualPackages.length : 0;
+    const f1 = (precision + recall) > 0 ? 2 * (precision * recall) / (precision + recall) : 0;
+    
+    const result = {
+        challenge_id: challenge.id,
+        predictions: [...userPredictions],
+        confidence,
+        hits: hits.length,
+        misses: misses.length,
+        extras: extras.length,
+        precision,
+        recall,
+        f1,
+        actual: challenge.consequences,
+    };
+    results.push(result);
+    
+    // Show results
+    const cls = recall >= 0.8 ? 'correct' : recall >= 0.4 ? 'partial' : 'missed';
+    const area = document.getElementById('results-area');
+    area.className = `results ${cls}`;
+    area.innerHTML = `
+        <h3>${recall >= 0.8 ? '🎉 Great!' : recall >= 0.4 ? '🤔 Partial' : '❌ Missed some'}</h3>
+        <div class="score">Recall: ${(recall * 100).toFixed(0)}% | Precision: ${(precision * 100).toFixed(0)}%</div>
+        <ul>
+            ${hits.map(h => `<li class="hit">✅ ${h} — correct!</li>`).join('')}
+            ${misses.map(m => `<li class="miss">❌ Missed: ${m}</li>`).join('')}
+            ${extras.map(e => `<li class="extra">⚠️ Extra: ${e} (not in ground truth)</li>`).join('')}
+        </ul>
+        <p style="margin-top: 12px; font-size: 0.9rem; color: #475569;"><b>Actual consequences:</b></p>
+        <ul>${challenge.consequences.map(c => `<li>${c.package}: ${c.description}</li>`).join('')}</ul>
+        <button class="btn btn-primary" style="margin-top: 16px;" onclick="next()">Next Challenge →</button>
+    `;
+    area.classList.remove('hidden');
+    
+    // Hide submit buttons
+    document.querySelector('.actions').classList.add('hidden');
+}
+
+function skip() {
+    results.push({ challenge_id: CHALLENGES[currentIndex].id, skipped: true });
+    next();
+}
+
+function next() {
+    currentIndex++;
+    userPredictions = [];
+    render();
+}
+
+function renderSummary(app) {
+    const completed = results.filter(r => !r.skipped);
+    const avgRecall = completed.length > 0 ? completed.reduce((s, r) => s + r.recall, 0) / completed.length : 0;
+    const avgPrecision = completed.length > 0 ? completed.reduce((s, r) => s + r.precision, 0) / completed.length : 0;
+    const avgF1 = completed.length > 0 ? completed.reduce((s, r) => s + r.f1, 0) / completed.length : 0;
+    
+    app.innerHTML = `
+        <div class="card summary">
+            <h2>🏁 Session Complete!</h2>
+            <div class="final-score">${(avgF1 * 100).toFixed(0)}% F1</div>
+            <p style="color: #64748b;">Average across ${completed.length} challenges</p>
+            
+            <div class="breakdown">
+                <div class="stat"><div class="stat-value">${(avgRecall * 100).toFixed(0)}%</div><div class="stat-label">Recall</div></div>
+                <div class="stat"><div class="stat-value">${(avgPrecision * 100).toFixed(0)}%</div><div class="stat-label">Precision</div></div>
+                <div class="stat"><div class="stat-value">${results.filter(r => r.skipped).length}</div><div class="stat-label">Skipped</div></div>
+            </div>
+            
+            <p style="margin-top: 24px; font-size: 0.9rem; color: #64748b;">
+                This establishes your human baseline. For comparison:<br>
+                FilePredictor (grep): 8% recall<br>
+                Historian (co-change): 25% recall<br>
+                Pattern + Structure: 82% recall<br>
+                <b>You: ${(avgRecall * 100).toFixed(0)}% recall</b>
+            </p>
+            
+            <button class="btn btn-primary" style="margin-top: 20px;" onclick="downloadResults()">Download Results (JSON)</button>
+        </div>
+    `;
+}
+
+function downloadResults() {
+    const data = { session_id: sessionId, timestamp: new Date().toISOString(), results };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `propbench-human-${sessionId}.json`;
+    a.click();
+}
+
+// Start
+render();
+</script>
+
+</body>
+</html>
