@@ -47,6 +47,7 @@ from .multi_invoker import MultiInvokerDetector
 from .playbook_engine import PlaybookEngine, EnsembleConsumerFinder
 from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLATE
 from .confidence import format_pr_body, classify_confidence, should_create_pr
+from .expand_contract import advise as expand_contract_advise, analyze_changes as ec_analyze
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .retry_queue import get_retry_queue, should_retry, should_retry_error
 from .gitlab_support import GitLabClient, parse_gitlab_push_event, verify_gitlab_signature, create_fix_mr
@@ -712,6 +713,9 @@ async def _process_spec_change(
     # Update consumer graph with observations
     graph = get_graph(org)
     
+    # Expand+Contract analysis — suggest safer migration patterns
+    ec_result = ec_analyze(breaking_changes)
+    
     return {
         "status": "processed",
         "spec": spec_path,
@@ -721,6 +725,11 @@ async def _process_spec_change(
         "warnings": warnings,
         "config_loaded": org in _org_configs and bool(_org_configs[org].playbooks),
         "min_confidence": config.min_confidence,
+        "expand_contract": {
+            "avoidable": ec_result["avoidable"],
+            "unavoidable": ec_result["unavoidable"],
+            "summary": ec_result["summary"],
+        },
     }
 
 
