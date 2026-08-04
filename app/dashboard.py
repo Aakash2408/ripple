@@ -115,7 +115,7 @@ async def dashboard():
 <body>
     <div class="container">
         <h1>🌊 Ripple Dashboard</h1>
-        <p class="subtitle">Self-maintaining APIs — 5 contract types, 30 breaking change detections, GitHub + GitLab + Self-Hosted</p>
+        <p class="subtitle">Self-maintaining APIs — 10 contract types, 50+ breaking change detections, GitHub + GitLab + Bitbucket + Self-Hosted</p>
         
         <div style="margin-bottom: 24px;">
             <div class="stat">
@@ -131,7 +131,7 @@ async def dashboard():
                 <div class="stat-label">Breaks Detected</div>
             </div>
             <div class="stat">
-                <div class="stat-value">5</div>
+                <div class="stat-value">10</div>
                 <div class="stat-label">Contract Types</div>
             </div>
         </div>
@@ -164,6 +164,11 @@ async def dashboard():
                 <tr><td>GraphQL</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
                 <tr><td>Database (SQL + Prisma)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
                 <tr><td>AsyncAPI (Kafka, SNS, MQTT)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>Avro (Confluent/Kafka)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>tRPC (TypeScript)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>Thrift (Apache/Meta)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>JSON Schema</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
+                <tr><td>Smithy (AWS)</td><td><span class="badge">Active</span></td><td>Full pipeline (detect → find → fix → PR)</td></tr>
             </table>
         </div>
 

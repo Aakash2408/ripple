@@ -128,6 +128,11 @@ Get the template: `GET /config/template`
 - [x] GraphQL
 - [x] Database schemas (SQL DDL + Prisma)
 - [x] AsyncAPI (Kafka, SNS/SQS, RabbitMQ, MQTT, NATS, WebSockets)
+- [x] Avro (Confluent Schema Registry, Kafka)
+- [x] tRPC (TypeScript full-stack)
+- [x] Thrift (Apache Thrift, Meta/enterprise RPC)
+- [x] JSON Schema (API validation, config schemas)
+- [x] Smithy (AWS services IDL)
 
 ## Supported Change Types
 
