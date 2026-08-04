@@ -38,6 +38,11 @@ from .proto_diff import diff_proto
 from .graphql_diff import diff_graphql
 from .migration_diff import diff_schema
 from .asyncapi_diff import diff_asyncapi
+from .avro_diff import diff_avro
+from .trpc_diff import diff_trpc
+from .thrift_diff import diff_thrift
+from .jsonschema_diff import diff_jsonschema
+from .smithy_diff import diff_smithy
 from .consumer_finder import find_consumers, ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
@@ -368,6 +373,16 @@ async def bitbucket_webhook(request: FastAPIRequest):
             breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
         elif contract_type == "asyncapi":
             breaking_changes = diff_asyncapi(old_content, new_content, file_path=spec_path)
+        elif contract_type == "avro":
+            breaking_changes = diff_avro(old_content, new_content, file_path=spec_path)
+        elif contract_type == "trpc":
+            breaking_changes = diff_trpc(old_content, new_content, file_path=spec_path)
+        elif contract_type == "thrift":
+            breaking_changes = diff_thrift(old_content, new_content, file_path=spec_path)
+        elif contract_type == "jsonschema":
+            breaking_changes = diff_jsonschema(old_content, new_content, file_path=spec_path)
+        elif contract_type == "smithy":
+            breaking_changes = diff_smithy(old_content, new_content, file_path=spec_path)
         else:
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
@@ -505,6 +520,16 @@ async def gitlab_webhook(request: FastAPIRequest):
             breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
         elif contract_type == "asyncapi":
             breaking_changes = diff_asyncapi(old_content, new_content, file_path=spec_path)
+        elif contract_type == "avro":
+            breaking_changes = diff_avro(old_content, new_content, file_path=spec_path)
+        elif contract_type == "trpc":
+            breaking_changes = diff_trpc(old_content, new_content, file_path=spec_path)
+        elif contract_type == "thrift":
+            breaking_changes = diff_thrift(old_content, new_content, file_path=spec_path)
+        elif contract_type == "jsonschema":
+            breaking_changes = diff_jsonschema(old_content, new_content, file_path=spec_path)
+        elif contract_type == "smithy":
+            breaking_changes = diff_smithy(old_content, new_content, file_path=spec_path)
         else:
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
@@ -670,6 +695,26 @@ def _is_spec_file(filepath: str) -> bool:
     if lower.endswith((".yaml", ".yml", ".json")) and any(x in lower for x in ["event", "message", "kafka", "sns", "sqs", "mqtt", "nats", "amqp"]):
         return True
     
+    # Avro
+    if lower.endswith(".avsc") or ("avro" in lower and lower.endswith(".json")):
+        return True
+    
+    # tRPC
+    if "trpc" in lower or "router" in lower and lower.endswith(".ts"):
+        return True
+    
+    # Thrift
+    if lower.endswith(".thrift"):
+        return True
+    
+    # JSON Schema
+    if lower.endswith(".schema.json") or "jsonschema" in lower or "json-schema" in lower:
+        return True
+    
+    # Smithy
+    if lower.endswith(".smithy"):
+        return True
+    
     return False
 
 
@@ -722,6 +767,16 @@ async def _process_spec_change(
         breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
     elif contract_type == "asyncapi":
         breaking_changes = diff_asyncapi(old_content, new_content, file_path=spec_path)
+    elif contract_type == "avro":
+        breaking_changes = diff_avro(old_content, new_content, file_path=spec_path)
+    elif contract_type == "trpc":
+        breaking_changes = diff_trpc(old_content, new_content, file_path=spec_path)
+    elif contract_type == "thrift":
+        breaking_changes = diff_thrift(old_content, new_content, file_path=spec_path)
+    elif contract_type == "jsonschema":
+        breaking_changes = diff_jsonschema(old_content, new_content, file_path=spec_path)
+    elif contract_type == "smithy":
+        breaking_changes = diff_smithy(old_content, new_content, file_path=spec_path)
     else:
         # OpenAPI — needs temp files (legacy interface)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
@@ -885,6 +940,16 @@ def _detect_contract_type(filepath: str) -> str:
         return "database"
     if "asyncapi" in lower or any(x in lower for x in ["event", "kafka", "sns", "sqs", "mqtt", "nats", "amqp"]):
         return "asyncapi"
+    if lower.endswith(".avsc") or "avro" in lower:
+        return "avro"
+    if "trpc" in lower or ("router" in lower and lower.endswith(".ts")):
+        return "trpc"
+    if lower.endswith(".thrift"):
+        return "thrift"
+    if lower.endswith(".schema.json") or "jsonschema" in lower or "json-schema" in lower:
+        return "jsonschema"
+    if lower.endswith(".smithy"):
+        return "smithy"
     return "openapi"
 
 
