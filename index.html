@@ -127,6 +127,41 @@
             .steps { flex-direction: column; align-items: center; gap: 24px; }
             .hero { min-height: 70vh; }
         }
+
+        /* Wave animation */
+        .hero { position: relative; overflow: hidden; }
+        .hero::after {
+            content: '';
+            position: absolute;
+            bottom: -5px;
+            left: 0;
+            width: 200%;
+            height: 80px;
+            background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 120' preserveAspectRatio='none'%3E%3Cpath d='M0,0V46.29c47.79,22.2,103.59,32.17,158,28,70.36-5.37,136.33-33.31,206.8-37.5C438.64,32.43,512.34,53.67,583,72.05c69.27,18,138.3,24.88,209.4,13.08,36.15-6,69.85-17.84,104.45-29.34C989.49,25,1113-14.29,1200,52.47V0Z' fill='%23ffffff' fill-opacity='.1'/%3E%3C/svg%3E") repeat-x;
+            animation: wave 8s linear infinite;
+            opacity: 0.3;
+            pointer-events: none;
+        }
+        @keyframes wave { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+        /* Typewriter */
+        .typewriter-line { opacity: 0; transform: translateY(5px); transition: all 0.3s ease; }
+        .typewriter-line.visible { opacity: 1; transform: translateY(0); }
+
+        /* Animated counter */
+        .counter { display: inline-block; font-weight: 700; font-size: 2rem; color: #0066ff; }
+
+        /* Logo grid */
+        .logo-grid { display: flex; flex-wrap: wrap; gap: 24px; justify-content: center; align-items: center; padding: 20px 0; opacity: 0.7; }
+        .logo-grid span { font-size: 0.9rem; font-weight: 600; color: #475569; padding: 8px 16px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0; }
+
+        /* Comparison table */
+        .compare-table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.9rem; }
+        .compare-table th { background: #0f1419; color: #e6edf3; padding: 12px; text-align: left; }
+        .compare-table td { padding: 10px 12px; border-bottom: 1px solid #f0f0f0; }
+        .compare-table tr:hover { background: #f8fafc; }
+        .compare-table .check { color: #16a34a; font-weight: 700; }
+        .compare-table .cross { color: #dc2626; }
     </style>
 </head>
 <body>
@@ -148,8 +183,8 @@
     </div>
     
     <div class="badges">
-        <span class="badge badge-green">✓ 82 tests passing</span>
-        <span class="badge badge-blue">✓ 50+ breaking change types</span>
+        <span class="badge badge-green">✓ <span class="counter" data-target="82">0</span> tests passing</span>
+        <span class="badge badge-blue">✓ <span class="counter" data-target="50">0</span>+ breaking change types</span>
         <span class="badge badge-purple">✓ GitHub + GitLab + Bitbucket</span>
     </div>
 </div>
@@ -316,6 +351,25 @@
     </div>
 </div>
 
+
+<div class="section" style="padding: 40px 24px;">
+    <p style="text-align: center; color: #94a3b8; font-size: 0.85rem; margin-bottom: 16px;">Works with</p>
+    <div class="logo-grid">
+        <span>GitHub</span>
+        <span>GitLab</span>
+        <span>Bitbucket</span>
+        <span>Kafka</span>
+        <span>gRPC</span>
+        <span>GraphQL</span>
+        <span>PostgreSQL</span>
+        <span>Prisma</span>
+        <span>AWS</span>
+        <span>TypeScript</span>
+        <span>Python</span>
+        <span>Java</span>
+    </div>
+</div>
+
 <div class="section" id="self-hosted">
     <h2>Self-Hosted Agent</h2>
     <p class="section-desc">For custom platforms, on-prem Git, or air-gapped networks.</p>
@@ -349,6 +403,27 @@
         <div class="feature"><h3>🤖 Not AI code review</h3><p>Code review finds bugs in what you wrote. Ripple fixes what you forgot to update.</p></div>
         <div class="feature"><h3>🏗️ Not SDK generation</h3><p>SDK generators rebuild from scratch. Ripple patches your EXISTING consumer code.</p></div>
     </div>
+</div>
+
+
+<div class="section">
+    <h2>How Ripple Compares</h2>
+    <table class="compare-table">
+        <thead>
+            <tr><th>Feature</th><th>Ripple</th><th>Dependabot</th><th>Optic</th><th>buf</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Detects API breaking changes</td><td class="check">✓</td><td class="cross">✗</td><td class="check">✓</td><td class="check">✓</td></tr>
+            <tr><td>Finds affected consumers</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+            <tr><td>Generates fix code</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+            <tr><td>Opens PRs/MRs automatically</td><td class="check">✓</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+            <tr><td>OpenAPI + Proto + GraphQL</td><td class="check">✓ (10 types)</td><td class="cross">✗</td><td>OpenAPI only</td><td>Proto only</td></tr>
+            <tr><td>Learns from git history</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+            <tr><td>GitHub + GitLab + Bitbucket</td><td class="check">✓</td><td>GitHub only</td><td>GitHub only</td><td>GitHub only</td></tr>
+            <tr><td>Self-hosted agent</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+            <tr><td>Expand+contract advisor</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+        </tbody>
+    </table>
 </div>
 
 <div class="section" style="text-align: center;">
@@ -387,6 +462,49 @@ const observer = new IntersectionObserver((entries) => {
 }, { threshold: 0.1 });
 
 document.querySelectorAll('.section').forEach(el => observer.observe(el));
+
+// Typewriter effect for terminal
+const terminalLines = document.querySelectorAll('#terminal br');
+let lineIndex = 0;
+const termEl = document.getElementById('terminal');
+if (termEl) {
+    const html = termEl.innerHTML;
+    const lines = html.split('<br>');
+    termEl.innerHTML = lines.map((l, i) => `<span class="typewriter-line" style="transition-delay: ${i * 0.15}s">${l}</span>`).join('<br>');
+    
+    const typeObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                entry.target.querySelectorAll('.typewriter-line').forEach(line => {
+                    line.classList.add('visible');
+                });
+            }
+        });
+    }, { threshold: 0.3 });
+    typeObserver.observe(termEl);
+}
+
+// Animated counters
+function animateCounter(el, target, duration = 1500) {
+    let start = 0;
+    const step = target / (duration / 16);
+    const timer = setInterval(() => {
+        start += step;
+        if (start >= target) { el.textContent = target + '+'; clearInterval(timer); }
+        else { el.textContent = Math.floor(start); }
+    }, 16);
+}
+
+const counterObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting && !entry.target.dataset.animated) {
+            entry.target.dataset.animated = 'true';
+            animateCounter(entry.target, parseInt(entry.target.dataset.target));
+        }
+    });
+});
+document.querySelectorAll('.counter').forEach(el => counterObserver.observe(el));
+
 </script>
 
 </body>
