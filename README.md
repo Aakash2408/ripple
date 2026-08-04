@@ -258,11 +258,33 @@ Ripple works with GitLab too. Setup:
 
 Works with all 4 contract types (OpenAPI, Proto, GraphQL, Database) on GitLab.
 
+## Bitbucket Support
+
+Ripple works with Bitbucket Cloud. Setup:
+
+1. **Create App Password:**
+   - Bitbucket → Settings → App passwords → Create
+   - Permissions: ✅ Repositories (read+write), ✅ Pull requests (read+write)
+
+2. **Set environment variables:**
+   ```bash
+   BITBUCKET_USERNAME=your-username
+   BITBUCKET_APP_PASSWORD=your-app-password
+   ```
+
+3. **Add webhook to your repository:**
+   - Repository → Settings → Webhooks → Add webhook
+   - URL: `https://your-ripple-server.com/webhook/bitbucket`
+   - Triggers: ✅ Repository Push
+
+4. **Push a breaking change** — Ripple creates a Pull Request with the fix.
+
 ## API Reference
 
 ```
 POST /webhook           — GitHub push events (auto-triggered by GitHub App)
 POST /webhook/gitlab    — GitLab push events
+POST /webhook/bitbucket — Bitbucket push events
 POST /webhook/install   — GitHub App installation (triggers learning)
 POST /learn             — Manually trigger co-change learning
 GET  /dashboard         — Web UI (monitored repos, activity, stats)

@@ -51,6 +51,7 @@ from .expand_contract import advise as expand_contract_advise, analyze_changes a
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .retry_queue import get_retry_queue, should_retry, should_retry_error
 from .gitlab_support import GitLabClient, parse_gitlab_push_event, verify_gitlab_signature, create_fix_mr
+from .bitbucket_support import BitbucketClient, parse_bitbucket_push_event, verify_bitbucket_signature, create_fix_pr as bb_create_fix_pr
 from .dashboard import router as dashboard_router
 from .gitlab_setup import router as gitlab_setup_router
 from .gitlab_oauth import router as gitlab_oauth_router
@@ -282,6 +283,142 @@ async def github_webhook(request: FastAPIRequest):
         results.append(result)
     
     return {"status": "processed", "results": results}
+
+
+# === Bitbucket Webhook ===
+
+@app.post("/webhook/bitbucket")
+async def bitbucket_webhook(request: FastAPIRequest):
+    """
+    Receives Bitbucket push events and triggers the Ripple pipeline.
+    
+    Setup: Repository → Settings → Webhooks → Add webhook
+    URL: https://your-server/webhook/bitbucket
+    Triggers: Repository Push
+    """
+    body = await request.body()
+    payload = json.loads(body)
+    
+    # Verify signature
+    secret = os.environ.get("BITBUCKET_WEBHOOK_SECRET", "")
+    sig_header = request.headers.get("X-Hub-Signature", "")
+    if not verify_bitbucket_signature(body, secret, sig_header):
+        raise HTTPException(status_code=401, detail="Invalid Bitbucket signature")
+    
+    # Only handle push events
+    event_type = request.headers.get("X-Event-Key", "")
+    if event_type != "repo:push":
+        return {"status": "ignored", "reason": f"event_type={event_type}"}
+    
+    # Parse event
+    event = parse_bitbucket_push_event(payload)
+    
+    # Rate limit
+    org = event["workspace"]
+    limiter = get_rate_limiter()
+    allowed, reason = limiter.check(org)
+    if not allowed:
+        return {"status": "rate_limited", "reason": reason}
+    
+    # Find spec files that changed
+    # Bitbucket push events don't always include file lists — fetch diff
+    client = BitbucketClient()
+    
+    if not event["before"] or not event["after"]:
+        return {"status": "ignored", "reason": "missing before/after SHA"}
+    
+    # Process: fetch old/new spec, diff, find consumers, create PRs
+    results = []
+    
+    # For now, check if any spec files were modified by comparing commits
+    # Bitbucket requires fetching the diffstat
+    diffstat = client._request(
+        "GET",
+        f"/repositories/{event['workspace']}/{event['repo_slug']}/diffstat/{event['before']}..{event['after']}"
+    )
+    
+    spec_files = []
+    if "values" in diffstat:
+        for file_change in diffstat["values"]:
+            file_path = file_change.get("new", {}).get("path", "") or file_change.get("old", {}).get("path", "")
+            if _is_spec_file(file_path):
+                spec_files.append(file_path)
+    
+    if not spec_files:
+        return {"status": "ignored", "reason": "no spec files changed"}
+    
+    for spec_path in spec_files:
+        old_content = client.get_file_at_commit(event["workspace"], event["repo_slug"], spec_path, event["before"])
+        new_content = client.get_file_at_commit(event["workspace"], event["repo_slug"], spec_path, event["after"])
+        
+        if not old_content or not new_content:
+            results.append({"spec": spec_path, "status": "error", "reason": "could not fetch versions"})
+            continue
+        
+        # Route to correct diff engine
+        contract_type = _detect_contract_type(spec_path)
+        
+        if contract_type == "proto":
+            breaking_changes = diff_proto(old_content, new_content, file_path=spec_path)
+        elif contract_type == "graphql":
+            breaking_changes = diff_graphql(old_content, new_content, file_path=spec_path)
+        elif contract_type == "database":
+            breaking_changes = diff_schema(old_content, new_content, file_path=spec_path)
+        elif contract_type == "asyncapi":
+            breaking_changes = diff_asyncapi(old_content, new_content, file_path=spec_path)
+        else:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(old_content)
+                old_path = f.name
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(new_content)
+                new_path = f.name
+            diff_result = diff_specs(old_path, new_path)
+            os.unlink(old_path)
+            os.unlink(new_path)
+            breaking_changes = diff_result.breaking_changes
+        
+        if not breaking_changes:
+            results.append({"spec": spec_path, "status": "no_breaking_changes"})
+            continue
+        
+        # Find consumers and create PRs
+        prs_created = []
+        for change in breaking_changes:
+            consumers = client.search_code(event["workspace"], event["repo_slug"], change.path)
+            for consumer in consumers[:5]:
+                consumer_path = consumer.get("path", "")
+                if consumer_path == spec_path or not consumer_path:
+                    continue
+                consumer_content = client.get_file(event["workspace"], event["repo_slug"], consumer_path)
+                if consumer_content:
+                    from .consumer_finder import ConsumerMatch
+                    from .fix_generator import _generate_with_template
+                    consumer_match = ConsumerMatch(
+                        file_path=consumer_path, line_number=0, code_snippet="",
+                        confidence="high", match_reason="Code search match",
+                        language=_detect_lang(consumer_path),
+                    )
+                    fixed_code, explanation = _generate_with_template(consumer_content, consumer_match, change)
+                    if fixed_code != consumer_content:
+                        pr_url = bb_create_fix_pr(
+                            client, event["workspace"], event["repo_slug"],
+                            consumer_path, fixed_code,
+                            f"Add required field '{change.field_name}' to {change.method} {change.path}",
+                        )
+                        if pr_url:
+                            prs_created.append(pr_url)
+                            limiter.record_pr_opened(org)
+        
+        results.append({
+            "spec": spec_path,
+            "status": "processed",
+            "breaking_changes": len(breaking_changes),
+            "prs_created": prs_created,
+        })
+    
+    return {"status": "processed", "platform": "bitbucket", "results": results}
 
 
 # === GitLab Webhook ===
