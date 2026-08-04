@@ -55,6 +55,7 @@ from .bitbucket_support import BitbucketClient, parse_bitbucket_push_event, veri
 from .dashboard import router as dashboard_router
 from .gitlab_setup import router as gitlab_setup_router
 from .gitlab_oauth import router as gitlab_oauth_router
+from .bitbucket_oauth import router as bitbucket_oauth_router
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
 
@@ -69,6 +70,7 @@ app.add_middleware(
 app.include_router(dashboard_router)
 app.include_router(gitlab_setup_router)
 app.include_router(gitlab_oauth_router)
+app.include_router(bitbucket_oauth_router)
 
 # SSL context for GitHub API calls (Amazon dev desktop fix)
 SSL_CTX = ssl.create_default_context()
