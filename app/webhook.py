@@ -61,8 +61,12 @@ from .dashboard import router as dashboard_router
 from .gitlab_setup import router as gitlab_setup_router
 from .gitlab_oauth import router as gitlab_oauth_router
 from .bitbucket_oauth import router as bitbucket_oauth_router
+from . import token_store
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
+
+# Initialize persistent token store (loads saved tokens from disk)
+token_store.init()
 
 # CORS — allow PropBench UI (GitHub Pages) to POST results
 from fastapi.middleware.cors import CORSMiddleware

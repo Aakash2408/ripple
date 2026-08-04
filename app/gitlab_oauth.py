@@ -39,6 +39,8 @@ try:
 except ImportError:
     pass
 
+from . import token_store
+
 router = APIRouter()
 
 # SSL context
@@ -46,10 +48,8 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
-# In-memory storage (swap to DB in production)
+# Only OAuth states are ephemeral (short-lived, OK to lose on restart)
 _oauth_states: dict[str, dict] = {}  # state → metadata
-_user_tokens: dict[str, dict] = {}   # user_id → {token, projects, ...}
-_monitored_projects: dict[int, dict] = {}  # project_id → {token, webhook_id, ...}
 
 # Config
 GITLAB_URL = "https://gitlab.com"
@@ -129,12 +129,8 @@ async def gitlab_auth_callback(code: str = "", state: str = "", error: str = "")
     user_id = str(user.get("id", "unknown"))
     username = user.get("username", "unknown")
     
-    # Store token
-    _user_tokens[user_id] = {
-        "token": access_token,
-        "username": username,
-        "refresh_token": token_data.get("refresh_token", ""),
-    }
+    # Store token (persistent)
+    token_store.save_gitlab_user(user_id, access_token, username, token_data.get("refresh_token", ""))
     
     # List user's projects and auto-install webhooks
     projects = _gitlab_api("GET", "/projects?owned=true&per_page=50", access_token)
@@ -148,11 +144,7 @@ async def gitlab_auth_callback(code: str = "", state: str = "", error: str = "")
             # Add webhook to each project
             webhook_result = _add_webhook(project_id, access_token)
             if webhook_result and "id" in webhook_result:
-                _monitored_projects[project_id] = {
-                    "token": access_token,
-                    "webhook_id": webhook_result["id"],
-                    "name": project_name,
-                }
+                token_store.save_gitlab_project(project_id, access_token, webhook_result["id"], project_name)
                 installed_projects.append(project_name)
     
     # Return success page
@@ -162,12 +154,14 @@ async def gitlab_auth_callback(code: str = "", state: str = "", error: str = "")
 @router.get("/auth/gitlab/status")
 async def gitlab_auth_status():
     """Check how many GitLab projects are connected."""
+    users = token_store.get_gitlab_users()
+    projects = token_store.get_gitlab_projects()
     return {
-        "connected_users": len(_user_tokens),
-        "monitored_projects": len(_monitored_projects),
+        "connected_users": len(users),
+        "monitored_projects": len(projects),
         "projects": [
             {"id": pid, "name": info["name"]}
-            for pid, info in _monitored_projects.items()
+            for pid, info in projects.items()
         ],
     }
 
@@ -209,9 +203,8 @@ def _add_webhook(project_id: int, token: str) -> dict:
 
 
 def get_token_for_project(project_id: int) -> str:
-    """Get stored OAuth token for a monitored project."""
-    info = _monitored_projects.get(project_id)
-    return info["token"] if info else ""
+    """Get stored OAuth token for a monitored project (persistent)."""
+    return token_store.get_gitlab_token_for_project(project_id)
 
 
 # === HTML Templates ===

@@ -40,10 +40,10 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
-# Storage
+# Only OAuth states are ephemeral (short-lived)
 _oauth_states: dict[str, dict] = {}
-_user_tokens: dict[str, dict] = {}
-_monitored_repos: dict[str, dict] = {}
+
+from . import token_store
 
 # Config
 BITBUCKET_CLIENT_ID = os.environ.get("BITBUCKET_CLIENT_ID", "")
@@ -109,10 +109,7 @@ async def bitbucket_auth_callback(code: str = "", state: str = "", error: str = 
     user = _bb_api("GET", "https://api.bitbucket.org/2.0/user", access_token)
     username = user.get("username", user.get("display_name", "unknown"))
     
-    _user_tokens[username] = {
-        "token": access_token,
-        "refresh_token": token_data.get("refresh_token", ""),
-    }
+    token_store.save_bitbucket_user(username, access_token, username, token_data.get("refresh_token", ""))
     
     # List user's repos and install webhooks
     repos_data = _bb_api("GET", "https://api.bitbucket.org/2.0/repositories?role=admin&pagelen=50", access_token)
@@ -127,10 +124,7 @@ async def bitbucket_auth_callback(code: str = "", state: str = "", error: str = 
             # Add webhook
             webhook_result = _add_webhook(workspace, repo_slug, access_token)
             if webhook_result and "uuid" in webhook_result:
-                _monitored_repos[full_name] = {
-                    "token": access_token,
-                    "webhook_uuid": webhook_result["uuid"],
-                }
+                token_store.save_bitbucket_repo(full_name, access_token, webhook_result["uuid"], full_name)
                 installed_repos.append(full_name)
     
     return HTMLResponse(content=_success_html(username, installed_repos))
@@ -139,10 +133,12 @@ async def bitbucket_auth_callback(code: str = "", state: str = "", error: str = 
 @router.get("/auth/bitbucket/status")
 async def bitbucket_auth_status():
     """Check connected Bitbucket repos."""
+    users = token_store.get_bitbucket_users()
+    repos = token_store.get_bitbucket_repos()
     return {
-        "connected_users": len(_user_tokens),
-        "monitored_repos": len(_monitored_repos),
-        "repos": list(_monitored_repos.keys()),
+        "connected_users": len(users),
+        "monitored_repos": len(repos),
+        "repos": list(repos.keys()),
     }
 
 
