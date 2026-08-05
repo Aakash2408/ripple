@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ripple — Pitch Deck</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+@page { size: landscape; margin: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e4e4e7; }
+
+.slide {
+    width: 100vw; height: 100vh;
+    padding: 60px 80px;
+    display: flex; flex-direction: column; justify-content: center;
+    page-break-after: always;
+    position: relative;
+    overflow: hidden;
+}
+.slide::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background-image: linear-gradient(rgba(59,130,246,0.03) 1px, transparent 1px),
+                      linear-gradient(90deg, rgba(59,130,246,0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
+    pointer-events: none;
+}
+
+h1 { font-size: 3.5rem; font-weight: 800; margin-bottom: 16px; line-height: 1.1; }
+h2 { font-size: 2.5rem; font-weight: 700; margin-bottom: 24px; color: #fff; }
+h3 { font-size: 1.4rem; font-weight: 600; margin-bottom: 12px; color: #3b82f6; text-transform: uppercase; letter-spacing: 2px; font-size: 0.9rem; }
+p { font-size: 1.3rem; color: #94a3b8; line-height: 1.6; max-width: 800px; }
+ul { list-style: none; padding: 0; }
+ul li { font-size: 1.2rem; color: #94a3b8; padding: 8px 0; padding-left: 24px; position: relative; }
+ul li::before { content: '→'; position: absolute; left: 0; color: #3b82f6; }
+
+.accent { color: #3b82f6; }
+.green { color: #22c55e; }
+.orange { color: #f97316; }
+.big-number { font-size: 4rem; font-weight: 800; color: #fff; }
+.subtitle { font-size: 1.1rem; color: #64748b; margin-top: 8px; }
+
+.logo { font-size: 4rem; margin-bottom: 20px; }
+.tagline { font-size: 1.8rem; color: #94a3b8; font-weight: 400; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: start; }
+.three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 40px; }
+
+.card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 24px;
+}
+.card h4 { font-size: 1.1rem; margin-bottom: 8px; color: #fff; }
+.card p { font-size: 1rem; }
+
+.stat-row { display: flex; gap: 48px; margin-top: 32px; }
+.stat-item .number { font-size: 2.5rem; font-weight: 800; color: #3b82f6; }
+.stat-item .label { font-size: 0.9rem; color: #64748b; }
+
+table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 1rem; }
+th { color: #64748b; font-weight: 500; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
+td { color: #e4e4e7; }
+.check { color: #22c55e; }
+.cross { color: #ef4444; }
+
+.slide-number { position: absolute; bottom: 30px; right: 40px; font-size: 0.8rem; color: #334155; }
+.brand { position: absolute; bottom: 30px; left: 40px; font-size: 0.8rem; color: #334155; }
+
+@media print {
+    .slide { width: 100%; height: 100vh; }
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+</head>
+<body>
+
+<!-- SLIDE 1: Title -->
+<div class="slide">
+    <div class="logo">🌊</div>
+    <h1>Ripple</h1>
+    <p class="tagline">Self-maintaining APIs.<br>Push a breaking change → fix PRs appear in every consumer repo.</p>
+    <div style="margin-top: 40px;">
+        <p style="font-size: 1rem; color: #64748b;">Aakash Sangwan · Solo Founder · aakashsangwan024@gmail.com</p>
+        <p style="font-size: 1rem; color: #64748b;">github.com/Aakash2408/ripple</p>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">1</span>
+</div>
+
+<!-- SLIDE 2: Problem -->
+<div class="slide">
+    <h3>The Problem</h3>
+    <h2>API changes break things.<br>Fixing them takes <span class="orange">days</span>.</h2>
+    <ul>
+        <li>Engineer changes <code>user.proto</code> — removes a field</li>
+        <li>5 downstream services break silently</li>
+        <li>2-3 days of Slack pinging to coordinate fixes</li>
+        <li>3-6 engineers involved per propagation event</li>
+        <li>2-4 packages touched manually</li>
+    </ul>
+    <p style="margin-top: 24px; font-size: 1.1rem; color: #f97316;">This happens every week at every company with microservices.</p>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">2</span>
+</div>
+
+<!-- SLIDE 3: Solution -->
+<div class="slide">
+    <h3>The Solution</h3>
+    <h2>Push a breaking change.<br>Fix PRs appear in <span class="green">15 seconds</span>.</h2>
+    <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px; margin-top: 24px; font-family: monospace; font-size: 1.1rem; line-height: 2;">
+        <span style="color: #64748b;">$</span> git push origin main<br>
+        <span style="color: #f97316;">⚠️</span> 1 breaking change detected in user.proto<br>
+        <span style="color: #22c55e;">✅</span> python-sdk/client.py — fixed<br>
+        <span style="color: #22c55e;">✅</span> node-api/handlers/user.ts — fixed<br>
+        <span style="color: #22c55e;">✅</span> java-gateway/UserService.java — fixed<br>
+        <span style="color: #3b82f6;">🌊</span> 3 PRs opened. Done in 15s.
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">3</span>
+</div>
+
+<!-- SLIDE 4: How it works -->
+<div class="slide">
+    <h3>How It Works</h3>
+    <h2>Detect → Find → Fix → PR</h2>
+    <div class="three-col" style="margin-top: 32px;">
+        <div class="card">
+            <h4>1. Detect</h4>
+            <p>Custom diff engines for 10 contract types. Understands semantics — not just text diff.</p>
+        </div>
+        <div class="card">
+            <h4>2. Find Consumers</h4>
+            <p>Ensemble of 5 strategies: grep + imports + git history + playbooks + multi-invoker.</p>
+        </div>
+        <div class="card">
+            <h4>3. Fix + PR</h4>
+            <p>Template-based or LLM-powered fix generation. Opens PR with explanation.</p>
+        </div>
+    </div>
+    <div class="stat-row">
+        <div class="stat-item"><div class="number">10</div><div class="label">Contract types</div></div>
+        <div class="stat-item"><div class="number">50+</div><div class="label">Breaking change detections</div></div>
+        <div class="stat-item"><div class="number">3</div><div class="label">Platforms (GitHub/GitLab/Bitbucket)</div></div>
+        <div class="stat-item"><div class="number">15s</div><div class="label">End-to-end time</div></div>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">4</span>
+</div>
+
+<!-- SLIDE 5: Contract Types -->
+<div class="slide">
+    <h3>Coverage</h3>
+    <h2>10 contract types. Every major format.</h2>
+    <div class="three-col" style="margin-top: 24px;">
+        <div>
+            <ul>
+                <li>OpenAPI / Swagger</li>
+                <li>Protobuf / gRPC</li>
+                <li>GraphQL</li>
+                <li>Database (SQL + Prisma)</li>
+            </ul>
+        </div>
+        <div>
+            <ul>
+                <li>AsyncAPI (Kafka, SNS)</li>
+                <li>Avro (Confluent)</li>
+                <li>tRPC (TypeScript)</li>
+            </ul>
+        </div>
+        <div>
+            <ul>
+                <li>Thrift (Apache/Meta)</li>
+                <li>JSON Schema</li>
+                <li>Smithy (AWS)</li>
+            </ul>
+        </div>
+    </div>
+    <p style="margin-top: 32px;">No competitor covers more than 2.</p>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">5</span>
+</div>
+
+<!-- SLIDE 6: Competition -->
+<div class="slide">
+    <h3>Competitive Landscape</h3>
+    <h2>They detect. We <span class="green">fix</span>.</h2>
+    <table>
+        <tr><th></th><th>Detect changes</th><th>Find consumers</th><th>Generate fix</th><th>Open PR</th><th>Multi-platform</th></tr>
+        <tr><td><strong>Dependabot</strong></td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="check">✓</td><td class="cross">✗</td></tr>
+        <tr><td><strong>Optic</strong></td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+        <tr><td><strong>buf</strong></td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
+        <tr><td><strong style="color: #3b82f6;">Ripple</strong></td><td class="check">✓</td><td class="check">✓</td><td class="check">✓</td><td class="check">✓</td><td class="check">✓</td></tr>
+    </table>
+    <p style="margin-top: 24px;">The "last mile" — finding consumers and generating fixes — is where all the manual work lives. Nobody else does it.</p>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">6</span>
+</div>
+
+<!-- SLIDE 7: Research Moat -->
+<div class="slide">
+    <h3>Research Moat</h3>
+    <h2>PropBench: 82% of "engineering judgment" is learnable</h2>
+    <div class="two-col" style="margin-top: 24px;">
+        <div>
+            <ul>
+                <li><strong style="color:#fff;">268</strong> real engineering changes analyzed</li>
+                <li><strong style="color:#fff;">1,223</strong> consequence files classified</li>
+                <li><strong style="color:#fff;">24</strong> repositories (industrial + OSS)</li>
+                <li><strong style="color:#fff;">8</strong> miss categories identified</li>
+            </ul>
+            <p style="margin-top: 16px; font-size: 1rem;">Paper pending publication (arXiv/Zenodo)</p>
+        </div>
+        <div>
+            <div class="card">
+                <h4>Key Finding</h4>
+                <p style="font-size: 0.95rem;">Naming conventions alone: <strong style="color:#fff;">7%</strong> recall<br>
+                + Git history learning: <strong style="color:#fff;">17-38%</strong> recall<br>
+                + Ensemble (all channels): <strong style="color:#fff;">82%</strong> package recall</p>
+                <p style="margin-top: 12px; font-size: 0.9rem; color: #22c55e;">Change propagation is not magic — it's pattern matching.</p>
+            </div>
+        </div>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">7</span>
+</div>
+
+<!-- SLIDE 8: Market -->
+<div class="slide">
+    <h3>Market</h3>
+    <h2>Every company with microservices.</h2>
+    <div class="two-col" style="margin-top: 24px;">
+        <div>
+            <div class="stat-item"><div class="number">$2B+</div><div class="label">DevTools TAM (API tooling segment)</div></div>
+            <div class="stat-item" style="margin-top: 24px;"><div class="number">85%</div><div class="label">of companies with >100 engineers use microservices</div></div>
+        </div>
+        <div>
+            <ul>
+                <li>Fintech (many services, strict contracts)</li>
+                <li>E-commerce (rapid API evolution)</li>
+                <li>SaaS platforms (public APIs + SDKs)</li>
+                <li>Platform teams at FAANG (internal tooling budget)</li>
+            </ul>
+        </div>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">8</span>
+</div>
+
+<!-- SLIDE 9: Business Model -->
+<div class="slide">
+    <h3>Business Model</h3>
+    <h2>Open core. Free to start, pay to scale.</h2>
+    <div class="three-col" style="margin-top: 32px;">
+        <div class="card">
+            <h4>Free (OSS)</h4>
+            <p>Self-hosted. 1 org. Community support. All 10 engines.</p>
+            <p style="margin-top: 12px; font-size: 1.5rem; font-weight: 700; color: #fff;">$0</p>
+        </div>
+        <div class="card" style="border-color: #3b82f6;">
+            <h4>Team</h4>
+            <p>Cloud-hosted. Unlimited repos. History learning. Priority support.</p>
+            <p style="margin-top: 12px; font-size: 1.5rem; font-weight: 700; color: #3b82f6;">$49/mo</p>
+        </div>
+        <div class="card">
+            <h4>Enterprise</h4>
+            <p>On-prem agent. SSO. Custom playbooks. SLA. Dedicated support.</p>
+            <p style="margin-top: 12px; font-size: 1.5rem; font-weight: 700; color: #fff;">Custom</p>
+        </div>
+    </div>
+    <p style="margin-top: 24px;">Land with free (OSS). Expand to paid when team scales beyond 5 repos.</p>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">9</span>
+</div>
+
+<!-- SLIDE 10: Traction -->
+<div class="slide">
+    <h3>Traction</h3>
+    <h2>Built in 6 days. Live in production.</h2>
+    <div class="two-col" style="margin-top: 24px;">
+        <div>
+            <ul>
+                <li><span class="green">✓</span> Product live on Railway (auto-deploys)</li>
+                <li><span class="green">✓</span> GitHub App installable (one click)</li>
+                <li><span class="green">✓</span> GitLab OAuth + webhooks working</li>
+                <li><span class="green">✓</span> Bitbucket OAuth + webhooks working</li>
+                <li><span class="green">✓</span> End-to-end proven (push → MR in 15s on GitLab)</li>
+                <li><span class="green">✓</span> 82 passing tests</li>
+                <li><span class="green">✓</span> Dark landing page live</li>
+                <li><span class="green">✓</span> Dev.to blog post published</li>
+            </ul>
+        </div>
+        <div>
+            <ul>
+                <li><span class="green">✓</span> Self-hosted Docker agent</li>
+                <li><span class="green">✓</span> Expand+contract advisor</li>
+                <li><span class="green">✓</span> Custom playbooks (.ripple.yaml)</li>
+                <li><span class="green">✓</span> Confidence scoring</li>
+                <li><span class="green">✓</span> Rate limiting</li>
+                <li><span class="green">✓</span> Token persistence (survives redeploys)</li>
+                <li><span class="orange">○</span> Looking for first 10 paying teams</li>
+            </ul>
+        </div>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">10</span>
+</div>
+
+<!-- SLIDE 11: The Ask -->
+<div class="slide">
+    <h3>The Ask</h3>
+    <h2>$500K to go full-time and get to 50 teams.</h2>
+    <div class="two-col" style="margin-top: 32px;">
+        <div>
+            <h4 style="color: #fff; margin-bottom: 16px;">Use of Funds (18 months)</h4>
+            <ul>
+                <li>Go full-time (quit Amazon)</li>
+                <li>Hire 1 engineer (consumer detection + fix quality)</li>
+                <li>Infrastructure (hosting, CI, LLM API costs)</li>
+                <li>Developer marketing + community</li>
+            </ul>
+        </div>
+        <div>
+            <h4 style="color: #fff; margin-bottom: 16px;">Milestones</h4>
+            <ul>
+                <li><strong style="color:#fff;">Month 3:</strong> 10 installed teams</li>
+                <li><strong style="color:#fff;">Month 6:</strong> 50 teams, first revenue ($49/mo)</li>
+                <li><strong style="color:#fff;">Month 12:</strong> $50K ARR, enterprise pilot</li>
+                <li><strong style="color:#fff;">Month 18:</strong> Series A ready</li>
+            </ul>
+        </div>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">11</span>
+</div>
+
+<!-- SLIDE 12: Team -->
+<div class="slide">
+    <h3>Team</h3>
+    <h2>Aakash Sangwan — Solo Founder</h2>
+    <div class="two-col" style="margin-top: 24px;">
+        <div>
+            <ul>
+                <li>SDE at Amazon — Geospatial AI & Delivery Infrastructure</li>
+                <li>Built event-driven systems processing millions of daily events</li>
+                <li>Designed LLM agent farms (Bedrock, cross-account CDK)</li>
+                <li>Led operational readiness for 9 production services</li>
+                <li>Built Ripple (full product) in 6 days alongside full-time job</li>
+                <li>PropBench research: 268 entries, paper-quality evaluation</li>
+            </ul>
+        </div>
+        <div>
+            <div class="card">
+                <h4>Why me?</h4>
+                <p style="font-size: 0.95rem;">I live this problem daily — coordinating API changes across 18+ repos at Amazon. I built the research (PropBench) to prove it's solvable, then built the product (Ripple) to solve it. Full-stack: backend, infra, ML, frontend, DevOps. Ready to go full-time immediately.</p>
+            </div>
+            <div style="margin-top: 16px;">
+                <p style="font-size: 0.9rem; color: #64748b;">
+                    github.com/Aakash2408<br>
+                    linkedin.com/in/aakash-sangwan<br>
+                    aakashsangwan024@gmail.com
+                </p>
+            </div>
+        </div>
+    </div>
+    <span class="brand">Ripple 🌊</span>
+    <span class="slide-number">12</span>
+</div>
+
+</body>
+</html>
