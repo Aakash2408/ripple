@@ -153,10 +153,12 @@ def _basic_diff(before: str, after: str, contract_type: str) -> list[BreakingCha
                 field_type="endpoint",
                 path=path,
                 method="*",
+                location="path",
+                severity="breaking",
                 description=f"Endpoint {path} was removed",
             ))
         
-        # Check for removed fields in response schemas
+        # Check for removed methods
         for path in before_paths & after_paths:
             _check_schema_changes(before_data, after_data, path, changes)
     
@@ -178,6 +180,8 @@ def _check_schema_changes(before_data: dict, after_data: dict, path: str, change
                 field_type="method",
                 path=path,
                 method=method,
+                location="path",
+                severity="breaking",
                 description=f"Method {method.upper()} removed from {path}",
             ))
 
