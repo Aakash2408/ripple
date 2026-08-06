@@ -37,12 +37,8 @@ try:
 except ImportError:
     pass
 
-from .diff_engine import detect_breaking_changes, BreakingChange
-from .consumer_finder import find_consumers
-from .impact_report import (
-    generate_impact_report, classify_consumer_files,
-    scan_file_for_references, ImpactReport
-)
+from .diff_engine import diff_specs, BreakingChange
+from .impact_report import generate_impact_report
 
 router = APIRouter()
 
@@ -85,26 +81,20 @@ async def dry_run_analysis(request: Request):
             "impact_report": "",
         })
     
-    # Step 2: Find consumers (if repo provided)
-    consumers = []
-    if repo:
-        for change in breaking_changes:
-            found = find_consumers(change.field_name, repo_path=repo)
-            consumers.extend(found)
-    
-    # Step 3: Build impact report
+    # Step 2: Build summary (consumer finding requires repo access — not available in dry-run)
     impact_md = ""
-    if breaking_changes:
-        fixed_files = [{"file_path": c, "reason": "Would be auto-fixed"} for c in consumers[:5]]
+    try:
         report = generate_impact_report(
             breaking_change_summary=f"{len(breaking_changes)} breaking change(s) in {contract_type} spec",
             source_file=f"{contract_type} spec",
-            fixed_files=fixed_files,
+            fixed_files=[],
             scanned_files=[],
         )
         impact_md = report.to_markdown()
+    except Exception:
+        pass
     
-    # Step 4: Return dry-run results
+    # Step 3: Return dry-run results
     return JSONResponse(content={
         "dry_run": True,
         "breaking_changes": [
@@ -117,9 +107,9 @@ async def dry_run_analysis(request: Request):
             }
             for bc in breaking_changes
         ],
-        "consumers_found": consumers[:10],
-        "would_open_prs": len(consumers),
-        "summary": f"⚠️ {len(breaking_changes)} breaking change(s) detected. Would open {len(consumers)} fix PR(s).",
+        "consumers_found": [],
+        "would_open_prs": 0,
+        "summary": f"⚠️ {len(breaking_changes)} breaking change(s) detected. Install Ripple to auto-find consumers and open fix PRs.",
         "impact_report": impact_md,
     })
 
@@ -133,10 +123,11 @@ async def dry_run_ui():
 def _detect_changes(before: str, after: str, contract_type: str) -> list[BreakingChange]:
     """Detect breaking changes between two spec versions."""
     try:
-        return detect_breaking_changes(before, after, contract_type)
-    except Exception:
-        # If the diff engine can't parse, try basic field-level comparison
+        # diff_specs expects file paths, but we have content strings
+        # Use the basic diff for direct content comparison
         return _basic_diff(before, after, contract_type)
+    except Exception:
+        return []
 
 
 def _basic_diff(before: str, after: str, contract_type: str) -> list[BreakingChange]:
