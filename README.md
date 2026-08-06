@@ -31,8 +31,6 @@ Ripple detects breaking API changes, finds every consumer, generates the fix, an
 ✅ Done in 15 seconds.
 ```
 
-## Install
-
 ## Try It (No Install)
 
 See what would break before installing anything:
@@ -89,6 +87,69 @@ Ripple gets smarter the more you use it:
 - **Custom playbooks** — Define your own patterns in `.ripple.yaml` (see below).
 
 Result: 3x better consumer detection than grep alone.
+
+## Change Impact Report
+
+Every PR/MR Ripple opens includes a **Change Impact Report** — a full manifest of what was changed, what was scanned but left alone, and why:
+
+```
+### ✅ Changed (auto-fixed)
+| File | Category | What was done |
+| client.py | 💻 code | Removed broken field reference |
+
+### ⚠️ Needs Manual Review
+| File | Category | Why | References |
+| tests/test_user.py | 🧪 test | References `phone_number` | L42: `assert user.phone_number...` · L67: `mock_user(...)` |
+| docs/api.md | 📝 docs | Documents the field | L18: `| phone_number | string |...` |
+
+### 📝 Deliberately Left Alone
+| Category | Status | Details |
+| ⚙️ Config | ✅ Safe | No config references detected |
+```
+
+**Line-level references** — shows exact line numbers + code snippets, not generic "check your tests." Supports naming variants (snake_case, camelCase, PascalCase, UPPER_SNAKE, kebab-case).
+
+Ripple only auto-fixes code that would **break**. Docs, examples, and tests that still pass are flagged but not modified — you decide.
+
+## Expand+Contract Advisor
+
+Warns when a breaking change could be done non-breakingly:
+
+```
+💡 This change (removing field `phone_number`) could be done safely using
+   the expand-and-contract pattern:
+   1. Mark field as deprecated (keep it)
+   2. Remove all consumers
+   3. Then remove the field
+```
+
+Helps teams avoid breaking changes entirely when possible.
+
+## Research: PropBench
+
+Ripple is backed by **PropBench** — a research benchmark proving that most "senior engineering judgment" in change propagation is actually learnable patterns:
+
+- **268** real engineering changes from **24** repositories
+- **1,223** consequence files classified into **8** miss categories
+- **7%** file recall with naming only → **17%** with co-change learning → **82%** package recall with ensemble
+
+Key finding: **39%** of propagation targets are cross-package — invisible to any single-repo tool.
+
+Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](https://github.com/Aakash2408/Propbench)
+
+## How Ripple Compares
+
+| | **Ripple** | Dependabot | Optic | buf |
+|---|---|---|---|---|
+| Detects breaking changes | ✅ | — | ✅ | ✅ |
+| Finds consumers | ✅ | — | — | — |
+| Generates fix code | ✅ | — | — | — |
+| Opens PRs automatically | ✅ | ✅ | — | — |
+| Contract types | 10 | 0 | 1 | 1 |
+| Learns from git history | ✅ | — | — | — |
+| Change Impact Report | ✅ | — | — | — |
+| GitHub + GitLab + Bitbucket | ✅ | GH only | GH only | GH only |
+| Self-hosted option | ✅ | — | — | — |
 
 ## Custom Playbooks
 
@@ -256,7 +317,15 @@ The agent uses the same 5 diff engines and 30 breaking change detections as the 
 
 ## GitLab Support
 
-Ripple works with GitLab too. Setup:
+Ripple works with GitLab with **one-click OAuth install**:
+
+**Option 1: One-Click OAuth (recommended)**
+
+👉 [**Install on GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab)
+
+Click Authorize → Ripple auto-installs webhooks on all your projects. Done.
+
+**Option 2: Manual webhook setup**
 
 1. **Set environment variables:**
    ```bash
@@ -273,11 +342,19 @@ Ripple works with GitLab too. Setup:
 
 3. **Push a breaking change** — Ripple creates a Merge Request automatically.
 
-Works with all 4 contract types (OpenAPI, Proto, GraphQL, Database) on GitLab.
+Works with all 10 contract types on GitLab.
 
 ## Bitbucket Support
 
-Ripple works with Bitbucket Cloud. Setup:
+Ripple works with Bitbucket Cloud with **one-click OAuth install**:
+
+**Option 1: One-Click OAuth (recommended)**
+
+👉 [**Install on Bitbucket**](https://ripple-production-be7f.up.railway.app/auth/bitbucket)
+
+Click Authorize → Ripple auto-installs webhooks on all your repos. Done.
+
+**Option 2: Manual webhook setup**
 
 1. **Create App Password:**
    - Bitbucket → Settings → App passwords → Create
