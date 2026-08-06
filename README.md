@@ -2,7 +2,7 @@
 
 > When you change an API, Ripple finds every consumer and opens PRs to fix them. Automatically.
 
-### 🌐 [**Live Landing Page**](https://aakash2408.github.io/ripple/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Install GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab) · [**Self-Hosted Agent**](#self-hosted-agent)
+### 🌐 [**Live Landing Page**](https://aakash2408.github.io/ripple/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Install GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab) · [**Try Dry-Run**](https://ripple-production-be7f.up.railway.app/dry-run) · [**Self-Hosted Agent**](#self-hosted-agent)
 
 [![Install GitHub App](https://img.shields.io/badge/Install-GitHub%20App-blue)](https://github.com/apps/ripple-api)
 [![Demo: Python](https://img.shields.io/badge/demo-Python%20PR-green)](https://github.com/Aakash2408/ripple-sdk-python/pull/1)
@@ -30,6 +30,18 @@ Ripple detects breaking API changes, finds every consumer, generates the fix, an
 
 ✅ Done in 15 seconds.
 ```
+
+## Install
+
+## Try It (No Install)
+
+See what would break before installing anything:
+
+👉 [**Dry-Run Mode**](https://ripple-production-be7f.up.railway.app/dry-run)
+
+Paste your old and new spec → see breaking changes instantly. No repo access needed. No PRs opened.
+
+---
 
 ## Install
 
