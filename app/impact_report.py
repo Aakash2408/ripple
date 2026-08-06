@@ -100,9 +100,11 @@ class ImpactReport:
         if self.needs_manual_items:
             lines.append("### ⚠️ Needs Manual Review")
             lines.append("")
-            lines.append("| File | Category | Why |")
-            lines.append("|------|----------|-----|")
+            lines.append("| File | Category | Why | References |")
+            lines.append("|------|----------|-----|------------|")
             for item in self.needs_manual_items:
+                ref_str = f" {item.line_numbers}" if item.line_numbers else ""
+                lines.append(f"| `{item.file_path}` | {_category_emoji(item.category)} {item.category.value} | {item.reason} | {ref_str} |")
                 lines.append(f"| `{item.file_path}` | {_category_emoji(item.category)} {item.category.value} | {item.reason} |")
             lines.append("")
         
@@ -162,6 +164,7 @@ def generate_impact_report(
             category=Category(s.get("category", _classify_file(s["file_path"]).value)),
             action=action,
             reason=s.get("reason", "No breaking reference found"),
+            line_numbers=s.get("line_refs", None),
         ))
     
     # If repo files provided, check for docs/examples/tests not yet scanned
@@ -190,11 +193,12 @@ def classify_consumer_files(
 ) -> list[dict]:
     """
     Classify consumer files as safe-to-leave or needs-manual-review.
+    Now with LINE-LEVEL references: shows exact lines that reference the field.
     
     For each file that WASN'T fixed, determine if it's safe:
     - Test file that doesn't reference the field → safe
     - Doc file with no mention → safe
-    - Example with the field referenced → needs manual
+    - Example with the field referenced → needs manual (with line numbers)
     """
     results = []
     
@@ -202,8 +206,9 @@ def classify_consumer_files(
         cat = _classify_file(file_path)
         content = (file_contents or {}).get(file_path, "")
         
-        # Check if file mentions the changed field
-        mentions_field = changed_field.lower() in content.lower() if content else False
+        # Find specific line references
+        line_refs = scan_file_for_references(content, changed_field) if content else []
+        mentions_field = len(line_refs) > 0
         
         if not mentions_field:
             results.append({
@@ -213,35 +218,130 @@ def classify_consumer_files(
                 "reason": f"No reference to `{changed_field}` found",
             })
         elif cat == Category.TEST:
+            ref_str = _format_line_refs(line_refs)
             results.append({
                 "file_path": file_path,
                 "category": cat.value,
                 "action": "left",
                 "reason": f"Test references `{changed_field}` but still passes (field was optional)",
+                "line_refs": ref_str,
             })
         elif cat == Category.DOCS:
+            ref_str = _format_line_refs(line_refs)
             results.append({
                 "file_path": file_path,
                 "category": cat.value,
                 "action": "manual",
                 "reason": f"Documentation mentions `{changed_field}` — update recommended",
+                "line_refs": ref_str,
             })
         elif cat == Category.EXAMPLE:
+            ref_str = _format_line_refs(line_refs)
             results.append({
                 "file_path": file_path,
                 "category": cat.value,
                 "action": "manual",
                 "reason": f"Example uses `{changed_field}` — may confuse new users",
+                "line_refs": ref_str,
             })
         else:
+            ref_str = _format_line_refs(line_refs)
             results.append({
                 "file_path": file_path,
                 "category": cat.value,
                 "action": "manual",
                 "reason": f"References `{changed_field}` — review needed",
+                "line_refs": ref_str,
             })
     
     return results
+
+
+def scan_file_for_references(content: str, field_name: str, max_refs: int = 5) -> list[dict]:
+    """
+    Scan file content for specific line references to a field.
+    
+    Returns list of {line_number, line_content, context} for each match.
+    Matches are case-insensitive and support common naming variants:
+      - phone_number, phoneNumber, PhoneNumber, PHONE_NUMBER
+    """
+    if not content or not field_name:
+        return []
+    
+    lines = content.split("\n")
+    refs = []
+    
+    # Generate search variants (snake_case, camelCase, etc.)
+    variants = _generate_field_variants(field_name)
+    
+    for i, line in enumerate(lines, 1):
+        line_lower = line.lower()
+        for variant in variants:
+            if variant.lower() in line_lower:
+                refs.append({
+                    "line_number": i,
+                    "line_content": line.strip()[:80],  # Truncate long lines
+                    "match": variant,
+                })
+                break  # Only one match per line
+        
+        if len(refs) >= max_refs:
+            break
+    
+    return refs
+
+
+def _generate_field_variants(field_name: str) -> list[str]:
+    """
+    Generate common naming variants of a field name.
+    
+    Input: "phone_number"
+    Output: ["phone_number", "phoneNumber", "PhoneNumber", "PHONE_NUMBER", "phone-number"]
+    """
+    variants = [field_name]
+    
+    # If it's snake_case, generate camelCase
+    if "_" in field_name:
+        parts = field_name.split("_")
+        # camelCase
+        camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
+        variants.append(camel)
+        # PascalCase
+        pascal = "".join(p.capitalize() for p in parts)
+        variants.append(pascal)
+        # UPPER_SNAKE
+        variants.append(field_name.upper())
+        # kebab-case
+        variants.append(field_name.replace("_", "-"))
+    elif any(c.isupper() for c in field_name[1:]):
+        # It's camelCase — generate snake_case
+        import re
+        snake = re.sub(r'([A-Z])', r'_\1', field_name).lower().lstrip('_')
+        variants.append(snake)
+        variants.append(snake.upper())
+    
+    return variants
+
+
+def _format_line_refs(refs: list[dict], max_show: int = 3) -> str:
+    """Format line references as a compact string for the impact table."""
+    if not refs:
+        return ""
+    
+    formatted = []
+    for ref in refs[:max_show]:
+        line_num = ref["line_number"]
+        content = ref["line_content"]
+        # Truncate content for table display
+        if len(content) > 50:
+            content = content[:47] + "..."
+        formatted.append(f"L{line_num}: `{content}`")
+    
+    result = " · ".join(formatted)
+    if len(refs) > max_show:
+        result += f" (+{len(refs) - max_show} more)"
+    
+    return result
 
 
 def _classify_file(file_path: str) -> Category:
