@@ -200,8 +200,9 @@ def create_fix_mr(client: GitLabClient, project_id: int, file_path: str,
     return mr.get("web_url", "")
 
 
-def _format_mr_description(change_description: str, source_project: str, fixed_file: str) -> str:
-    """Format MR description with change impact report."""
+def _format_mr_description(change_description: str, source_project: str, fixed_file: str,
+                           scanned_refs: list[dict] = None) -> str:
+    """Format MR description with change impact report + line-level references."""
     # Extract field name from description if possible
     field_name = ""
     if "'" in change_description:
@@ -213,6 +214,29 @@ def _format_mr_description(change_description: str, source_project: str, fixed_f
         if len(parts) >= 2:
             field_name = parts[1]
     
+    # Build the needs-review section with line refs if available
+    review_section = ""
+    if scanned_refs:
+        review_section = "### ⚠️ Needs Manual Review\n\n"
+        review_section += "| File | Category | Why | References |\n"
+        review_section += "|------|----------|-----|------------|\n"
+        for ref in scanned_refs:
+            line_info = ref.get("line_refs", "")
+            review_section += f"| `{ref['file_path']}` | {ref.get('category', 'code')} | {ref.get('reason', 'Review needed')} | {line_info} |\n"
+        review_section += "\n"
+    else:
+        review_section = f"""### 📝 Scanned — Deliberately Left Alone
+
+| Category | Status | Details |
+|----------|--------|---------|
+| 📋 Contract | ℹ️ Source | `{source_project}` — this is where the breaking change originated |
+| 🧪 Tests | 📝 Review recommended | Check if tests reference `{field_name or 'changed field'}` |
+| 📝 Docs | 📝 Review recommended | Update API docs if field was documented |
+| 📖 Examples | 📝 Review recommended | Update examples if field was demonstrated |
+| ⚙️ Config | ✅ Safe | No config references detected |
+
+"""
+    
     return f"""## 🌊 Ripple
 
 **API change in `{source_project}`:** {change_description}
@@ -223,19 +247,7 @@ def _format_mr_description(change_description: str, source_project: str, fixed_f
 |------|----------|---------------|
 | `{fixed_file}` | 💻 code | Removed broken reference |
 
-### 📝 Scanned — Deliberately Left Alone
-
-| Category | Status | Details |
-|----------|--------|---------|
-| 📋 Contract | ℹ️ Source | `{source_project}` — this is where the breaking change originated |
-| 🧪 Tests | 📝 Review recommended | Check if tests reference `{field_name or 'changed field'}` |
-| 📝 Docs | 📝 Review recommended | Update API docs if field was documented |
-| 📖 Examples | 📝 Review recommended | Update examples if field was demonstrated |
-| ⚙️ Config | ✅ Safe | No config references detected |
-
----
-
-**Summary:** 1 fixed · 1 source (upstream) · 3 categories flagged for optional review
+{review_section}---
 
 *Ripple only auto-fixes code that would **break**. Docs, examples, and tests that still pass are flagged but not modified — you decide.*
 

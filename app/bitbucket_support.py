@@ -258,7 +258,7 @@ def create_fix_pr(client: BitbucketClient, workspace: str, repo_slug: str,
     commit_msg = f"fix: {change_description}"
     client.update_file(workspace, repo_slug, file_path, fixed_content, branch_name, commit_msg)
     
-    # Create PR with impact report
+    # Create PR with impact report + line-level references
     field_name = ""
     if "'" in change_description:
         parts = change_description.split("'")
@@ -268,6 +268,16 @@ def create_fix_pr(client: BitbucketClient, workspace: str, repo_slug: str,
         parts = change_description.split("`")
         if len(parts) >= 2:
             field_name = parts[1]
+    
+    # Build review section — with line refs if available from scanned_refs param
+    review_section = f"""### 📝 Scanned — Deliberately Left Alone
+
+| Category | Status | Details |
+|----------|--------|---------|
+| 🧪 Tests | 📝 Review recommended | Check if tests reference `{field_name or 'changed field'}` |
+| 📝 Docs | 📝 Review recommended | Update API docs if field was documented |
+| 📖 Examples | 📝 Review recommended | Update examples if field was demonstrated |
+| ⚙️ Config | ✅ Safe | No config references detected |"""
     
     pr_description = f"""## 🌊 Ripple
 
@@ -279,14 +289,7 @@ def create_fix_pr(client: BitbucketClient, workspace: str, repo_slug: str,
 |------|----------|---------------|
 | `{file_path}` | 💻 code | Removed broken reference |
 
-### 📝 Scanned — Deliberately Left Alone
-
-| Category | Status | Details |
-|----------|--------|---------|
-| 🧪 Tests | 📝 Review recommended | Check if tests reference `{field_name or 'changed field'}` |
-| 📝 Docs | 📝 Review recommended | Update API docs if field was documented |
-| 📖 Examples | 📝 Review recommended | Update examples if field was demonstrated |
-| ⚙️ Config | ✅ Safe | No config references detected |
+{review_section}
 
 ---
 
