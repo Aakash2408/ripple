@@ -127,11 +127,40 @@
         footer a { color: #6b7280; }
         
         /* Responsive */
-        @media (max-width: 640px) {
-            h1 { font-size: 2.2rem; }
-            .features, .contracts { grid-template-columns: 1fr; }
+        @media (max-width: 768px) {
+            h1 { font-size: 2rem; letter-spacing: -1px; }
+            .hero { padding: 50px 0 30px; }
+            .hero-sub { font-size: 1rem; }
+            .nav-links { gap: 12px; }
+            .nav-links a { font-size: 0.78rem; }
+            .btn-group { flex-direction: column; align-items: center; }
+            .btn { width: 100%; max-width: 280px; justify-content: center; }
+            .features { grid-template-columns: 1fr; }
+            .contracts { grid-template-columns: repeat(2, 1fr); }
             .steps { flex-direction: column; align-items: center; }
-            .hero { padding: 60px 0 40px; }
+            .compare { font-size: 0.7rem; display: block; overflow-x: auto; }
+            .compare th, .compare td { padding: 6px 5px; white-space: nowrap; }
+            .pricing { flex-direction: column; align-items: center; }
+            .price-card { max-width: 100%; width: 100%; }
+            .terminal-body { font-size: 0.7rem; line-height: 1.7; padding: 14px; }
+            .terminal-wrap { margin: 20px auto 0; }
+            section { padding: 50px 0; }
+            section h2 { font-size: 1.5rem; }
+            .badges { gap: 6px; }
+            .badge { font-size: 0.65rem; padding: 4px 8px; }
+            .links { flex-wrap: wrap; gap: 12px; }
+            .logos { gap: 8px; }
+            .logos span { font-size: 0.7rem; padding: 4px 10px; }
+            .proof-links { flex-direction: column; align-items: center; }
+        }
+        
+        @media (max-width: 480px) {
+            h1 { font-size: 1.7rem; }
+            .nav-links { gap: 8px; }
+            .nav-links a { font-size: 0.72rem; }
+            .contracts { grid-template-columns: 1fr 1fr; }
+            .container { padding: 0 16px; }
+            .terminal-body { font-size: 0.65rem; }
         }
         
         /* Scroll animations */
@@ -281,7 +310,7 @@
     <section class="fade-in">
         <h2>Research-Backed</h2>
         <p class="desc">Ripple is built on PropBench — a benchmark proving most "engineering judgment" is learnable.</p>
-        <div class="features" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="features" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));">
             <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">268</h3><p>Real engineering changes analyzed</p></div>
             <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">1,223</h3><p>Consequence files classified</p></div>
             <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">82%</h3><p>Package-level recall (ensemble)</p></div>
