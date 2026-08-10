@@ -19,9 +19,9 @@
             background-size: 60px 60px; pointer-events: none; z-index: 0; }
         
         /* Glow effects */
-        .glow { position: absolute; width: 600px; height: 600px; border-radius: 50%; filter: blur(120px); opacity: 0.15; pointer-events: none; max-width: 100vw; }
+        .glow { position: absolute; width: 600px; height: 600px; border-radius: 50%; filter: blur(120px); opacity: 0.15; pointer-events: none; }
         .glow-blue { background: #3b82f6; top: -200px; left: 50%; transform: translateX(-50%); }
-        .glow-purple { background: #8b5cf6; top: 400px; right: 0; transform: translateX(50%); opacity: 0.08; }
+        .glow-purple { background: #8b5cf6; top: 400px; right: -100px; opacity: 0.08; }
         
         /* Layout */
         .container { max-width: 1000px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
@@ -172,8 +172,10 @@
 <body>
 
 <div class="grid-bg"></div>
-<div class="glow glow-blue"></div>
-<div class="glow glow-purple"></div>
+<div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; overflow: hidden; pointer-events: none; z-index: 0;">
+    <div class="glow glow-blue"></div>
+    <div class="glow glow-purple"></div>
+</div>
 
 <div class="container">
     <nav>
