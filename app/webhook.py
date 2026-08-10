@@ -909,6 +909,30 @@ async def _process_spec_change(
                     )
                     if pr_url:
                         prs_created.append(pr_url)
+                        # Track for lifecycle (pending -> merged -> reverted)
+                        try:
+                            from .pr_lifecycle import (
+                                SourceChange, TrackedFixPR, UpstreamStatus,
+                                track_fix_pr, LABEL_PENDING, LABEL_AUTO_FIX
+                            )
+                            source = SourceChange(
+                                repo=repo,
+                                commit_sha=event.get("after", "")[:12],
+                                pr_number=None,
+                                pr_url=None,
+                                title=f"{change.change_type}: {change.field_name}",
+                                status=UpstreamStatus.PENDING,
+                            )
+                            fix = TrackedFixPR(
+                                repo=consumer_repo,
+                                pr_number=0,  # extracted from URL if needed
+                                pr_url=pr_url,
+                                source=source,
+                                labels=[LABEL_AUTO_FIX, LABEL_PENDING],
+                            )
+                            track_fix_pr(source, fix)
+                        except Exception:
+                            pass  # lifecycle tracking is optional
     
     # Update consumer graph with observations
     graph = get_graph(org)
