@@ -8,6 +8,7 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #000000; color: #ededed; line-height: 1.6; overflow-x: hidden; }
+        html { overflow-x: hidden; }
         a { color: #60a5fa; text-decoration: none; }
         a:hover { color: #93c5fd; }
         
@@ -18,9 +19,9 @@
             background-size: 60px 60px; pointer-events: none; z-index: 0; }
         
         /* Glow effects */
-        .glow { position: absolute; width: 600px; height: 600px; border-radius: 50%; filter: blur(120px); opacity: 0.15; pointer-events: none; }
+        .glow { position: absolute; width: 600px; height: 600px; border-radius: 50%; filter: blur(120px); opacity: 0.15; pointer-events: none; max-width: 100vw; }
         .glow-blue { background: #3b82f6; top: -200px; left: 50%; transform: translateX(-50%); }
-        .glow-purple { background: #8b5cf6; top: 400px; right: -200px; opacity: 0.08; }
+        .glow-purple { background: #8b5cf6; top: 400px; right: 0; transform: translateX(50%); opacity: 0.08; }
         
         /* Layout */
         .container { max-width: 1000px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
