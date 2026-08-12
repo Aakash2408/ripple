@@ -129,7 +129,7 @@ async def dashboard():
         <div class="header-inner">
             <div class="logo">🌊 <span>Ripple</span></div>
             <div class="header-links">
-                <a href="https://aakash2408.github.io/ripple/">Home</a>
+                <a href="https://ripple-cnn.pages.dev/">Home</a>
                 <a href="/docs">API Docs</a>
                 <a href="/health">Health</a>
                 <a href="https://github.com/Aakash2408/ripple" target="_blank">GitHub ↗</a>
@@ -195,7 +195,7 @@ async def dashboard():
         <div class="card">
             <h2>🔗 Links</h2>
             <ul>
-                <li><a href="https://aakash2408.github.io/ripple/" target="_blank">Landing Page</a></li>
+                <li><a href="https://ripple-cnn.pages.dev/" target="_blank">Landing Page</a></li>
                 <li><a href="/docs">API Documentation (Swagger UI)</a></li>
                 <li><a href="/health">Health Check</a></li>
                 <li><a href="/auth/gitlab">Install on GitLab</a></li>

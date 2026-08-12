@@ -2,7 +2,7 @@
 title: I Built a Tool That Auto-Fixes Downstream Code When You Change an API
 published: true
 tags: api, opensource, devtools, microservices
-cover_image: https://aakash2408.github.io/ripple/og-image.png
+cover_image: https://ripple-cnn.pages.dev/og-image.png
 ---
 
 You change a field in your proto file. You push it. Then you spend the next two days pinging 4 teams on Slack asking them to update their consumers.
@@ -138,7 +138,7 @@ The takeaway: most of what we call "senior engineering judgment" in change propa
 
 ## Try It
 
-- **Landing page:** [aakash2408.github.io/ripple](https://aakash2408.github.io/ripple)
+- **Landing page:** [ripple-cnn.pages.dev](https://ripple-cnn.pages.dev)
 - **Source:** [github.com/Aakash2408/ripple](https://github.com/Aakash2408/ripple)
 - **GitHub App:** [github.com/apps/ripple-api](https://github.com/apps/ripple-api)
 
