@@ -2,7 +2,7 @@
 
 > When you change an API, Ripple finds every consumer and opens PRs to fix them. Automatically.
 
-### 🌐 [**Live Landing Page**](https://aakash2408.github.io/ripple/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Install GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab) · [**Try Dry-Run**](https://ripple-production-be7f.up.railway.app/dry-run) · [**Self-Hosted Agent**](#self-hosted-agent)
+### 🌐 [**Live Landing Page**](https://aakash2408.github.io/ripple/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Install GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab) · [**Try Dry-Run**](https://ripple-production-be7f.up.railway.app/dry-run) · [**CI/CD Gate**](#cicd-gate-ripple-check) · [**Self-Hosted Agent**](#self-hosted-agent)
 
 [![Install GitHub App](https://img.shields.io/badge/Install-GitHub%20App-blue)](https://github.com/apps/ripple-api)
 [![Demo: Python](https://img.shields.io/badge/demo-Python%20PR-green)](https://github.com/Aakash2408/ripple-sdk-python/pull/1)
@@ -38,6 +38,71 @@ See what would break before installing anything:
 👉 [**Dry-Run Mode**](https://ripple-production-be7f.up.railway.app/dry-run)
 
 Paste your old and new spec → see breaking changes instantly. No repo access needed. No PRs opened.
+
+---
+
+## CI/CD Gate (Ripple Check)
+
+Block PRs that introduce breaking changes with unfixed consumers — like `buf lint` but for change **propagation**, not just detection.
+
+Add to `.github/workflows/ripple-check.yml`:
+
+```yaml
+name: Ripple Check
+on: [pull_request]
+jobs:
+  ripple:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Aakash2408/ripple-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          contract-types: "openapi,proto,graphql"
+          fail-on-breaking: true
+          monorepo: true
+```
+
+**What it does:**
+1. Detects spec files changed in the PR (OpenAPI, Proto, GraphQL, Avro, Thrift, Smithy, AsyncAPI, JSON Schema)
+2. Calls the Ripple analysis engine to identify breaking changes
+3. Posts a PR comment with the full impact report
+4. Fails the check if breaking changes have unfixed consumers
+
+**Inputs:**
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `token` | ✅ | — | GitHub token for API access |
+| `contract-types` | — | `openapi,proto,graphql` | Comma-separated types to check |
+| `fail-on-breaking` | — | `true` | Fail check if breaking changes detected |
+| `monorepo` | — | `false` | Scan within the same repo for consumers |
+| `consumers-path` | — | — | Glob patterns to scan for consumers |
+
+**Outputs:** `breaking-changes`, `consumers-affected`, `status` (pass/warn/fail), `report` (markdown)
+
+---
+
+## Monorepo Support
+
+Ripple scans **within your repo** for consumers — not just across repos. Perfect for monorepos where API producers and consumers live side-by-side.
+
+**How it works:**
+- Uses `git grep` with naming variants (snake_case, camelCase, PascalCase, kebab-case) to find in-repo references
+- Confidence scoring: generated code (95%), imports (85%), usage (80%), test files (75%)
+- Automatically enabled when `monorepo: true` is set in the CI/CD gate or `.ripple.yaml`
+
+**In `.ripple.yaml`:**
+
+```yaml
+settings:
+  monorepo: true
+  consumers_path: "services/**,clients/**"  # optional: restrict scan scope
+```
+
+Works with all 10 contract types. Combines with cross-repo scanning — Ripple checks both your monorepo AND external consumer repos.
 
 ---
 
@@ -145,6 +210,8 @@ Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](h
 | Finds consumers | ✅ | — | — | — |
 | Generates fix code | ✅ | — | — | — |
 | Opens PRs automatically | ✅ | ✅ | — | — |
+| CI/CD gate (blocks merge) | ✅ | — | — | ✅ |
+| Monorepo support | ✅ | — | — | — |
 | Contract types | 10 | 0 | 1 | 1 |
 | Learns from git history | ✅ | — | — | — |
 | Change Impact Report | ✅ | — | — | — |
