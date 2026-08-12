@@ -1,382 +1,457 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ripple — Self-Maintaining APIs</title>
-    <meta name="description" content="When you change an API, Ripple finds every consumer and opens PRs to fix them. 10 contract types. 3 platforms. 15 seconds.">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #000000; color: #ededed; line-height: 1.6; overflow-x: hidden; }
-        html { overflow-x: hidden; }
-        a { color: #60a5fa; text-decoration: none; }
-        a:hover { color: #93c5fd; }
-        
-        /* Grid background */
-        .grid-bg { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background-image: 
-            linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
-            background-size: 60px 60px; pointer-events: none; z-index: 0; }
-        
-        /* Glow effects */
-        .glow { position: absolute; width: 600px; height: 600px; border-radius: 50%; filter: blur(120px); opacity: 0.15; pointer-events: none; }
-        .glow-blue { background: #3b82f6; top: -200px; left: 50%; transform: translateX(-50%); }
-        .glow-purple { background: #8b5cf6; top: 400px; right: -100px; opacity: 0.08; }
-        
-        /* Layout */
-        .container { max-width: 1000px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
-        
-        /* Nav */
-        nav { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
-        .nav-brand { font-weight: 700; font-size: 1.2rem; }
-        .nav-links { display: flex; gap: 24px; }
-        .nav-links a { color: #9ca3af; font-size: 0.9rem; transition: color 0.2s; }
-        .nav-links a:hover { color: #ffffff; }
-        
-        /* Hero */
-        .hero { text-align: center; padding: 100px 0 60px; position: relative; }
-        .hero-tag { font-size: 0.75rem; letter-spacing: 3px; text-transform: uppercase; color: #60a5fa; font-weight: 600; margin-bottom: 16px; }
-        h1 { font-size: 3.8rem; font-weight: 800; letter-spacing: -2px; line-height: 1.1; margin-bottom: 20px; }
-        h1 .gradient { background: linear-gradient(135deg, #60a5fa, #a78bfa, #60a5fa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-size: 200% auto; animation: shimmer 3s linear infinite; }
-        @keyframes shimmer { to { background-position: 200% center; } }
-        .hero-sub { font-size: 1.2rem; color: #9ca3af; max-width: 550px; margin: 0 auto 36px; }
-        
-        /* Buttons */
-        .btn-group { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 20px; }
-        .btn { padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 0.95rem; transition: all 0.2s; display: inline-flex; align-items: center; gap: 8px; }
-        .btn-primary { background: #3b82f6; color: white; }
-        .btn-primary:hover { background: #2563eb; transform: translateY(-1px); box-shadow: 0 0 20px rgba(59,130,246,0.4); }
-        .btn-secondary { background: rgba(255,255,255,0.06); color: #e5e7eb; border: 1px solid rgba(255,255,255,0.1); }
-        .btn-secondary:hover { background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); }
-        
-        .links { display: flex; gap: 20px; justify-content: center; margin: 16px 0; }
-        .links a { color: #6b7280; font-size: 0.85rem; }
-        .links a:hover { color: #60a5fa; }
-        
-        /* Badges */
-        .badges { display: flex; gap: 10px; justify-content: center; margin-top: 24px; flex-wrap: wrap; }
-        .badge { padding: 5px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 500; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); color: #9ca3af; }
-        
-        /* Terminal */
-        .terminal-wrap { margin: 40px auto 0; max-width: 720px; }
-        .terminal { background: #0a0a0a; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; overflow: hidden; }
-        .terminal-header { display: flex; gap: 6px; padding: 12px 16px; background: rgba(255,255,255,0.03); border-bottom: 1px solid rgba(255,255,255,0.06); }
-        .terminal-dot { width: 10px; height: 10px; border-radius: 50%; }
-        .terminal-dot.r { background: #ef4444; }
-        .terminal-dot.y { background: #eab308; }
-        .terminal-dot.g { background: #22c55e; }
-        .terminal-body { padding: 20px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.9; color: #d1d5db; }
-        .terminal-body .c { color: #6b7280; }
-        .terminal-body .g { color: #4ade80; }
-        .terminal-body .w { color: #facc15; }
-        .terminal-body .b { color: #60a5fa; }
-        
-        .proof-links { display: flex; gap: 10px; justify-content: center; margin-top: 16px; flex-wrap: wrap; }
-        .proof-links a { padding: 6px 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; font-family: monospace; font-size: 0.75rem; color: #60a5fa; transition: all 0.2s; }
-        .proof-links a:hover { background: rgba(59,130,246,0.1); border-color: #3b82f6; }
-        
-        /* Sections */
-        section { padding: 80px 0; border-top: 1px solid rgba(255,255,255,0.06); }
-        section h2 { font-size: 2rem; font-weight: 700; margin-bottom: 8px; text-align: center; letter-spacing: -0.5px; }
-        section .desc { text-align: center; color: #6b7280; margin-bottom: 40px; }
-        
-        /* Contract grid */
-        .contracts { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
-        .contract { padding: 14px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; text-align: center; transition: all 0.2s; }
-        .contract:hover { border-color: rgba(59,130,246,0.3); background: rgba(59,130,246,0.04); transform: translateY(-2px); }
-        .contract-icon { font-size: 1.3rem; margin-bottom: 6px; }
-        .contract-name { font-weight: 600; font-size: 0.85rem; }
-        .contract-sub { font-size: 0.7rem; color: #6b7280; margin-top: 2px; }
-        
-        /* Features */
-        .features { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-        .feature { padding: 20px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; transition: all 0.2s; }
-        .feature:hover { border-color: rgba(255,255,255,0.12); }
-        .feature h3 { font-size: 0.95rem; margin-bottom: 6px; }
-        .feature p { font-size: 0.85rem; color: #6b7280; }
-        
-        /* Comparison */
-        .compare { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-        .compare th { padding: 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); color: #9ca3af; font-weight: 500; }
-        .compare td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.04); }
-        .compare .y { color: #4ade80; }
-        .compare .n { color: #6b7280; }
-        
-        /* Logo bar */
-        .logos { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; padding: 20px 0; }
-        .logos span { font-size: 0.8rem; color: #6b7280; padding: 6px 14px; border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; }
-        
-        /* Steps */
-        .steps { display: flex; gap: 30px; justify-content: center; flex-wrap: wrap; }
-        .step { text-align: center; flex: 1; min-width: 180px; }
-        .step-num { width: 36px; height: 36px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.9rem; margin-bottom: 10px; }
-        .step h4 { margin-bottom: 4px; }
-        .step p { color: #6b7280; font-size: 0.85rem; }
-        
-        /* Pricing */
-        .pricing { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
-        .price-card { border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 28px 20px; flex: 1; min-width: 200px; max-width: 240px; text-align: center; transition: all 0.2s; }
-        .price-card:hover { border-color: rgba(59,130,246,0.3); transform: translateY(-2px); }
-        .price-card.featured { border-color: #3b82f6; background: rgba(59,130,246,0.05); }
-        .price-card h3 { color: #9ca3af; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; }
-        .price { font-size: 2.2rem; font-weight: 700; margin: 8px 0; }
-        .price span { font-size: 0.9rem; color: #6b7280; font-weight: 400; }
-        .price-card p { color: #6b7280; font-size: 0.85rem; line-height: 1.8; }
-        
-        /* Footer */
-        footer { text-align: center; padding: 40px 0; border-top: 1px solid rgba(255,255,255,0.06); color: #4b5563; font-size: 0.8rem; }
-        footer a { color: #6b7280; }
-        
-        /* Responsive */
-        @media (max-width: 768px) {
-            h1 { font-size: 2rem; letter-spacing: -1px; }
-            .hero { padding: 50px 0 30px; }
-            .hero-sub { font-size: 1rem; }
-            .nav-links { gap: 12px; }
-            .nav-links a { font-size: 0.78rem; }
-            .btn-group { flex-direction: column; align-items: center; }
-            .btn { width: 100%; max-width: 280px; justify-content: center; }
-            .features { grid-template-columns: 1fr; }
-            .contracts { grid-template-columns: repeat(2, 1fr); }
-            .steps { flex-direction: column; align-items: center; }
-            .compare { font-size: 0.7rem; display: block; overflow-x: auto; }
-            .compare th, .compare td { padding: 6px 5px; white-space: nowrap; }
-            .pricing { flex-direction: column; align-items: center; }
-            .price-card { max-width: 100%; width: 100%; }
-            .terminal-body { font-size: 0.7rem; line-height: 1.7; padding: 14px; }
-            .terminal-wrap { margin: 20px auto 0; }
-            section { padding: 50px 0; }
-            section h2 { font-size: 1.5rem; }
-            .badges { gap: 6px; }
-            .badge { font-size: 0.65rem; padding: 4px 8px; }
-            .links { flex-wrap: wrap; gap: 12px; }
-            .logos { gap: 8px; }
-            .logos span { font-size: 0.7rem; padding: 4px 10px; }
-            .proof-links { flex-direction: column; align-items: center; }
-        }
-        
-        @media (max-width: 480px) {
-            h1 { font-size: 1.7rem; }
-            .nav-links { gap: 8px; }
-            .nav-links a { font-size: 0.72rem; }
-            .contracts { grid-template-columns: 1fr 1fr; }
-            .container { padding: 0 16px; }
-            .terminal-body { font-size: 0.65rem; }
-        }
-        
-        /* Scroll animations */
-        .fade-in { opacity: 0; transform: translateY(20px); transition: all 0.6s ease; }
-        .fade-in.visible { opacity: 1; transform: translateY(0); }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ripple — Push a breaking change. Every consumer gets fixed.</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: #0a0a0f;
+      color: #e2e2e8;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+    a { color: inherit; text-decoration: none; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    /* NAV */
+    nav {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 20px 0; position: relative; z-index: 10;
+    }
+    .logo { font-size: 1.25rem; font-weight: 700; }
+    .nav-links { display: flex; gap: 24px; font-size: 0.9rem; }
+    .nav-links a { opacity: 0.7; transition: opacity 0.2s; }
+    .nav-links a:hover { opacity: 1; }
+
+    /* HERO */
+    .hero {
+      text-align: center; padding: 80px 0 60px;
+      position: relative; overflow: hidden;
+    }
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3.5rem); font-weight: 800;
+      color: #fff; margin-bottom: 20px; letter-spacing: -0.02em;
+    }
+    .hero p {
+      font-size: clamp(1rem, 2vw, 1.2rem); color: #9898a8;
+      max-width: 640px; margin: 0 auto 36px;
+    }
+    .cta-group { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    .btn-primary {
+      background: #7c3aed; color: #fff; padding: 14px 28px;
+      border-radius: 8px; font-weight: 600; font-size: 0.95rem;
+      transition: background 0.2s, transform 0.15s; border: none; cursor: pointer;
+    }
+    .btn-primary:hover { background: #6d28d9; transform: translateY(-1px); }
+    .btn-ghost {
+      border: 1px solid #3b3b4f; color: #c4c4d4; padding: 14px 28px;
+      border-radius: 8px; font-weight: 500; font-size: 0.95rem;
+      transition: border-color 0.2s, color 0.2s; cursor: pointer; background: transparent;
+    }
+    .btn-ghost:hover { border-color: #7c3aed; color: #fff; }
+
+    /* TERMINAL */
+    .terminal-wrap {
+      margin: 48px auto 0; max-width: 620px; position: relative;
+      overflow: hidden; border-radius: 12px;
+    }
+    .terminal {
+      background: #12121a; border: 1px solid #1e1e2e; border-radius: 12px;
+      text-align: left; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;
+      box-shadow: 0 0 60px rgba(124, 58, 237, 0.08);
+    }
+    .terminal-bar {
+      display: flex; gap: 6px; padding: 12px 16px;
+      border-bottom: 1px solid #1e1e2e;
+    }
+    .terminal-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .terminal-dot.r { background: #ff5f57; }
+    .terminal-dot.y { background: #febc2e; }
+    .terminal-dot.g { background: #28c840; }
+    .terminal-body { padding: 16px 20px; min-height: 180px; }
+    .terminal-line {
+      opacity: 0; white-space: pre-wrap; margin-bottom: 6px;
+      animation: fadeIn 0.4s forwards;
+    }
+    .terminal-line:nth-child(1) { animation-delay: 0.5s; }
+    .terminal-line:nth-child(2) { animation-delay: 1.4s; }
+    .terminal-line:nth-child(3) { animation-delay: 2.3s; }
+    .terminal-line:nth-child(4) { animation-delay: 3.2s; }
+    .terminal-line:nth-child(5) { animation-delay: 4.1s; }
+    .terminal-line:nth-child(6) { animation-delay: 5.0s; }
+    .terminal-line .cmd { color: #a78bfa; }
+    @keyframes fadeIn { to { opacity: 1; } }
+
+    /* SOCIAL PROOF */
+    .social-proof {
+      text-align: center; padding: 48px 0; border-top: 1px solid #1a1a2e;
+      border-bottom: 1px solid #1a1a2e;
+    }
+    .proof-logos {
+      display: flex; flex-wrap: wrap; gap: 20px 32px;
+      justify-content: center; align-items: center;
+      font-size: 0.85rem; color: #6b6b80; margin-bottom: 12px;
+    }
+    .proof-logos span { opacity: 0.8; }
+    .social-proof .tagline { font-size: 0.82rem; color: #5a5a6e; margin-top: 8px; }
+
+    /* STATS */
+    .stats {
+      display: grid; grid-template-columns: repeat(3, 1fr);
+      gap: 32px; padding: 80px 0; text-align: center;
+    }
+    .stat-item .stat-number {
+      font-size: clamp(2.5rem, 5vw, 4rem); font-weight: 800;
+      color: #fff; letter-spacing: -0.03em;
+    }
+    .stat-item .stat-number .accent { color: #a78bfa; }
+    .stat-item .stat-label { font-size: 0.9rem; color: #7a7a90; margin-top: 4px; }
+
+    /* HOW IT WORKS */
+    .how-it-works { padding: 60px 0; }
+    .how-it-works h2 {
+      text-align: center; font-size: 2rem; font-weight: 700;
+      color: #fff; margin-bottom: 64px;
+    }
+    .step {
+      display: grid; grid-template-columns: 80px 1fr;
+      gap: 24px; align-items: start; margin-bottom: 64px;
+      opacity: 0; transform: translateY(20px);
+      transition: opacity 0.6s, transform 0.6s;
+    }
+    .step.visible { opacity: 1; transform: translateY(0); }
+    .step-num {
+      font-size: 3rem; font-weight: 800; color: #7c3aed;
+      opacity: 0.3; line-height: 1;
+    }
+    .step-content h3 { font-size: 1.3rem; font-weight: 700; color: #fff; margin-bottom: 8px; }
+    .step-content p { color: #9898a8; font-size: 0.95rem; max-width: 560px; }
+
+    /* COMPARISON */
+    .comparison { padding: 60px 0; }
+    .comparison h2 {
+      text-align: center; font-size: 2rem; font-weight: 700;
+      color: #fff; margin-bottom: 40px;
+    }
+    .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid #1e1e2e; }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 0.85rem;
+      min-width: 580px;
+    }
+    th, td { padding: 14px 18px; text-align: center; border-bottom: 1px solid #1a1a2e; }
+    th { color: #9898a8; font-weight: 500; background: #0f0f18; }
+    th:first-child, td:first-child { text-align: left; }
+    td.ripple-col {
+      color: #a78bfa; font-weight: 600;
+      background: rgba(124, 58, 237, 0.04);
+      box-shadow: inset 0 0 20px rgba(124, 58, 237, 0.03);
+    }
+    .check { color: #34d399; }
+    .dash { color: #3b3b4f; }
+
+    /* FEATURES TABS */
+    .features { padding: 60px 0; }
+    .features h2 {
+      text-align: center; font-size: 2rem; font-weight: 700;
+      color: #fff; margin-bottom: 32px;
+    }
+    .tabs { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
+    .tab-btn {
+      background: transparent; border: 1px solid #2a2a3e; color: #9898a8;
+      padding: 10px 20px; border-radius: 6px; font-size: 0.85rem;
+      cursor: pointer; transition: all 0.2s; font-family: inherit;
+    }
+    .tab-btn.active, .tab-btn:hover {
+      border-color: #7c3aed; color: #fff; background: rgba(124, 58, 237, 0.08);
+    }
+    .tab-content {
+      background: #12121a; border: 1px solid #1e1e2e; border-radius: 12px;
+      padding: 24px; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+      display: none; white-space: pre-wrap; color: #c4c4d4; min-height: 180px;
+    }
+    .tab-content.active { display: block; }
+
+    /* BOTTOM CTA */
+    .bottom-cta {
+      text-align: center; padding: 100px 0 80px;
+    }
+    .bottom-cta h2 {
+      font-size: clamp(1.5rem, 3vw, 2.2rem); font-weight: 700;
+      color: #fff; margin-bottom: 24px;
+    }
+    .bottom-cta .note { color: #6b6b80; font-size: 0.85rem; margin-top: 16px; }
+
+    /* FOOTER */
+    footer {
+      border-top: 1px solid #1a1a2e; padding: 32px 0; text-align: center;
+    }
+    .footer-links {
+      display: flex; gap: 24px; justify-content: center; flex-wrap: wrap;
+      font-size: 0.85rem; color: #6b6b80; margin-bottom: 12px;
+    }
+    .footer-links a:hover { color: #a78bfa; }
+    footer .copy { font-size: 0.78rem; color: #4a4a5e; }
+
+    /* RESPONSIVE */
+    @media (max-width: 768px) {
+      .stats { grid-template-columns: 1fr; gap: 24px; }
+      .step { grid-template-columns: 50px 1fr; gap: 16px; }
+      .step-num { font-size: 2rem; }
+      .hero { padding: 48px 0 40px; }
+      .nav-links { gap: 16px; font-size: 0.82rem; }
+    }
+    @media (max-width: 480px) {
+      .cta-group { flex-direction: column; align-items: center; }
+      .terminal { font-size: 0.72rem; }
+      .proof-logos { font-size: 0.75rem; gap: 12px 20px; }
+    }
+  </style>
 </head>
 <body>
 
-<div class="grid-bg"></div>
-<div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; overflow: hidden; pointer-events: none; z-index: 0;">
-    <div class="glow glow-blue"></div>
-    <div class="glow glow-purple"></div>
-</div>
-
+<!-- NAV + HERO -->
 <div class="container">
-    <nav>
-        <div class="nav-brand">🌊 Ripple</div>
-        <div class="nav-links">
-            <a href="#contracts">Contracts</a>
-            <a href="#compare">Compare</a>
-            <a href="https://ripple-production-be7f.up.railway.app/dry-run" target="_blank">Try It</a>
-            <a href="#pricing">Pricing</a>
-            <a href="https://github.com/Aakash2408/ripple" target="_blank">GitHub</a>
-        </div>
-    </nav>
+  <nav>
+    <div class="logo">🌊 Ripple</div>
+    <div class="nav-links">
+      <a href="https://github.com/Aakash2408/ripple#readme">Docs</a>
+      <a href="https://github.com/Aakash2408/ripple">GitHub</a>
+      <a href="https://ripple-production-be7f.up.railway.app/auth/github">Install</a>
+    </div>
+  </nav>
 
-    <div class="hero">
-        <p class="hero-tag">self-maintaining APIs</p>
-        <h1>API changes break things.<br><span class="gradient">Ripple fixes them.</span></h1>
-        <p class="hero-sub">Push a breaking change. In 15 seconds, every consumer gets a fix PR. Automatically.</p>
-        
-        <div class="btn-group">
-            <a href="https://github.com/apps/ripple-api" class="btn btn-primary">Install on GitHub</a>
-            <a href="https://ripple-production-be7f.up.railway.app/auth/gitlab" class="btn btn-secondary">Install on GitLab</a>
-            <a href="https://ripple-production-be7f.up.railway.app/auth/bitbucket" class="btn btn-secondary">Install on Bitbucket</a>
-        </div>
-        
-        <div class="links">
-            <a href="#self-hosted">Self-Hosted →</a>
-            <a href="https://github.com/Aakash2408/ripple">Source →</a>
-            <a href="https://ripple-production-be7f.up.railway.app/dashboard">Dashboard →</a>
-        </div>
-        
-        <div class="badges">
-            <span class="badge">10 contract types</span>
-            <span class="badge">50+ breaking change detections</span>
-            <span class="badge">3 platforms</span>
-            <span class="badge">82 tests</span>
-        </div>
+  <section class="hero">
+    <h1>Push a breaking change. Every consumer gets fixed.</h1>
+    <p>Ripple detects API changes, finds every consumer across your org, and opens fix PRs in 15 seconds. 12 languages. Zero manual coordination.</p>
+    <div class="cta-group">
+      <a href="https://ripple-production-be7f.up.railway.app/auth/github" class="btn-primary">Install GitHub App</a>
+      <a href="https://ripple-production-be7f.up.railway.app/dry-run" class="btn-ghost">Try Dry Run →</a>
     </div>
-    
-    <div class="terminal-wrap fade-in">
-        <div class="terminal">
-            <div class="terminal-header">
-                <div class="terminal-dot r"></div>
-                <div class="terminal-dot y"></div>
-                <div class="terminal-dot g"></div>
-            </div>
-            <div class="terminal-body">
-                <span class="c"># Push a breaking change</span><br>
-                <span class="b">$ git push origin main</span><br>
-                <span class="c"># Added required field 'idempotency_key' to POST /payments</span><br><br>
-                <span class="w">⚠️  1 breaking change detected</span><br>
-                &nbsp;&nbsp;POST /payments — added required field 'idempotency_key'<br><br>
-                <span class="b">🔍 Finding consumers...</span> Found 3 across 3 repos<br><br>
-                <span class="g">✅ Python SDK — parameter added</span><br>
-                <span class="g">✅ Node SDK — interface updated</span><br>
-                <span class="g">✅ Java SDK — method signature fixed</span><br><br>
-                <span class="g">🌊 Done in 15 seconds.</span>
-            </div>
+
+    <div class="terminal-wrap">
+      <div class="terminal">
+        <div class="terminal-bar">
+          <div class="terminal-dot r"></div>
+          <div class="terminal-dot y"></div>
+          <div class="terminal-dot g"></div>
         </div>
-        <div class="proof-links">
-            <a href="https://github.com/Aakash2408/ripple-sdk-python/pull/1">Python PR →</a>
-            <a href="https://github.com/Aakash2408/ripple-sdk-node/pull/1">Node PR →</a>
-            <a href="https://github.com/Aakash2408/ripple-sdk-java/pull/1">Java PR →</a>
-            <a href="https://gitlab.com/ripple-api2/Ripple/-/merge_requests/1">GitLab MR →</a>
+        <div class="terminal-body">
+          <div class="terminal-line"><span class="cmd">$ git push origin main</span></div>
+          <div class="terminal-line">🌊 Ripple detected 3 breaking changes in user.proto</div>
+          <div class="terminal-line">🔍 Found 7 consumers across 4 repos</div>
+          <div class="terminal-line">🧠 AI Confidence: 94% (based on 47 observations)</div>
+          <div class="terminal-line"><span class="check">✅</span> Opened 7 fix PRs in Go, TypeScript, Python, Rust</div>
+          <div class="terminal-line">⏱️  Total time: 14.2 seconds</div>
         </div>
+      </div>
     </div>
+  </section>
 </div>
 
+<!-- SOCIAL PROOF -->
+<section class="social-proof">
+  <div class="container">
+    <div class="proof-logos">
+      <span>Works with:</span>
+      <span>GitHub</span><span>·</span><span>GitLab</span><span>·</span><span>Bitbucket</span><span>·</span>
+      <span>OpenAPI</span><span>·</span><span>Proto</span><span>·</span><span>GraphQL</span><span>·</span>
+      <span>gRPC</span><span>·</span><span>Thrift</span>
+    </div>
+    <div class="tagline">Built by an Amazon engineer. Research-backed by PropBench.</div>
+  </div>
+</section>
+
+<!-- ROLLING STATS -->
 <div class="container">
-    <section id="contracts" class="fade-in">
-        <h2>10 Contract Types</h2>
-        <p class="desc">Every API surface, one tool.</p>
-        <div class="contracts">
-            <div class="contract"><div class="contract-icon">📄</div><div class="contract-name">OpenAPI</div><div class="contract-sub">REST APIs</div></div>
-            <div class="contract"><div class="contract-icon">⚡</div><div class="contract-name">Protobuf</div><div class="contract-sub">gRPC</div></div>
-            <div class="contract"><div class="contract-icon">🔮</div><div class="contract-name">GraphQL</div><div class="contract-sub">Schemas</div></div>
-            <div class="contract"><div class="contract-icon">🗄️</div><div class="contract-name">Database</div><div class="contract-sub">SQL + Prisma</div></div>
-            <div class="contract"><div class="contract-icon">📡</div><div class="contract-name">AsyncAPI</div><div class="contract-sub">Kafka / SNS</div></div>
-            <div class="contract"><div class="contract-icon">🔷</div><div class="contract-name">Avro</div><div class="contract-sub">Confluent</div></div>
-            <div class="contract"><div class="contract-icon">🟦</div><div class="contract-name">tRPC</div><div class="contract-sub">TypeScript</div></div>
-            <div class="contract"><div class="contract-icon">🔶</div><div class="contract-name">Thrift</div><div class="contract-sub">Apache</div></div>
-            <div class="contract"><div class="contract-icon">📋</div><div class="contract-name">JSON Schema</div><div class="contract-sub">Validation</div></div>
-            <div class="contract"><div class="contract-icon">☁️</div><div class="contract-name">Smithy</div><div class="contract-sub">AWS</div></div>
-        </div>
-    </section>
-    
-    <section class="fade-in">
-        <h2>It Gets Smarter</h2>
-        <p class="desc">Not just grep. Learns your codebase.</p>
-        <div class="features">
-            <div class="feature"><h3>🧬 Co-change Learning</h3><p>Scans git history. Files that always change together? Ripple knows.</p></div>
-            <div class="feature"><h3>🕸️ Consumer Graph</h3><p>Persistent dependency map. Gets smarter every push.</p></div>
-            <div class="feature"><h3>⚠️ Multi-Invoker Detection</h3><p>Warns when shared configs have hidden consumers.</p></div>
-            <div class="feature"><h3>📋 Custom Playbooks</h3><p>Add .ripple.yaml to teach it YOUR patterns.</p></div>
-            <div class="feature"><h3>🎯 Confidence Scoring</h3><p>Each PR shows WHY that file was chosen.</p></div>
-            <div class="feature"><h3>🔄 Expand+Contract</h3><p>Warns when a breaking change could be done safely.</p></div>
-            <div class="feature"><h3>📋 Impact Report</h3><p>Every PR shows what was fixed, what was left alone, and why. Full transparency.</p></div>
-            <div class="feature"><h3>🚦 CI/CD Gate</h3><p>Block merge if breaking changes have unfixed consumers. GitHub Action, one line to install.</p></div>
-            <div class="feature"><h3>📦 Monorepo</h3><p>Finds consumers within the same repo. 70% of companies use monorepos — now Ripple works inside them.</p></div>
-            <div class="feature"><h3>🧠 AI Confidence</h3><p>Every PR shows why Ripple made this fix, with confidence score based on repo-specific learning.</p></div>
-            <div class="feature"><h3>🌐 12 Languages</h3><p>Template fixes for Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart — plus LLM for any other language.</p></div>
-        </div>
-    </section>
-    
-    <section class="fade-in">
-        <h2>How It Works</h2>
-        <div class="steps">
-            <div class="step"><div class="step-num">1</div><h4>Install</h4><p>One click. GitHub, GitLab, or Bitbucket.</p></div>
-            <div class="step"><div class="step-num">2</div><h4>Push</h4><p>Change your spec. Push to main.</p></div>
-            <div class="step"><div class="step-num">3</div><h4>Fixed</h4><p>PRs appear in every consumer with AI confidence badges. Review & merge.</p></div>
-        </div>
-    </section>
-    
-    <section class="fade-in">
-        <p class="desc" style="margin-bottom: 20px;">Works with</p>
-        <div class="logos">
-            <span>GitHub</span><span>GitLab</span><span>Bitbucket</span><span>Kafka</span><span>gRPC</span><span>GraphQL</span><span>PostgreSQL</span><span>Prisma</span><span>AWS</span><span>TypeScript</span><span>Python</span><span>Java</span>
-        </div>
-    </section>
-    
-    <section id="compare" class="fade-in">
-        <h2>How Ripple Compares</h2>
-        <p class="desc">The only tool that does the full loop: detect → find → fix → PR.</p>
-        <table class="compare">
-            <thead><tr><th></th><th>Ripple</th><th>Dependabot</th><th>Optic</th><th>buf</th></tr></thead>
-            <tbody>
-                <tr><td>Detects breaking changes</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="y">✓</td></tr>
-                <tr><td>Finds consumers</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>Generates fix code</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>Opens PRs automatically</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>Contract types</td><td class="y">10</td><td class="n">0</td><td>1</td><td>1</td></tr>
-                <tr><td>Learns from git history</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>Change Impact Report</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>GitHub + GitLab + Bitbucket</td><td class="y">✓</td><td>GH only</td><td>GH only</td><td>GH only</td></tr>
-                <tr><td>Self-hosted option</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>CI/CD gate</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td></tr>
-                <tr><td>Monorepo support</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-                <tr><td>Fix languages</td><td class="y">12 + LLM</td><td>10 (SDK gen)</td><td class="n">0</td><td class="n">0</td></tr>
-                <tr><td>Dependency graph</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
-            </tbody>
-        </table>
-    </section>
-    
-    <section class="fade-in">
-        <h2>Research-Backed</h2>
-        <p class="desc">Ripple is built on PropBench — a benchmark proving most "engineering judgment" is learnable.</p>
-        <div class="features" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));">
-            <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">268</h3><p>Real engineering changes analyzed</p></div>
-            <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">1,223</h3><p>Consequence files classified</p></div>
-            <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">82%</h3><p>Package-level recall (ensemble)</p></div>
-            <div class="feature" style="text-align: center;"><h3 style="font-size: 2rem; color: #3b82f6;">3</h3><p>Independent learning channels</p></div>
-        </div>
-        <p style="text-align: center; color: #6b7280; margin-top: 20px; font-size: 0.9rem;">Finding: 39% of propagation targets are cross-package — invisible to any single-repo tool.<br>Naming alone: 7% recall. + Git history: 17%. + Ensemble: 82%. <a href="https://github.com/Aakash2408/Propbench" style="color: #3b82f6;">Read the research →</a></p>
-    </section>
+  <section class="stats">
+    <div class="stat-item">
+      <div class="stat-number"><span class="counter" data-target="12">0</span><span class="accent">+</span></div>
+      <div class="stat-label">Languages</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number"><span class="counter" data-target="10">0</span></div>
+      <div class="stat-label">Contract Types</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number"><span class="counter" data-target="15">0</span><span class="accent">s</span></div>
+      <div class="stat-label">Push to PR</div>
+    </div>
+  </section>
 
-    <section id="self-hosted" class="fade-in">
-        <h2>Self-Hosted Agent</h2>
-        <p class="desc">For custom platforms, on-prem Git, or air-gapped networks.</p>
-        <div class="terminal" style="max-width: 600px; margin: 0 auto;">
-            <div class="terminal-header"><div class="terminal-dot r"></div><div class="terminal-dot y"></div><div class="terminal-dot g"></div></div>
-            <div class="terminal-body" style="padding: 16px 20px;">
-                <span class="b">$ ripple-agent scan /path/to/repo</span><br>
-                <span class="b">$ docker run -v /repos:/repos ripple-agent watch</span>
-            </div>
-        </div>
-        <div class="logos" style="margin-top: 20px;">
-            <span>Generic Git</span><span>Amazon CRUX</span><span>Phabricator</span><span>Gerrit</span>
-        </div>
-    </section>
+  <!-- HOW IT WORKS -->
+  <section class="how-it-works">
+    <h2>How it works</h2>
+    <div class="step">
+      <div class="step-num">01</div>
+      <div class="step-content">
+        <h3>Detect</h3>
+        <p>Parses 10 contract types (OpenAPI, Proto, GraphQL, DB, AsyncAPI, Avro, tRPC, Thrift, JSON Schema, Smithy). Finds every breaking change in the diff.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">02</div>
+      <div class="step-content">
+        <h3>Find</h3>
+        <p>Ensemble consumer finder with 5 detection channels: code search, git history learning, playbooks, multi-invoker analysis, and custom rules. Finds consumers you didn't know existed.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">03</div>
+      <div class="step-content">
+        <h3>Fix</h3>
+        <p>Generates idiomatic fixes in 12 languages with AI confidence scoring. Template engine for speed, LLM fallback for edge cases.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">04</div>
+      <div class="step-content">
+        <h3>Ship</h3>
+        <p>Opens fix PRs with Impact Reports, lifecycle labels, and upstream status tracking. Notifies via Slack. CI/CD gate blocks merge until consumers are safe.</p>
+      </div>
+    </div>
+  </section>
 
-    <section id="pricing" class="fade-in">
-        <h2>Pricing</h2>
-        <div class="pricing">
-            <div class="price-card featured">
-                <h3>Open Source</h3>
-                <div class="price">Free</div>
-                <p>All 10 contract types<br>GitHub + GitLab + Bitbucket<br>Self-hosted agent<br>Community support</p>
-            </div>
-            <div class="price-card">
-                <h3>Team</h3>
-                <div class="price">$49<span>/mo</span></div>
-                <p>Private repos<br>Org-wide scanning<br>Slack notifications<br>Priority support</p>
-            </div>
-            <div class="price-card">
-                <h3>Enterprise</h3>
-                <div class="price">Custom</div>
-                <p>SSO + audit log<br>Custom adapters<br>On-prem deployment<br>Dedicated support</p>
-            </div>
-        </div>
-    </section>
+  <!-- COMPARISON TABLE -->
+  <section class="comparison">
+    <h2>How Ripple compares</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Feature</th><th>Ripple</th><th>Speakeasy</th><th>Optic</th><th>buf</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Detect breaking changes</td><td class="ripple-col check">✓</td><td class="check">✓</td><td class="check">✓</td><td class="check">✓</td></tr>
+          <tr><td>Find ANY consumer</td><td class="ripple-col check">✓</td><td class="dash">—</td><td class="dash">—</td><td class="dash">—</td></tr>
+          <tr><td>Fix existing code</td><td class="ripple-col check">✓</td><td class="dash">—</td><td class="dash">—</td><td class="dash">—</td></tr>
+          <tr><td>Open PRs automatically</td><td class="ripple-col check">✓</td><td class="dash">—</td><td class="dash">—</td><td class="dash">—</td></tr>
+          <tr><td>CI/CD gate</td><td class="ripple-col check">✓</td><td class="dash">—</td><td class="dash">—</td><td class="check">✓</td></tr>
+          <tr><td>Monorepo support</td><td class="ripple-col check">✓</td><td class="check">✓</td><td class="dash">—</td><td class="check">✓</td></tr>
+          <tr><td>Fix languages</td><td class="ripple-col">12 + LLM</td><td>10</td><td class="dash">—</td><td class="dash">—</td></tr>
+          <tr><td>Dependency graph</td><td class="ripple-col check">✓</td><td class="dash">—</td><td class="dash">—</td><td class="dash">—</td></tr>
+          <tr><td>AI confidence scoring</td><td class="ripple-col check">✓</td><td class="dash">—</td><td class="dash">—</td><td class="dash">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- FEATURES TABS -->
+  <section class="features">
+    <h2>Features</h2>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="cicd">CI/CD Gate</button>
+      <button class="tab-btn" data-tab="confidence">AI Confidence</button>
+      <button class="tab-btn" data-tab="monorepo">Monorepo</button>
+      <button class="tab-btn" data-tab="slack">Slack Alerts</button>
+    </div>
+    <div class="tab-content active" id="tab-cicd">- uses: Aakash2408/ripple-check@v1
+  with:
+    token: ${{ secrets.GITHUB_TOKEN }}
+    contract-types: openapi,proto,graphql
+    fail-on-breaking: true
+    monorepo: true
+
+# ✅ All consumers safe — merge allowed
+# ❌ 3 breaking changes — 2 fix PRs pending</div>
+    <div class="tab-content" id="tab-confidence">## 🧠 AI Confidence Report
+
+| Consumer        | Language   | Confidence | Basis            |
+|-----------------|------------|------------|------------------|
+| billing-svc     | Go         | 97%        | 63 observations  |
+| checkout-web    | TypeScript | 91%        | 28 observations  |
+| analytics-pipe  | Python     | 84%        | 12 observations  |
+
+Model: PropBench v1 · Improves with every merged fix</div>
+    <div class="tab-content" id="tab-monorepo">$ ripple scan --monorepo
+
+🔍 Scanning monorepo structure...
+   Found 14 packages in ./packages/
+   Detected 3 internal consumers of @api/users
+
+📦 packages/billing    → imports UserSchema (proto)
+📦 packages/dashboard  → imports UserAPI (openapi)
+📦 packages/analytics  → imports UserEvent (asyncapi)
+
+✅ Internal consumers included in fix batch</div>
+    <div class="tab-content" id="tab-slack">┌─────────────────────────────────────────┐
+│ 🌊 Ripple                               │
+├─────────────────────────────────────────┤
+│ Breaking change detected in user.proto  │
+│                                         │
+│ • 3 fields removed in UserResponse      │
+│ • 7 consumers found                     │
+│ • 7 fix PRs opened                      │
+│                                         │
+│ ⏱️ 14.2s  |  🧠 94% confidence          │
+│                                         │
+│ [View Impact Report]  [See PRs]         │
+└─────────────────────────────────────────┘</div>
+  </section>
+
+  <!-- BOTTOM CTA -->
+  <section class="bottom-cta">
+    <h2>Your next API change doesn't have to break anything.</h2>
+    <a href="https://ripple-production-be7f.up.railway.app/auth/github" class="btn-primary">Install in 30 seconds</a>
+    <p class="note">Free for open source. No config needed.</p>
+  </section>
 </div>
 
+<!-- FOOTER -->
 <footer>
-    <p>Built by <a href="https://github.com/Aakash2408">Aakash Sangwan</a> · <a href="https://github.com/Aakash2408/ripple">Source</a> · <a href="https://ripple-production-be7f.up.railway.app/dashboard">Dashboard</a> · <a href="https://ripple-production-be7f.up.railway.app/docs">API</a></p>
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/Aakash2408/ripple">GitHub</a>
+      <a href="https://github.com/Aakash2408/ripple#readme">Docs</a>
+      <a href="#">Blog</a>
+      <a href="https://ripple-production-be7f.up.railway.app/dry-run">Dry Run</a>
+      <a href="mailto:aakash.sangwan24@gmail.com">Contact</a>
+    </div>
+    <div class="copy">© 2026 Ripple · Built by Aakash Sangwan</div>
+  </div>
 </footer>
 
 <script>
-const observer = new IntersectionObserver(entries => {
-    entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
-}, { threshold: 0.1 });
-document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
-</script>
+// Counter animation on scroll
+const counters = document.querySelectorAll('.counter');
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const el = entry.target;
+      const target = +el.dataset.target;
+      let current = 0;
+      const step = Math.ceil(target / 30);
+      const timer = setInterval(() => {
+        current += step;
+        if (current >= target) { current = target; clearInterval(timer); }
+        el.textContent = current;
+      }, 40);
+      observer.unobserve(el);
+    }
+  });
+}, { threshold: 0.5 });
+counters.forEach(c => observer.observe(c));
 
+// Step reveal on scroll
+const steps = document.querySelectorAll('.step');
+const stepObs = new IntersectionObserver((entries) => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
+}, { threshold: 0.2 });
+steps.forEach(s => stepObs.observe(s));
+
+// Tabs
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+</script>
 </body>
 </html>
