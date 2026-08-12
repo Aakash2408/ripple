@@ -137,9 +137,10 @@ uvicorn app.webhook:app --port 8000
 
 1. **Detect** — Parses API contracts (OpenAPI, Protobuf, GraphQL, database schemas) and finds breaking changes
 2. **Find** — Scans your org's repos for code that calls the changed endpoint
-3. **Fix** — Generates the minimal code fix for each consumer (TypeScript, Python, Java)
+3. **Fix** — Generates the minimal code fix for each consumer in **8 languages** (Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#) with LLM fallback for any other language
 4. **Validate** — Syntax-checks every fix before opening a PR
-5. **PR** — Opens a pull request with the fix + clear explanation
+5. **PR** — Opens a pull request with the fix, confidence badge, and clear explanation
+6. **Visualize** — Maps your full dependency graph (`/graph` endpoint) in ASCII, Mermaid, or D3 format
 
 ## It Learns Your Codebase
 
@@ -190,6 +191,91 @@ Warns when a breaking change could be done non-breakingly:
 
 Helps teams avoid breaking changes entirely when possible.
 
+## Multi-Language Fix Generation
+
+Ripple generates idiomatic fixes in **8 languages** natively, with LLM fallback for anything else:
+
+| Language | Engine | Fix Quality |
+|---|---|---|
+| Python | AST-aware (libcst) | Idiomatic, preserves formatting |
+| TypeScript | AST-aware (ts-morph) | Type-safe, handles generics |
+| Java | AST-aware (JavaParser) | Handles annotations, generics |
+| Go | AST-aware (go/ast) | gofmt-compliant output |
+| Rust | AST-aware (syn) | Lifetime/ownership-aware |
+| Ruby | Pattern-based + AST | Rails conventions respected |
+| Kotlin | AST-aware (KotlinParser) | Coroutine/suspend-safe |
+| C# | AST-aware (Roslyn) | Nullable reference types aware |
+| *Any other* | LLM fallback (GPT-4) | Context-aware, validated |
+
+**How the LLM fallback works:**
+- If the consumer file is in a language without a native engine, Ripple sends the breaking change + file context to GPT-4
+- The generated fix is syntax-validated before opening a PR
+- Confidence score is adjusted (typically 70-85% vs 90-98% for native engines)
+
+Every fix — native or LLM — is syntax-checked and dry-run validated before opening a PR.
+
+## Dependency Graph Visualization
+
+See your entire API dependency graph at a glance:
+
+```
+GET /graph?org={org}&format={ascii|mermaid|d3}&filter={contract_type}
+```
+
+**Formats:**
+
+| Format | Use Case | Output |
+|---|---|---|
+| `ascii` | Terminal / Slack | Box-and-arrow text diagram |
+| `mermaid` | Docs / README / wikis | Mermaid flowchart syntax |
+| `d3` | Interactive exploration | HTML page with D3.js force graph |
+
+**Filtering options:**
+
+| Parameter | Example | Description |
+|---|---|---|
+| `format` | `mermaid` | Output format (default: ascii) |
+| `filter` | `openapi,proto` | Only show edges for these contract types |
+| `depth` | `2` | Max hops from root (default: unlimited) |
+| `root` | `payments-api` | Center graph on this service |
+| `highlight` | `breaking` | Color-code nodes with recent breaking changes |
+| `include-stale` | `false` | Hide consumers not seen in 30+ days |
+
+**Example (Mermaid output):**
+
+```mermaid
+graph LR
+  payments-api -->|OpenAPI| billing-service
+  payments-api -->|OpenAPI| checkout-ui
+  payments-api -->|Proto| fraud-detector
+  billing-service -->|GraphQL| reporting-dashboard
+```
+
+The graph updates live as Ripple learns your codebase. Every push refines the consumer map.
+
+## AI Confidence Badge
+
+Every PR Ripple opens includes a **confidence badge** showing how certain Ripple is about the fix:
+
+```
+🟢 Confidence: 96% — High confidence fix (AST-validated, pattern-matched)
+🟡 Confidence: 78% — Medium confidence (LLM-generated, syntax-validated)
+🔴 Confidence: 45% — Low confidence (best-effort, needs manual review)
+```
+
+**What drives the score:**
+
+| Factor | Impact |
+|---|---|
+| Native AST engine (vs LLM) | +15-20% |
+| Co-change history match | +10% |
+| File seen in prior successful fixes | +8% |
+| Monorepo (same-repo consumer) | +5% |
+| Test file coverage detected | +5% |
+| Multiple naming variant matches | +3% |
+
+Badges appear in the PR title and body. CI/CD gates can be configured to only auto-merge above a threshold (e.g., `min_confidence: 0.85` in `.ripple.yaml`).
+
 ## Research: PropBench
 
 Ripple is backed by **PropBench** — a research benchmark proving that most "senior engineering judgment" in change propagation is actually learnable patterns:
@@ -209,9 +295,11 @@ Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](h
 | Detects breaking changes | ✅ | — | ✅ | ✅ |
 | Finds consumers | ✅ | — | — | — |
 | Generates fix code | ✅ | — | — | — |
+| Fix languages | 8 + LLM fallback | 0 | 0 | 0 |
 | Opens PRs automatically | ✅ | ✅ | — | — |
 | CI/CD gate (blocks merge) | ✅ | — | — | ✅ |
 | Monorepo support | ✅ | — | — | — |
+| Dep graph visualization | ✅ | — | — | — |
 | Contract types | 10 | 0 | 1 | 1 |
 | Learns from git history | ✅ | — | — | — |
 | Change Impact Report | ✅ | — | — | — |
@@ -321,8 +409,12 @@ Get the template: `GET /config/template`
 - [x] TypeScript / JavaScript
 - [x] Python
 - [x] Java
-- [ ] Go (coming soon)
-- [ ] Rust (coming soon)
+- [x] Go
+- [x] Rust
+- [x] Ruby
+- [x] Kotlin
+- [x] C#
+- [x] Any other language (LLM fallback)
 
 ## Deploy
 
@@ -448,6 +540,7 @@ POST /webhook/gitlab    — GitLab push events
 POST /webhook/bitbucket — Bitbucket push events
 POST /webhook/install   — GitHub App installation (triggers learning)
 POST /learn             — Manually trigger co-change learning
+GET  /graph             — Dependency graph visualization (ASCII/Mermaid/D3)
 GET  /dashboard         — Web UI (monitored repos, activity, stats)
 GET  /status/{org}      — What Ripple knows about your codebase (JSON)
 GET  /rate-limit/{org}  — Rate limit status for an org
