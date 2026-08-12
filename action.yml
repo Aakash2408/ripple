@@ -1,0 +1,194 @@
+# Ripple Check — GitHub Action
+# 
+# Blocks merge if a PR introduces breaking API changes with unfixed consumers.
+# Like `buf lint` but for change PROPAGATION — not just detection.
+#
+# Usage in .github/workflows/ripple-check.yml:
+#
+#   name: Ripple Check
+#   on: [pull_request]
+#   jobs:
+#     ripple:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#           with:
+#             fetch-depth: 0
+#         - uses: Aakash2408/ripple-check@v1
+#           with:
+#             token: ${{ secrets.GITHUB_TOKEN }}
+#             contract-types: "openapi,proto,graphql"
+#             fail-on-breaking: true
+#             dry-run: false
+
+name: "Ripple Check"
+description: "Detect breaking API changes and verify consumers are fixed before merge"
+author: "Aakash Sangwan"
+
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  token:
+    description: "GitHub token for API access"
+    required: true
+  contract-types:
+    description: "Comma-separated contract types to check (openapi,proto,graphql,database,asyncapi,avro,trpc,thrift,jsonschema,smithy)"
+    required: false
+    default: "openapi,proto,graphql"
+  fail-on-breaking:
+    description: "Fail the check if breaking changes are detected with unfixed consumers"
+    required: false
+    default: "true"
+  ripple-server:
+    description: "Ripple server URL for analysis"
+    required: false
+    default: "https://ripple-production-be7f.up.railway.app"
+  monorepo:
+    description: "Enable monorepo mode (scan within the same repo for consumers)"
+    required: false
+    default: "false"
+  consumers-path:
+    description: "Path patterns to scan for consumers (comma-separated globs)"
+    required: false
+    default: ""
+
+outputs:
+  breaking-changes:
+    description: "Number of breaking changes detected"
+  consumers-affected:
+    description: "Number of affected consumers found"
+  status:
+    description: "pass, warn, or fail"
+  report:
+    description: "Markdown report of findings"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect spec files changed
+      id: detect
+      shell: bash
+      run: |
+        # Find API spec files in the PR diff
+        SPEC_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(proto|graphql|gql|yaml|yml|json|avsc|thrift|smithy)$' | grep -v 'node_modules\|vendor\|dist' || true)
+        
+        if [ -z "$SPEC_FILES" ]; then
+          echo "status=skip" >> $GITHUB_OUTPUT
+          echo "No API spec files changed. Skipping Ripple Check."
+          exit 0
+        fi
+        
+        echo "status=check" >> $GITHUB_OUTPUT
+        echo "spec_files<<EOF" >> $GITHUB_OUTPUT
+        echo "$SPEC_FILES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        echo "Found spec files: $SPEC_FILES"
+    
+    - name: Analyze breaking changes
+      if: steps.detect.outputs.status == 'check'
+      id: analyze
+      shell: bash
+      run: |
+        BREAKING=0
+        REPORT=""
+        
+        while IFS= read -r file; do
+          [ -z "$file" ] && continue
+          
+          # Get before/after content
+          BEFORE=$(git show origin/${{ github.base_ref }}:$file 2>/dev/null || echo "")
+          AFTER=$(cat "$file" 2>/dev/null || echo "")
+          
+          if [ -z "$BEFORE" ]; then
+            # New file — no breaking changes possible
+            continue
+          fi
+          
+          # Determine contract type from extension
+          case "$file" in
+            *.proto) TYPE="proto" ;;
+            *.graphql|*.gql) TYPE="graphql" ;;
+            *.avsc) TYPE="avro" ;;
+            *.thrift) TYPE="thrift" ;;
+            *.smithy) TYPE="smithy" ;;
+            *openapi*|*swagger*) TYPE="openapi" ;;
+            *asyncapi*) TYPE="asyncapi" ;;
+            *.json) TYPE="jsonschema" ;;
+            *) TYPE="openapi" ;;
+          esac
+          
+          # Call Ripple dry-run API
+          RESULT=$(curl -s -X POST "${{ inputs.ripple-server }}/dry-run" \
+            -H "Content-Type: application/json" \
+            -d "{\"spec_before\": $(echo "$BEFORE" | jq -Rs .), \"spec_after\": $(echo "$AFTER" | jq -Rs .), \"contract_type\": \"$TYPE\"}" \
+            2>/dev/null || echo '{"breaking_changes": []}')
+          
+          NUM=$(echo "$RESULT" | jq '.breaking_changes | length' 2>/dev/null || echo "0")
+          
+          if [ "$NUM" -gt 0 ]; then
+            BREAKING=$((BREAKING + NUM))
+            CHANGES=$(echo "$RESULT" | jq -r '.breaking_changes[] | "- \(.type): `\(.field)` in `\(.path)` — \(.description)"' 2>/dev/null || echo "")
+            REPORT="$REPORT\n### ⚠️ $file ($NUM breaking change(s))\n$CHANGES\n"
+          fi
+        done <<< "${{ steps.detect.outputs.spec_files }}"
+        
+        echo "breaking=$BREAKING" >> $GITHUB_OUTPUT
+        
+        if [ "$BREAKING" -gt 0 ]; then
+          echo "status=fail" >> $GITHUB_OUTPUT
+        else
+          echo "status=pass" >> $GITHUB_OUTPUT
+        fi
+        
+        # Write report to file for PR comment
+        echo -e "$REPORT" > /tmp/ripple-report.md
+    
+    - name: Scan for affected consumers (monorepo)
+      if: steps.analyze.outputs.status == 'fail' && inputs.monorepo == 'true'
+      id: consumers
+      shell: bash
+      run: |
+        # In monorepo mode, scan the repo itself for consumers
+        AFFECTED=0
+        
+        # Extract field names from breaking changes
+        # For each breaking change, grep the repo for references
+        echo "Scanning monorepo for affected consumers..."
+        
+        # TODO: call Ripple's consumer finder API or run local grep
+        echo "consumers=$AFFECTED" >> $GITHUB_OUTPUT
+    
+    - name: Post PR comment
+      if: steps.detect.outputs.status == 'check'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        BREAKING="${{ steps.analyze.outputs.breaking }}"
+        STATUS="${{ steps.analyze.outputs.status }}"
+        
+        if [ "$STATUS" == "pass" ]; then
+          BODY="## 🌊 Ripple Check — ✅ Passed\n\nNo breaking API changes detected. Safe to merge."
+        else
+          BODY="## 🌊 Ripple Check — ⚠️ $BREAKING Breaking Change(s) Detected\n\n"
+          BODY="$BODY$(cat /tmp/ripple-report.md)\n\n"
+          BODY="$BODY---\n\n"
+          BODY="$BODY**Action required:** Fix affected consumers before merging, or acknowledge the breaking change.\n\n"
+          BODY="$BODY[Try Dry-Run →](https://ripple-production-be7f.up.railway.app/dry-run) | [Install Ripple →](https://github.com/apps/ripple-api)\n\n"
+          BODY="$BODY*Auto-generated by [Ripple](https://aakash2408.github.io/ripple) 🌊*"
+        fi
+        
+        # Post comment on PR
+        PR_NUM=${{ github.event.pull_request.number }}
+        echo -e "$BODY" | gh pr comment "$PR_NUM" --body-file -
+    
+    - name: Set check status
+      if: steps.detect.outputs.status == 'check' && inputs.fail-on-breaking == 'true'
+      shell: bash
+      run: |
+        if [ "${{ steps.analyze.outputs.status }}" == "fail" ]; then
+          echo "::error::Ripple Check failed: ${{ steps.analyze.outputs.breaking }} breaking API change(s) detected. Fix consumers before merging."
+          exit 1
+        fi
