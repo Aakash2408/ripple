@@ -137,7 +137,7 @@ uvicorn app.webhook:app --port 8000
 
 1. **Detect** — Parses API contracts (OpenAPI, Protobuf, GraphQL, database schemas) and finds breaking changes
 2. **Find** — Scans your org's repos for code that calls the changed endpoint
-3. **Fix** — Generates the minimal code fix for each consumer in **8 languages** (Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#) with LLM fallback for any other language
+3. **Fix** — Generates the minimal code fix for each consumer in **12 languages** (Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart) with LLM fallback for any other language
 4. **Validate** — Syntax-checks every fix before opening a PR
 5. **PR** — Opens a pull request with the fix, confidence badge, and clear explanation
 6. **Visualize** — Maps your full dependency graph (`/graph` endpoint) in ASCII, Mermaid, or D3 format
@@ -193,7 +193,7 @@ Helps teams avoid breaking changes entirely when possible.
 
 ## Multi-Language Fix Generation
 
-Ripple generates idiomatic fixes in **8 languages** natively, with LLM fallback for anything else:
+Ripple generates idiomatic fixes in **12 languages** natively, with LLM fallback for anything else:
 
 | Language | Engine | Fix Quality |
 |---|---|---|
@@ -295,7 +295,7 @@ Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](h
 | Detects breaking changes | ✅ | — | ✅ | ✅ |
 | Finds consumers | ✅ | — | — | — |
 | Generates fix code | ✅ | — | — | — |
-| Fix languages | 8 + LLM fallback | 0 | 0 | 0 |
+| Fix languages | 12 + LLM fallback | 0 | 0 | 0 |
 | Opens PRs automatically | ✅ | ✅ | — | — |
 | CI/CD gate (blocks merge) | ✅ | — | — | ✅ |
 | Monorepo support | ✅ | — | — | — |
