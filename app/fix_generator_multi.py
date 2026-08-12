@@ -31,6 +31,10 @@ SUPPORTED_LANGUAGES = [
     "ruby",
     "kotlin",
     "csharp",
+    "swift",
+    "php",
+    "scala",
+    "dart",
 ]
 
 # File extension -> language mapping
@@ -47,6 +51,11 @@ _EXTENSION_MAP: dict[str, str] = {
     ".kt": "kotlin",
     ".kts": "kotlin",
     ".cs": "csharp",
+    ".swift": "swift",
+    ".php": "php",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".dart": "dart",
 }
 
 
@@ -75,7 +84,7 @@ def generate_fix_multi(
         return generate_fix(consumer, breaking_change, use_llm=use_llm)
 
     # New languages handled here
-    if language not in ("go", "rust", "ruby", "kotlin", "csharp"):
+    if language not in ("go", "rust", "ruby", "kotlin", "csharp", "swift", "php", "scala", "dart"):
         return None
 
     # Read the consumer file
@@ -561,6 +570,299 @@ def _to_camel_case(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Swift
+# ---------------------------------------------------------------------------
+
+def _fix_swift(original_code: str, field_name: str, field_type: str) -> tuple[str, str]:
+    """
+    Swift fix: add property to struct/class + function parameter.
+
+    Patterns:
+      struct CreateRequest: Codable { ... }  ->  add let fieldName: Type
+      func createUser(name: String, ...)     ->  add fieldName: String
+      let payload = CreateRequest(...)       ->  add fieldName: fieldName
+    """
+    fixed_code = original_code
+    swift_type = _swift_type(field_type)
+    swift_prop = _to_camel_case(field_name)
+
+    # (1) Add property to struct/class
+    struct_pattern = re.compile(
+        r'((?:struct|class)\s+\w+(?:Request)?[^{]*\{[^}]*?)(})',
+        re.DOTALL,
+    )
+    match = struct_pattern.search(fixed_code)
+    if match:
+        fixed_code = struct_pattern.sub(
+            rf'\1    let {swift_prop}: {swift_type}\n\2',
+            fixed_code,
+        )
+
+    # (2) Add parameter to function
+    func_pattern = re.compile(
+        r'(func\s+\w+\([^)]*?)(\))',
+        re.DOTALL,
+    )
+    match = func_pattern.search(fixed_code)
+    if match:
+        params = match.group(1)
+        if params.strip().endswith("("):
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}{swift_prop}: {swift_type}{match.group(2)}",
+            )
+        else:
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}, {swift_prop}: {swift_type}{match.group(2)}",
+            )
+
+    # (3) Add to initializer call
+    init_pattern = re.compile(
+        r'(\w+Request\([^)]*?)(\))',
+        re.DOTALL,
+    )
+    match = init_pattern.search(fixed_code)
+    if match:
+        params = match.group(1)
+        if params.strip().endswith("("):
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}{swift_prop}: {swift_prop}{match.group(2)}",
+            )
+        else:
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}, {swift_prop}: {swift_prop}{match.group(2)}",
+            )
+
+    explanation = f"Added '{field_name}' to struct, function param, and initializer"
+    return fixed_code, explanation
+
+
+# ---------------------------------------------------------------------------
+# PHP
+# ---------------------------------------------------------------------------
+
+def _fix_php(original_code: str, field_name: str, field_type: str) -> tuple[str, str]:
+    """
+    PHP fix: add to associative array + function parameter.
+
+    Patterns:
+      function createUser($name, $email, ...)  ->  add $field_name
+      $payload = ['name' => $name, ...]        ->  add 'field_name' => $field_name
+      'body' => json_encode([...])             ->  add 'field_name' => $field_name
+    """
+    fixed_code = original_code
+    php_var = "$" + field_name.replace("-", "_")
+
+    # (1) Add parameter to function
+    func_pattern = re.compile(
+        r'(function\s+\w+\([^)]*?)(\))',
+        re.DOTALL,
+    )
+    match = func_pattern.search(fixed_code)
+    if match:
+        params = match.group(1)
+        if params.strip().endswith("("):
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}{php_var}{match.group(2)}",
+            )
+        else:
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}, {php_var}{match.group(2)}",
+            )
+
+    # (2) Add to associative array
+    array_pattern = re.compile(
+        r"(\$(?:payload|body|data)\s*=\s*\[[^\]]*?)(,?\n?\s*\])",
+        re.DOTALL,
+    )
+    match = array_pattern.search(fixed_code)
+    if match:
+        fixed_code = array_pattern.sub(
+            rf"\1,\n        '{field_name}' => {php_var}\2",
+            fixed_code,
+        )
+    else:
+        # Try inline array
+        inline_pattern = re.compile(
+            r"(\[[^\]]*?'[^']+'\s*=>\s*\$\w+)(,?\s*\])",
+        )
+        match = inline_pattern.search(fixed_code)
+        if match:
+            fixed_code = inline_pattern.sub(
+                rf"\1, '{field_name}' => {php_var}\2",
+                fixed_code,
+                count=1,
+            )
+
+    explanation = f"Added '{field_name}' to function params and array payload"
+    return fixed_code, explanation
+
+
+# ---------------------------------------------------------------------------
+# Scala
+# ---------------------------------------------------------------------------
+
+def _fix_scala(original_code: str, field_name: str, field_type: str) -> tuple[str, str]:
+    """
+    Scala fix: add to case class + function parameter.
+
+    Patterns:
+      case class CreateRequest(name: String, ...)  ->  add fieldName: String
+      def createUser(name: String, ...)            ->  add fieldName: String
+      Map("name" -> name, ...)                     ->  add "field_name" -> fieldName
+    """
+    fixed_code = original_code
+    scala_type = _scala_type(field_type)
+    scala_field = _to_camel_case(field_name)
+
+    # (1) Add to case class
+    case_class_pattern = re.compile(
+        r'(case\s+class\s+\w+\([^)]*?)(\))',
+        re.DOTALL,
+    )
+    match = case_class_pattern.search(fixed_code)
+    if match:
+        params = match.group(1)
+        if params.strip().endswith("("):
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}{scala_field}: {scala_type}{match.group(2)}",
+            )
+        else:
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params},\n  {scala_field}: {scala_type}{match.group(2)}",
+            )
+
+    # (2) Add parameter to def
+    def_pattern = re.compile(
+        r'(def\s+\w+\([^)]*?)(\))',
+        re.DOTALL,
+    )
+    match = def_pattern.search(fixed_code)
+    if match:
+        params = match.group(1)
+        if params.strip().endswith("("):
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}{scala_field}: {scala_type}{match.group(2)}",
+            )
+        else:
+            fixed_code = fixed_code.replace(
+                match.group(0),
+                f"{params}, {scala_field}: {scala_type}{match.group(2)}",
+            )
+
+    # (3) Add to Map literal
+    map_pattern = re.compile(
+        r'(Map\([^)]*?)(,?\n?\s*\))',
+        re.DOTALL,
+    )
+    match = map_pattern.search(fixed_code)
+    if match:
+        fixed_code = map_pattern.sub(
+            rf'\1,\n      "{field_name}" -> {scala_field}\2',
+            fixed_code,
+        )
+
+    explanation = f"Added '{field_name}' to case class, def param, and Map payload"
+    return fixed_code, explanation
+
+
+# ---------------------------------------------------------------------------
+# Dart
+# ---------------------------------------------------------------------------
+
+def _fix_dart(original_code: str, field_name: str, field_type: str) -> tuple[str, str]:
+    """
+    Dart fix: add field to class + constructor + toJson.
+
+    Patterns:
+      class CreateRequest { ... }           ->  add final Type fieldName;
+      CreateRequest({required this.name})   ->  add required this.fieldName
+      Map<String, dynamic> toJson() => {}   ->  add 'field_name': fieldName
+    """
+    fixed_code = original_code
+    dart_type = _dart_type(field_type)
+    dart_field = _to_camel_case(field_name)
+
+    # (1) Add field to class body
+    class_pattern = re.compile(
+        r'(class\s+\w+(?:Request)?\s*\{)',
+        re.DOTALL,
+    )
+    match = class_pattern.search(fixed_code)
+    if match:
+        insert_pos = match.end()
+        fixed_code = (
+            fixed_code[:insert_pos] +
+            f"\n  final {dart_type} {dart_field};" +
+            fixed_code[insert_pos:]
+        )
+
+    # (2) Add to constructor
+    constructor_pattern = re.compile(
+        r'(\w+(?:Request)?\(\{[^}]*?)(\})',
+        re.DOTALL,
+    )
+    match = constructor_pattern.search(fixed_code)
+    if match:
+        params = match.group(1)
+        fixed_code = fixed_code.replace(
+            match.group(0),
+            f"{params}, required this.{dart_field}{match.group(2)}",
+        )
+
+    # (3) Add to toJson map
+    tojson_pattern = re.compile(
+        r"(toJson\(\)\s*=>\s*\{[^}]*?)(,?\n?\s*\})",
+        re.DOTALL,
+    )
+    match = tojson_pattern.search(fixed_code)
+    if match:
+        fixed_code = tojson_pattern.sub(
+            rf"\1,\n      '{field_name}': {dart_field}\2",
+            fixed_code,
+        )
+
+    explanation = f"Added '{field_name}' to class field, constructor, and toJson"
+    return fixed_code, explanation
+
+
+# ---------------------------------------------------------------------------
+# Type mapping helpers (new languages)
+# ---------------------------------------------------------------------------
+
+def _swift_type(field_type: str) -> str:
+    mapping = {
+        "string": "String", "integer": "Int", "number": "Double",
+        "boolean": "Bool", "array": "[Any]", "object": "[String: Any]",
+    }
+    return mapping.get(field_type, "String")
+
+
+def _scala_type(field_type: str) -> str:
+    mapping = {
+        "string": "String", "integer": "Int", "number": "Double",
+        "boolean": "Boolean", "array": "List[Any]", "object": "Map[String, Any]",
+    }
+    return mapping.get(field_type, "String")
+
+
+def _dart_type(field_type: str) -> str:
+    mapping = {
+        "string": "String", "integer": "int", "number": "double",
+        "boolean": "bool", "array": "List<dynamic>", "object": "Map<String, dynamic>",
+    }
+    return mapping.get(field_type, "String")
+
+
+# ---------------------------------------------------------------------------
 # Language handler registry
 # ---------------------------------------------------------------------------
 
@@ -570,4 +872,8 @@ _LANGUAGE_HANDLERS: dict[str, callable] = {
     "ruby": _fix_ruby,
     "kotlin": _fix_kotlin,
     "csharp": _fix_csharp,
+    "swift": _fix_swift,
+    "php": _fix_php,
+    "scala": _fix_scala,
+    "dart": _fix_dart,
 }
