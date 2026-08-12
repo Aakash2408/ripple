@@ -303,7 +303,7 @@ Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](h
 | Contract types | 10 | 0 | 1 | 1 |
 | Learns from git history | ✅ | — | — | — |
 | Change Impact Report | ✅ | — | — | — |
-| GitHub + GitLab + Bitbucket | ✅ | GH only | GH only | GH only |
+| Platforms (7) | ✅ (GH+GL+BB+Phab+Gerrit+CRUX+Git) | GH only | GH only | GH only |
 | Self-hosted option | ✅ | — | — | — |
 
 ## Custom Playbooks
@@ -469,8 +469,24 @@ max_fixes_per_scan: 10
 |---|---|---|
 | `generic-git` | Any git repo | Creates branch + commit |
 | `crux` | Amazon (code.amazon.com) | Uses `cr` CLI for code reviews |
-| `phabricator` | Meta, Uber, Pinterest | Uses `arc diff` (planned) |
-| `gerrit` | Google, Android | Uses Gerrit REST API (planned) |
+| `phabricator` | Meta, Uber, Pinterest | Uses `arc diff` CLI or Conduit REST API |
+| `gerrit` | Google, Android, Chromium | Pushes to `refs/for/main` or uses Gerrit REST API |
+
+**Phabricator setup:**
+```bash
+export PHABRICATOR_URL=https://phabricator.yourcompany.com
+export PHABRICATOR_TOKEN=cli-xxxxxxxxxxxx
+python3 -m agent.core scan /path/to/repo --platform phabricator
+```
+
+**Gerrit setup:**
+```bash
+export GERRIT_URL=https://gerrit.yourcompany.com
+export GERRIT_USERNAME=your-username
+export GERRIT_PASSWORD=your-http-password
+export GERRIT_PROJECT=your/project
+python3 -m agent.core scan /path/to/repo --platform gerrit
+```
 
 The agent uses the same 5 diff engines and 30 breaking change detections as the cloud version — just runs locally on your network.
 
