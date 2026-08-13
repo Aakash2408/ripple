@@ -1,0 +1,7 @@
+- [Home](/)
+- [Getting Started](getting-started.md)
+- [How It Works](how-it-works.md)
+- [Platforms](platforms.md)
+- [CI/CD Gate](ci-cd-gate.md)
+- [Self-Hosted](self-hosted.md)
+- [API Reference](api-reference.md)
