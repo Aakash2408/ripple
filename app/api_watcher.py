@@ -222,7 +222,7 @@ def watch_command():
     """CLI: check all APIs for changes."""
     watcher = APIWatcher()
     
-    print("\n🌊 Ripple API Watcher")
+    print("\nRipple API Watcher")
     print("=" * 50)
     print(f"\nMonitoring {len(watcher.apis)} public APIs...\n")
     

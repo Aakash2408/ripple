@@ -250,7 +250,7 @@ code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }
 a { color: #0066ff; }
 </style>
 </head><body>
-<h1>🌊 GitLab OAuth Not Configured</h1>
+<h1>GitLab OAuth Not Configured</h1>
 <p>The server admin needs to register a GitLab OAuth Application.</p>
 <div class="steps">
 <h3>Setup (for server admin):</h3>

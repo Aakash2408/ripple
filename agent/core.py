@@ -200,7 +200,7 @@ class RippleAgent:
         Run in watch mode — poll repos every N seconds.
         Runs forever until interrupted.
         """
-        logger.info(f"🌊 Ripple Agent starting (platform: {self.adapter.name}, interval: {self.config.interval}s)")
+        logger.info(f"Ripple Agent starting (platform: {self.adapter.name}, interval: {self.config.interval}s)")
         logger.info(f"   Monitoring: {self.config.repos or self.config.repos_dir}")
         
         while True:
@@ -305,7 +305,7 @@ def main():
     """CLI entry point for ripple-agent."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="🌊 Ripple Agent — self-hosted API change propagation")
+    parser = argparse.ArgumentParser(description="Ripple Agent — self-hosted API change propagation")
     subparsers = parser.add_subparsers(dest="command")
     
     # scan command

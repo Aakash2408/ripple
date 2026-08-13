@@ -217,7 +217,7 @@ a { color: #3b82f6; text-decoration: none; }
 </style>
 </head><body>
 <div class="container">
-    <h1>🌊 Ripple — Dry Run</h1>
+    <h1>Ripple — Dry Run</h1>
     <p class="subtitle">See what would break. No PRs opened. No repo access needed.</p>
     
     <div class="form-group">

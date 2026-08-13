@@ -126,7 +126,7 @@ def cmd_run():
     # Step 1: Detect breaking changes
     print()
     print("━" * 60)
-    print("  🌊 RIPPLE — API Change Propagation")
+    print("  RIPPLE — API Change Propagation")
     print("━" * 60)
     print()
     
@@ -173,7 +173,7 @@ def cmd_run():
         print(format_prs(prs))
     
     print("━" * 60)
-    print(f"  🌊 RIPPLE COMPLETE")
+    print(f"  RIPPLE COMPLETE")
     print(f"     Breaking changes:  {len(result.breaking_changes)}")
     print(f"     Consumers found:   {sum(1 for _ in all_fixes)}")
     print(f"     Fixes generated:   {len(all_fixes)}")

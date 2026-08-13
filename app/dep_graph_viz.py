@@ -369,7 +369,7 @@ _GRAPH_HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>🌊 Ripple Dependency Graph</h1>
+<h1>Ripple Dependency Graph</h1>
 <div class="stats">{stats_line}</div>
 <div class="tabs">
   <div class="tab active" onclick="switchTab('mermaid')">Mermaid</div>

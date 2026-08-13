@@ -71,7 +71,7 @@ def build_breaking_change_message(
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": f"🌊 Breaking Changes Detected",
+                "text": f"Breaking Changes Detected",
                 "emoji": True,
             },
         },
@@ -132,7 +132,7 @@ def build_fix_pr_message(
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": f"🌊 Ripple Opened {len(fix_prs)} Fix PR(s)",
+                "text": f"Ripple Opened {len(fix_prs)} Fix PR(s)",
                 "emoji": True,
             },
         },

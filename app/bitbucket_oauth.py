@@ -203,7 +203,7 @@ NO_CREDENTIALS_HTML = """<!DOCTYPE html>
 <style>body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 24px; }
 code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; } a { color: #0066ff; }</style>
 </head><body>
-<h1>🌊 Bitbucket OAuth Not Configured</h1>
+<h1>Bitbucket OAuth Not Configured</h1>
 <p>Set <code>BITBUCKET_CLIENT_ID</code> and <code>BITBUCKET_CLIENT_SECRET</code> env vars.</p>
 <ol>
 <li>Go to Bitbucket → Settings → OAuth consumers → Add consumer</li>

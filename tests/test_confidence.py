@@ -165,7 +165,7 @@ class TestFormatPrBody:
             sources=["grep", "history"],
             reasons=["Direct API endpoint reference found", "Co-changed 8/10 times"],
         )
-        assert "🌊 Ripple" in body
+        assert "Ripple" in body
         assert "org/api-spec" in body
         assert "88%" in body
         assert "🟢" in body
@@ -214,7 +214,7 @@ class TestFormatPrBody:
             all_predictions=None,
         )
         assert "Other consumers detected" not in body
-        assert "🌊 Ripple" in body
+        assert "Ripple" in body
 
 
 class TestConfidenceLevels:

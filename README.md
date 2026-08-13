@@ -1,4 +1,4 @@
-# 🌊 Ripple — Self-Maintaining APIs
+# Ripple — Self-Maintaining APIs
 
 > When you change an API, Ripple finds every consumer and opens PRs to fix them. Automatically.
 
@@ -19,7 +19,7 @@ You change `POST /users` to require a new field. Three teams find out when their
 Ripple detects breaking API changes, finds every consumer, generates the fix, and opens a PR — in seconds, not days.
 
 ```
-🌊 RIPPLE — API Change Propagation
+RIPPLE — API Change Propagation
 
 ⚠️  1 breaking change detected:
   POST /payments — added required field 'idempotency_key' (string)

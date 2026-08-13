@@ -127,7 +127,7 @@ async def dashboard():
 <body>
     <div class="header">
         <div class="header-inner">
-            <div class="logo">🌊 <span>Ripple</span></div>
+            <div class="logo"><span>Ripple</span></div>
             <div class="header-links">
                 <a href="https://ripple-cnn.pages.dev/">Home</a>
                 <a href="/docs">API Docs</a>

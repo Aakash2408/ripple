@@ -119,7 +119,7 @@ GITLAB_SETUP_HTML = """<!DOCTYPE html>
 </head>
 <body>
 
-<h1>🌊 Ripple — GitLab Setup</h1>
+<h1>Ripple — GitLab Setup</h1>
 <p class="subtitle">Connect your GitLab project to Ripple in 2 minutes.</p>
 
 <div class="step">

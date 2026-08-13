@@ -259,7 +259,7 @@ def setup():
     """Create both repos and push initial code."""
     import time
     
-    print("\n🌊 RIPPLE DEMO SETUP")
+    print("\nRIPPLE DEMO SETUP")
     print("=" * 50)
     
     # Create API repo
@@ -284,7 +284,7 @@ def setup():
 
 def run_demo():
     """Push v2 spec and run Ripple to create a PR."""
-    print("\n🌊 RIPPLE DEMO — Running full pipeline")
+    print("\nRIPPLE DEMO — Running full pipeline")
     print("=" * 50)
     
     # Push v2 spec (the breaking change)
@@ -381,7 +381,7 @@ def run_demo():
     
     # Create PR
     print("  Opening Pull Request...")
-    pr_body = f"""## 🌊 Ripple — Automated API Change Propagation
+    pr_body = f"""## Ripple — Automated API Change Propagation
 
 ### Breaking Change Detected
 

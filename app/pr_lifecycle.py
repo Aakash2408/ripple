@@ -115,13 +115,13 @@ def format_status_update_comment(source: SourceChange) -> str:
         return (
             f"✅ **Upstream merged!** The source change in `{source.repo}` "
             f"has been merged. This fix PR is now safe to merge.\n\n"
-            f"_Updated by [Ripple](https://ripple-cnn.pages.dev) 🌊_"
+            f"_Updated by [Ripple](https://ripple-cnn.pages.dev)_"
         )
     elif source.status == UpstreamStatus.REVERTED:
         return (
             f"🔄 **Upstream reverted.** The source change in `{source.repo}` "
             f"was reverted. This fix PR is no longer needed and will be closed.\n\n"
-            f"_Updated by [Ripple](https://ripple-cnn.pages.dev) 🌊_"
+            f"_Updated by [Ripple](https://ripple-cnn.pages.dev)_"
         )
     return ""
 
