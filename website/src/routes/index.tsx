@@ -335,14 +335,24 @@ function Index() {
               naming alone: 4.3% recall · + git history: 30% · + ensemble:{" "}
               <span className="text-[var(--success)]">82%</span>
             </p>
-            <a
-              href={LINKS.research}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-6 inline-block rounded-md border border-border px-4 py-2.5 text-sm transition-colors hover:border-primary/60"
-            >
-              Read the research →
-            </a>
+            <div className="mt-6 flex flex-wrap gap-3">
+              <a
+                href={LINKS.research}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-block rounded-md border border-border px-4 py-2.5 text-sm transition-colors hover:border-primary/60"
+              >
+                GitHub (dataset + code) →
+              </a>
+              <a
+                href={LINKS.researchPaper}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-block rounded-md border border-primary/40 bg-primary/5 px-4 py-2.5 text-sm transition-colors hover:border-primary/60"
+              >
+                Read the paper (ResearchGate) →
+              </a>
+            </div>
           </div>
         </Section>
 

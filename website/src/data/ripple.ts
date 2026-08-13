@@ -5,6 +5,7 @@ export const LINKS = {
   dashboard: "https://ripple-production-be7f.up.railway.app/dashboard",
   source: "https://github.com/Aakash2408/ripple",
   research: "https://github.com/Aakash2408/Propbench",
+  researchPaper: "https://www.researchgate.net/publication/PropBench_A_Benchmark_for_Measuring_Engineering_Judgment_in_Change_Propagation",
   pythonPr: "https://github.com/Aakash2408/ripple-sdk-python/pull/1",
   nodePr: "https://github.com/Aakash2408/ripple-sdk-node/pull/1",
   javaPr: "https://github.com/Aakash2408/ripple-sdk-java/pull/1",
