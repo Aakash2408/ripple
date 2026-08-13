@@ -177,8 +177,8 @@ export const COMPARE_ROWS: { label: string; values: string[] }[] = [
 ];
 
 export const RESEARCH_STATS = [
-  { value: "481", label: "Real engineering changes analyzed" },
-  { value: "2,400+", label: "Consequence files classified" },
+  { value: "874", label: "Real engineering changes analyzed" },
+  { value: "5,200+", label: "Consequence files classified" },
   { value: "82%", label: "Package-level recall (ensemble)" },
   { value: "5", label: "Independent learning channels" },
 ];
