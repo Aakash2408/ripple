@@ -177,10 +177,10 @@ export const COMPARE_ROWS: { label: string; values: string[] }[] = [
 ];
 
 export const RESEARCH_STATS = [
-  { value: "268", label: "Real engineering changes analyzed" },
-  { value: "1,223", label: "Consequence files classified" },
+  { value: "481", label: "Real engineering changes analyzed" },
+  { value: "2,400+", label: "Consequence files classified" },
   { value: "82%", label: "Package-level recall (ensemble)" },
-  { value: "3", label: "Independent learning channels" },
+  { value: "5", label: "Independent learning channels" },
 ];
 
 export const PRICING = [

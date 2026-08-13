@@ -329,10 +329,10 @@ function Index() {
           <div className="card-surface mt-4 p-7">
             <p className="text-lg">
               <span className="font-mono text-sm text-muted-foreground">Finding — </span>
-              39% of propagation targets are cross-package, invisible to any single-repo tool.
+              39% of propagation targets are cross-package, invisible to any single-repo tool. Tested on 481 real changes across 15 OSS repos + production codebases.
             </p>
             <p className="mt-4 font-mono text-sm text-muted-foreground">
-              naming alone: 7% recall · + git history: 17% · + ensemble:{" "}
+              naming alone: 4.3% recall · + git history: 30% · + ensemble:{" "}
               <span className="text-[var(--success)]">82%</span>
             </p>
             <a
