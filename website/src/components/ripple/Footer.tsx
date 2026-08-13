@@ -76,7 +76,9 @@ export function Footer() {
         </div>
 
         <div className="mt-12 flex flex-col gap-2 border-t border-border pt-6 font-mono text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-          <span>© {new Date().getFullYear()} Ripple — open source</span>
+          <span>© {new Date().getFullYear()} Ripple — Built by{" "}
+            <a href="https://www.linkedin.com/in/aakash-sangwan/" target="_blank" rel="noreferrer" className="text-foreground hover:text-primary transition-colors">Aakash Sangwan</a>
+          </span>
           <span>detect → find → fix → PR</span>
         </div>
       </div>
