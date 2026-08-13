@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Changelog — Ripple</title>
+    <meta name="description" content="What's new in Ripple. Feature releases, improvements, and fixes.">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 20 Q8 14 14 20 Q20 26 26 20 Q30 17 32 18' fill='none' stroke='%233b82f6' stroke-width='3' stroke-linecap='round'/%3E%3Cpath d='M2 14 Q8 8 14 14 Q20 20 26 14 Q30 11 32 12' fill='none' stroke='%2360a5fa' stroke-width='2.5' stroke-linecap='round' opacity='0.7'/%3E%3C/svg%3E">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #000000; color: #ededed; line-height: 1.6; }
+        a { color: #60a5fa; text-decoration: none; }
+        a:hover { color: #93c5fd; }
+        .container { max-width: 720px; margin: 0 auto; padding: 0 24px; }
+
+        /* Nav */
+        nav { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+        .nav-brand { font-weight: 700; font-size: 1.2rem; }
+        .nav-links { display: flex; gap: 24px; }
+        .nav-links a { color: #9ca3af; font-size: 0.9rem; transition: color 0.2s; }
+        .nav-links a:hover { color: #ffffff; }
+
+        /* Header */
+        .page-header { padding: 60px 0 40px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+        .page-header h1 { font-size: 2.4rem; font-weight: 800; letter-spacing: -1px; margin-bottom: 8px; }
+        .page-header p { color: #6b7280; font-size: 1rem; }
+
+        /* Entries */
+        .changelog-entry { padding: 32px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+        .changelog-entry:last-child { border-bottom: none; }
+        .changelog-entry h3 { font-size: 1rem; font-weight: 600; color: #60a5fa; margin-bottom: 12px; letter-spacing: 0.5px; }
+        .changelog-entry ul { list-style: none; padding: 0; }
+        .changelog-entry li { padding: 4px 0; padding-left: 20px; position: relative; color: #d1d5db; font-size: 0.95rem; }
+        .changelog-entry li::before { content: '•'; position: absolute; left: 0; color: #3b82f6; font-weight: bold; }
+
+        /* Footer */
+        footer { text-align: center; padding: 40px 0; border-top: 1px solid rgba(255,255,255,0.06); color: #4b5563; font-size: 0.8rem; }
+        footer a { color: #6b7280; }
+
+        @media (max-width: 480px) {
+            .page-header h1 { font-size: 1.8rem; }
+            .nav-links { gap: 12px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <nav>
+        <a href="index.html" class="nav-brand">Ripple</a>
+        <div class="nav-links">
+            <a href="index.html">Home</a>
+            <a href="https://ripple-production-be7f.up.railway.app/docs" target="_blank">Docs</a>
+            <a href="https://github.com/Aakash2408/ripple" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <div class="page-header">
+        <h1>Changelog</h1>
+        <p>What's new in Ripple. All notable features, improvements, and fixes.</p>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 13, 2026</h3>
+        <ul>
+            <li>Docs site launched</li>
+            <li>OG image and favicon added</li>
+            <li>Email capture on landing page</li>
+            <li>Changelog page added</li>
+            <li>Cleaned up branding (removed wave emoji from titles)</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 12, 2026</h3>
+        <ul>
+            <li>12-language fix generation (Python, TS, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart + LLM fallback)</li>
+            <li>Dependency graph visualization</li>
+            <li>AI Confidence badge on fix PRs</li>
+            <li>Slack notifications with Block Kit formatting</li>
+            <li>CI/CD Gate (GitHub Action — action.yml)</li>
+            <li>Monorepo support</li>
+            <li>Phabricator adapter (arc diff + Conduit API)</li>
+            <li>Gerrit adapter (refs/for/main + REST API)</li>
+            <li>Landing page moved to Cloudflare Pages</li>
+            <li>Dashboard UI overhaul</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 10, 2026</h3>
+        <ul>
+            <li>PR lifecycle labels (pending / merged / reverted tracking)</li>
+            <li>Expand + contract migration advisor</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 9, 2026</h3>
+        <ul>
+            <li>Mobile CSS overhaul — responsive at 768px and 480px breakpoints</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 6, 2026</h3>
+        <ul>
+            <li>Change Impact Report — summarizes blast radius before merge</li>
+            <li>Dry-run mode — preview fixes without opening PRs</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 5, 2026</h3>
+        <ul>
+            <li>GitLab OAuth integration</li>
+            <li>Bitbucket OAuth integration</li>
+            <li>Token persistence across deploys</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 4, 2026</h3>
+        <ul>
+            <li>10 contract types supported: OpenAPI, Proto, GraphQL, DB migrations, AsyncAPI, Avro, tRPC, Thrift, JSON Schema, Smithy</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>July 30, 2026</h3>
+        <ul>
+            <li>Rate limiting and retry queue for webhook processing</li>
+            <li>Playbook engine — codified fix patterns per contract type</li>
+            <li>Ensemble consumer finder — multi-strategy search</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>July 29, 2026</h3>
+        <ul>
+            <li>Initial launch</li>
+            <li>OpenAPI, Proto, GraphQL, and DB migration contract detection</li>
+            <li>GitHub App with one-click install</li>
+            <li>Landing page and documentation</li>
+        </ul>
+    </div>
+</div>
+
+<footer>
+    <p><a href="index.html">Ripple</a> · Built by <a href="https://www.linkedin.com/in/aakash-sangwan/">Aakash Sangwan</a></p>
+</footer>
+</body>
+</html>

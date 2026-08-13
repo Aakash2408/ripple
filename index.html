@@ -398,8 +398,21 @@
     </section>
 </div>
 
+<section style="padding: 60px 0; background: rgba(255,255,255,0.02); border-top: 1px solid rgba(255,255,255,0.06);">
+    <div class="container" style="text-align: center; max-width: 480px;">
+        <h2 style="font-size: 1.6rem; margin-bottom: 8px;">Stay updated</h2>
+        <p style="color: #6b7280; margin-bottom: 20px; font-size: 0.95rem;">Get notified when we ship new features.</p>
+        <form id="subscribe-form" style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+            <input type="email" id="subscribe-email" placeholder="you@company.com" required
+                style="padding: 12px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: #ededed; font-size: 0.95rem; flex: 1; min-width: 200px;">
+            <button type="submit" class="btn btn-primary" style="white-space: nowrap;">Subscribe</button>
+        </form>
+        <p id="subscribe-msg" style="margin-top: 12px; font-size: 0.85rem; color: #4ade80; display: none;"></p>
+    </div>
+</section>
+
 <footer>
-    <p>Built by <a href="https://www.linkedin.com/in/aakash-sangwan/">Aakash Sangwan</a> · <a href="https://github.com/Aakash2408/ripple">Source</a> · <a href="https://ripple-production-be7f.up.railway.app/dashboard">Dashboard</a> · <a href="https://ripple-production-be7f.up.railway.app/docs">API</a></p>
+    <p>Built by <a href="https://www.linkedin.com/in/aakash-sangwan/">Aakash Sangwan</a> · <a href="https://github.com/Aakash2408/ripple">Source</a> · <a href="https://ripple-production-be7f.up.railway.app/dashboard">Dashboard</a> · <a href="https://ripple-production-be7f.up.railway.app/docs">API</a> · <a href="changelog.html">Changelog</a></p>
 </footer>
 
 <script>
@@ -421,6 +434,21 @@ if (termBody) {
     }, { threshold: 0.3 });
     termObserver.observe(termBody);
 }
+
+// Email subscribe
+document.getElementById('subscribe-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = document.getElementById('subscribe-email').value;
+    const msg = document.getElementById('subscribe-msg');
+    try {
+        const res = await fetch('https://ripple-production-be7f.up.railway.app/subscribe', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({email})
+        });
+        msg.textContent = res.ok ? 'You\'re in! We\'ll keep you posted.' : 'Something went wrong. Try again.';
+        msg.style.color = res.ok ? '#4ade80' : '#ef4444';
+    } catch { msg.textContent = 'Network error. Try again.'; msg.style.color = '#ef4444'; }
+    msg.style.display = 'block';
+});
 </script>
 
 </body>
