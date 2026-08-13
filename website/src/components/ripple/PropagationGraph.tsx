@@ -11,6 +11,13 @@ export function PropagationGraph() {
       <p className="eyebrow">Propagation graph</p>
       <div className="relative mt-4 h-[240px] w-full">
         <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 h-full w-full">
+          <defs>
+            <style>{`
+              @keyframes dashFlow {
+                to { stroke-dashoffset: -12; }
+              }
+            `}</style>
+          </defs>
           {NODES.map((n, i) => (
             <path
               key={n.id}
@@ -21,7 +28,7 @@ export function PropagationGraph() {
               strokeWidth="0.5"
               vectorEffect="non-scaling-stroke"
               strokeDasharray="3 3"
-              style={{ animation: `marquee ${14 + i * 3}s linear infinite` }}
+              style={{ animation: `dashFlow ${2 + i * 0.5}s linear infinite` }}
             />
           ))}
         </svg>
