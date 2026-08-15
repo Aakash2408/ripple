@@ -181,34 +181,61 @@ async def test_llm():
 async def github_install_webhook(request: FastAPIRequest):
     """
     Handles GitHub App installation events.
-    When installed on a repo/org, automatically scans git history
-    to learn co-change patterns (PropBench Historian integration).
+    When installed on a repo/org:
+    1. Scans git history for co-change patterns (History Learner)
+    2. Indexes merged PRs into RAG store (fix patterns)
+    3. Pre-loads PropBench general knowledge
     """
     body = await request.body()
     payload = json.loads(body)
     event_type = request.headers.get("X-GitHub-Event", "")
     
     if event_type == "installation" and payload.get("action") == "created":
-        # App was just installed — learn from all repos
         repos = payload.get("repositories", [])
         org = payload.get("installation", {}).get("account", {}).get("login", "unknown")
+        installation_id = payload.get("installation", {}).get("id")
         
         learner = get_learner(org)
+        token = _get_token(installation_id)
         results = []
         
+        # Initialize RAG store for this org
+        from .rag_engine import RagStore, index_from_propbench
+        store = RagStore(collection_name=f"ripple_{org}")
+        
+        # Pre-load PropBench general knowledge (882 patterns)
+        try:
+            propbench_dir = os.path.join(os.path.dirname(__file__), "..", "propbench_data")
+            if os.path.exists(propbench_dir):
+                pb_stats = index_from_propbench(propbench_dir, store)
+                results.append({"source": "propbench", "status": "loaded", "patterns": pb_stats.get("indexed", 0)})
+        except Exception as e:
+            results.append({"source": "propbench", "status": "skipped", "reason": str(e)[:100]})
+        
+        # For each repo: scan merged PRs via GitHub API + index into RAG
         for repo in repos:
             repo_name = repo.get("full_name", "")
-            # Trigger async learning (in production, this would be a background job)
-            results.append({
-                "repo": repo_name,
-                "status": "learning_queued",
-                "message": f"Will scan git history for co-change patterns",
-            })
+            try:
+                # Scan merged PRs for fix patterns
+                pr_patterns = _index_merged_prs(repo_name, token, store)
+                results.append({
+                    "repo": repo_name,
+                    "status": "indexed",
+                    "merged_prs_scanned": pr_patterns.get("prs_scanned", 0),
+                    "patterns_extracted": pr_patterns.get("patterns_stored", 0),
+                })
+            except Exception as e:
+                results.append({
+                    "repo": repo_name,
+                    "status": "error",
+                    "reason": str(e)[:100],
+                })
         
         return {
             "status": "installation_received",
             "org": org,
             "repos_to_learn": len(repos),
+            "rag_store_size": store.count(),
             "results": results,
         }
     
@@ -1129,6 +1156,204 @@ def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:
     if "content" in data:
         return base64.b64decode(data["content"]).decode()
     return ""
+
+
+def _index_merged_prs(repo: str, token: str, store, platform: str = "github", max_prs: int = 100) -> dict:
+    """
+    Scan merged PRs/MRs from any platform and index fix patterns into RAG store.
+    
+    Supports: GitHub, GitLab, Bitbucket, and any platform via adapter pattern.
+    Looks for PRs where a spec/contract file changed alongside consumer files.
+    """
+    from .rag_engine import FixExample
+    from .smart_consumer_finder import generate_variants
+    
+    prs_scanned = 0
+    patterns_stored = 0
+    
+    # Spec file patterns (files that trigger propagation)
+    spec_patterns = [
+        ".proto", "openapi.yaml", "openapi.json", "swagger.yaml", "swagger.json",
+        "schema.graphql", ".graphql", "schema.prisma", "asyncapi.yaml",
+        ".avro", ".thrift", ".smithy", "trpc.ts",
+    ]
+    
+    try:
+        if platform == "github":
+            merged_prs = _fetch_github_merged_prs(repo, token, max_prs)
+        elif platform == "gitlab":
+            merged_prs = _fetch_gitlab_merged_mrs(repo, token, max_prs)
+        elif platform == "bitbucket":
+            merged_prs = _fetch_bitbucket_merged_prs(repo, token, max_prs)
+        else:
+            # Self-hosted / generic -- use git log if available
+            merged_prs = _fetch_git_log_prs(repo, max_prs)
+    except Exception:
+        return {"prs_scanned": 0, "patterns_stored": 0}
+    
+    for pr in merged_prs:
+        prs_scanned += 1
+        files_changed = pr.get("files", [])
+        
+        # Find spec files in this PR
+        spec_files = [f for f in files_changed if any(f.endswith(p) or p in f for p in spec_patterns)]
+        consumer_files = [f for f in files_changed if f not in spec_files and _is_code_file(f)]
+        
+        if spec_files and consumer_files:
+            # This PR changed a spec + consumers → it's a propagation example
+            for spec_file in spec_files:
+                example = FixExample(
+                    trigger_description=f"Changed {spec_file} in PR #{pr.get('number', '?')}: {pr.get('title', '')}",
+                    trigger_file=spec_file,
+                    trigger_diff=pr.get("title", ""),
+                    fix_file=consumer_files[0],
+                    fix_diff=f"Modified {len(consumer_files)} consumer file(s): {', '.join(consumer_files[:5])}",
+                    language=_detect_lang(consumer_files[0]),
+                    change_type="unknown",  # Would need diff analysis to determine
+                    field_name="",
+                )
+                store.add_example(example)
+                patterns_stored += 1
+    
+    return {"prs_scanned": prs_scanned, "patterns_stored": patterns_stored}
+
+
+def _fetch_github_merged_prs(repo: str, token: str, max_prs: int) -> list[dict]:
+    """Fetch merged PRs from GitHub API."""
+    prs = []
+    data = _github_api("GET", f"/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page={min(max_prs, 100)}", token)
+    
+    if not isinstance(data, list):
+        return []
+    
+    for pr_data in data:
+        if not pr_data.get("merged_at"):
+            continue  # Only merged PRs
+        
+        # Fetch files changed in this PR
+        files_data = _github_api("GET", f"/repos/{repo}/pulls/{pr_data['number']}/files", token)
+        files = [f["filename"] for f in (files_data if isinstance(files_data, list) else [])]
+        
+        prs.append({
+            "number": pr_data["number"],
+            "title": pr_data.get("title", ""),
+            "files": files,
+            "merged_at": pr_data.get("merged_at", ""),
+        })
+        
+        if len(prs) >= max_prs:
+            break
+    
+    return prs
+
+
+def _fetch_gitlab_merged_mrs(repo: str, token: str, max_prs: int) -> list[dict]:
+    """Fetch merged MRs from GitLab API."""
+    import urllib.request
+    
+    prs = []
+    # repo format for GitLab: "group/project" → URL-encoded
+    project_path = repo.replace("/", "%2F")
+    gitlab_url = os.environ.get("GITLAB_URL", "https://gitlab.com")
+    
+    try:
+        req = urllib.request.Request(
+            f"{gitlab_url}/api/v4/projects/{project_path}/merge_requests?state=merged&order_by=updated_at&per_page={min(max_prs, 100)}",
+            headers={"PRIVATE-TOKEN": token}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            mrs_data = json.loads(resp.read().decode())
+    except Exception:
+        return []
+    
+    for mr in mrs_data[:max_prs]:
+        # Fetch MR changes
+        try:
+            req = urllib.request.Request(
+                f"{gitlab_url}/api/v4/projects/{project_path}/merge_requests/{mr['iid']}/changes",
+                headers={"PRIVATE-TOKEN": token}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                changes_data = json.loads(resp.read().decode())
+            files = [c["new_path"] for c in changes_data.get("changes", [])]
+        except Exception:
+            files = []
+        
+        prs.append({
+            "number": mr["iid"],
+            "title": mr.get("title", ""),
+            "files": files,
+            "merged_at": mr.get("merged_at", ""),
+        })
+    
+    return prs
+
+
+def _fetch_bitbucket_merged_prs(repo: str, token: str, max_prs: int) -> list[dict]:
+    """Fetch merged PRs from Bitbucket Cloud API."""
+    import urllib.request
+    
+    prs = []
+    try:
+        req = urllib.request.Request(
+            f"https://api.bitbucket.org/2.0/repositories/{repo}/pullrequests?state=MERGED&pagelen={min(max_prs, 50)}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return []
+    
+    for pr_data in data.get("values", [])[:max_prs]:
+        # Fetch diffstat for file list
+        try:
+            req = urllib.request.Request(
+                pr_data.get("links", {}).get("diffstat", {}).get("href", ""),
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                diff_data = json.loads(resp.read().decode())
+            files = [d.get("new", {}).get("path", "") for d in diff_data.get("values", [])]
+        except Exception:
+            files = []
+        
+        prs.append({
+            "number": pr_data.get("id", 0),
+            "title": pr_data.get("title", ""),
+            "files": files,
+            "merged_at": pr_data.get("updated_on", ""),
+        })
+    
+    return prs
+
+
+def _fetch_git_log_prs(repo_path: str, max_prs: int) -> list[dict]:
+    """Fallback for self-hosted: extract PR-like info from git log merge commits."""
+    import subprocess
+    
+    prs = []
+    try:
+        result = subprocess.run(
+            ["git", "log", "--merges", f"--max-count={max_prs}", "--format=%H|%s", "--name-only"],
+            cwd=repo_path, capture_output=True, text=True, timeout=60
+        )
+        
+        current_pr = None
+        for line in result.stdout.strip().split("\n"):
+            if "|" in line and line.count("|") == 1:
+                if current_pr:
+                    prs.append(current_pr)
+                sha, title = line.split("|", 1)
+                current_pr = {"number": sha[:8], "title": title, "files": [], "merged_at": ""}
+            elif current_pr and line.strip():
+                current_pr["files"].append(line.strip())
+        
+        if current_pr:
+            prs.append(current_pr)
+    except Exception:
+        pass
+    
+    return prs[:max_prs]
 
 
 def _find_consumer_repos(source_repo: str, token: str) -> list[str]:
