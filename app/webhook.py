@@ -360,7 +360,10 @@ async def github_webhook(request: FastAPIRequest):
     # Check if any OpenAPI spec files changed
     spec_files = _find_changed_specs(payload)
     if not spec_files:
+        _log_activity("no_spec_files", {"commits": len(payload.get("commits", []))})
         return {"status": "ignored", "reason": "no spec files changed"}
+    
+    _log_activity("spec_files_found", {"count": len(spec_files), "files": [s[0] for s in spec_files]})
     
     # Rate limit check
     repo_full_name = payload["repository"]["full_name"]
@@ -368,6 +371,7 @@ async def github_webhook(request: FastAPIRequest):
     limiter = get_rate_limiter()
     allowed, reason = limiter.check(org)
     if not allowed:
+        _log_activity("rate_limited", {"org": org, "reason": reason})
         return {"status": "rate_limited", "reason": reason, "org": org}
     
     # Process each changed spec
