@@ -290,7 +290,6 @@ async def learn_repo(request: FastAPIRequest):
     if local_path and os.path.isdir(local_path):
         stats = learner.learn_from_repo(local_path, since="12 months ago")
         return {
-        _log_activity("pr_merged_learned", {"pr": pr.get("number"), "repo": repo})
             "status": "learned",
             "repo": repo,
             "stats": stats,
@@ -1223,8 +1222,8 @@ def _handle_pr_merged(payload: dict, pr: dict) -> dict:
             store=store,
         )
         
-        return {
         _log_activity("pr_merged_learned", {"pr": pr.get("number"), "repo": repo})
+        return {
             "status": "learned",
             "pr": pr.get("number"),
             "repo": repo,
@@ -1260,8 +1259,8 @@ def _handle_pr_rejected(payload: dict, pr: dict) -> dict:
             store=store,
         )
         
-        return {
         _log_activity("pr_rejected_learned", {"pr": pr.get("number"), "repo": repo})
+        return {
             "status": "learned_negative",
             "pr": pr.get("number"),
             "repo": repo,
@@ -1327,7 +1326,7 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
         )
         
         if result and result.fixed_code != content:
-                _log_activity("fix_generated", {"source": result.source_type, "file": consumer.file_path, "confidence": result.confidence})
+            _log_activity("fix_generated", {"source": result.source_type, "file": getattr(consumer, 'file_path', ''), "confidence": getattr(result, 'confidence', 0)})
             return result.fixed_code, f"[RAG/{result.source_type}] {result.explanation}"
     except Exception:
         pass  # RAG unavailable or failed — fall through to templates
@@ -1335,7 +1334,7 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     # Fallback to template engine
     fixed_code, explanation = _generate_with_template(content, consumer, change)
     if fixed_code != content:
-    _log_activity("fix_generated", {"source": "template", "file": consumer.file_path})
+        _log_activity("fix_generated", {"source": "template", "file": getattr(consumer, 'file_path', '')})
         return fixed_code, f"[template] {explanation}"
     
     return content, ""
