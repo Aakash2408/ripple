@@ -138,6 +138,15 @@ def _basic_diff(before: str, after: str, contract_type: str) -> list[BreakingCha
         before_data = json.loads(before)
         after_data = json.loads(after)
     except (json.JSONDecodeError, TypeError):
+        # Try YAML parsing
+        try:
+            import yaml
+            before_data = yaml.safe_load(before)
+            after_data = yaml.safe_load(after)
+        except Exception:
+            return changes
+    
+    if not isinstance(before_data, dict) or not isinstance(after_data, dict):
         return changes
     
     # For OpenAPI: check paths removed
@@ -166,7 +175,7 @@ def _basic_diff(before: str, after: str, contract_type: str) -> list[BreakingCha
 
 
 def _check_schema_changes(before_data: dict, after_data: dict, path: str, changes: list):
-    """Check for removed/changed fields in schemas at a path."""
+    """Check for removed/changed fields and added required fields in schemas at a path."""
     before_methods = before_data.get("paths", {}).get(path, {})
     after_methods = after_data.get("paths", {}).get(path, {})
     
@@ -184,6 +193,52 @@ def _check_schema_changes(before_data: dict, after_data: dict, path: str, change
                 severity="breaking",
                 description=f"Method {method.upper()} removed from {path}",
             ))
+            continue
+        
+        # Check for added required fields in request body
+        before_schema = _get_request_schema(before_methods.get(method, {}))
+        after_schema = _get_request_schema(after_methods.get(method, {}))
+        
+        if before_schema and after_schema:
+            before_required = set(before_schema.get("required", []))
+            after_required = set(after_schema.get("required", []))
+            
+            added_required = after_required - before_required
+            for field_name in added_required:
+                field_type = after_schema.get("properties", {}).get(field_name, {}).get("type", "string")
+                changes.append(BreakingChange(
+                    change_type="added_required_field",
+                    field_name=field_name,
+                    field_type=field_type,
+                    path=path,
+                    method=method,
+                    location="request_body",
+                    severity="breaking",
+                    description=f"Added required field '{field_name}' ({field_type}) to {method.upper()} {path} request body",
+                ))
+            
+            # Check for removed fields
+            before_props = set(before_schema.get("properties", {}).keys())
+            after_props = set(after_schema.get("properties", {}).keys())
+            for field_name in before_props - after_props:
+                changes.append(BreakingChange(
+                    change_type="removed_field",
+                    field_name=field_name,
+                    field_type=before_schema.get("properties", {}).get(field_name, {}).get("type", "string"),
+                    path=path,
+                    method=method,
+                    location="request_body",
+                    severity="breaking",
+                    description=f"Removed field '{field_name}' from {method.upper()} {path} request body",
+                ))
+
+
+def _get_request_schema(method_data: dict) -> dict:
+    """Extract the request body schema from a method definition."""
+    body = method_data.get("requestBody", {})
+    content = body.get("content", {})
+    json_content = content.get("application/json", {})
+    return json_content.get("schema", {})
 
 
 # === HTML UI ===
