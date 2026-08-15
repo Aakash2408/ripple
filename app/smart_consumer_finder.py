@@ -14,7 +14,6 @@ Instead of "any line containing phone_number", this module:
 import re
 from dataclasses import dataclass
 
-
 @dataclass
 class SmartMatch:
     """A consumer match with confidence and context."""
@@ -24,7 +23,6 @@ class SmartMatch:
     match_type: str  # "field_access", "param", "assignment", "import", "comment", "string_literal"
     confidence: float  # 0.0-1.0
     variant_matched: str  # which variant was found
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Naming Variant Generation
@@ -61,7 +59,6 @@ def generate_variants(field_name: str) -> list[str]:
     variants.add(f"Get{pascal}")  # Go exported
     
     return [v for v in variants if v and len(v) > 2]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Language-Aware Pattern Matching
@@ -103,7 +100,6 @@ def classify_match(line: str, variant: str, language: str) -> tuple[str, float]:
     # Default: medium confidence
     return ("unknown_usage", 0.6)
 
-
 def _is_comment(line: str, language: str) -> bool:
     """Check if line is a comment."""
     if line.startswith("//") or line.startswith("#") or line.startswith("*") or line.startswith("/*"):
@@ -111,7 +107,6 @@ def _is_comment(line: str, language: str) -> bool:
     if language == "python" and (line.startswith('"""') or line.startswith("'''")):
         return True
     return False
-
 
 def _is_string_literal_only(line: str, variant: str, language: str) -> bool:
     """Check if the variant only appears inside a string literal (not as code)."""
@@ -125,7 +120,6 @@ def _is_string_literal_only(line: str, variant: str, language: str) -> bool:
         return True  # Only in strings
     return False
 
-
 def _classify_go(line: str, variant: str) -> tuple[str, float]:
     """Go-specific pattern matching."""
     # Struct field assignment: PhoneNumber: phone
@@ -135,13 +129,12 @@ def _classify_go(line: str, variant: str) -> tuple[str, float]:
     if re.search(rf'\.\s*{variant}\s*[(\[]?', line):
         return ("field_access", 0.95)
     # Function parameter: phone string
-    if re.search(rf'{variant}\s+\w+[,)]', line):
+    if re.search(rf'{variant}\s+\w+[)]', line):
         return ("param", 0.9)
     # Variable declaration: phone :=
     if re.search(rf'{variant}\s*:?=', line):
         return ("assignment", 0.85)
     return ("usage", 0.7)
-
 
 def _classify_typescript(line: str, variant: str) -> tuple[str, float]:
     """TypeScript/JavaScript-specific pattern matching."""
@@ -158,18 +151,15 @@ def _classify_typescript(line: str, variant: str) -> tuple[str, float]:
     if re.search(rf'\.\s*{variant}', line):
         return ("field_access", 0.95)
     # Parameter: (phoneNumber: string)
-    if re.search(rf'[(,]\s*{variant}\s*[?:]', line):
+    if re.search(rf'[(]\s*{variant}\s*[?:]', line):
         return ("param", 0.9)
     return ("usage", 0.7)
 
-
 def _classify_python(line: str, variant: str) -> tuple[str, float]:
     """Python-specific pattern matching."""
-    # Dataclass/class field: phone_number: str
-    if re.search(rf'{variant}\s*:', line) and not line.strip().startswith('#'):
+    # Dataclass/class field: line) and not line.strip().startswith('#'):
         return ("field_access", 0.95)
-    # Keyword argument: phone_number=value
-    if re.search(rf'{variant}\s*=', line):
+    # Keyword argument: line):
         return ("assignment", 0.9)
     # Attribute access: self.phone_number or obj.phone_number
     if re.search(rf'\.{variant}', line):
@@ -177,11 +167,9 @@ def _classify_python(line: str, variant: str) -> tuple[str, float]:
     # Function parameter: def func(phone_number, ...)
     if re.search(rf'def\s+\w+\([^)]*{variant}', line):
         return ("param", 0.9)
-    # Dict key: ['phone_number'] or ["phone_number"]
     if re.search(rf'[\["\']' + variant + r'["\'\]]', line):
         return ("field_access", 0.85)
     return ("usage", 0.7)
-
 
 def _classify_java(line: str, variant: str) -> tuple[str, float]:
     """Java-specific pattern matching."""
@@ -192,27 +180,23 @@ def _classify_java(line: str, variant: str) -> tuple[str, float]:
     if re.search(rf'(private|public|protected)\s+\w+\s+{variant}', line):
         return ("field_access", 0.95)
     # Method parameter: String phoneNumber
-    if re.search(rf'\w+\s+{variant}\s*[,)]', line):
+    if re.search(rf'\w+\s+{variant}\s*[)]', line):
         return ("param", 0.9)
     # Dot access: user.phoneNumber or user.getPhoneNumber()
     if re.search(rf'\.{variant}', line):
         return ("field_access", 0.9)
     return ("usage", 0.7)
 
-
 def _classify_rust(line: str, variant: str) -> tuple[str, float]:
     """Rust-specific pattern matching."""
-    # Struct field: phone_number: String
-    if re.search(rf'{variant}\s*:', line):
+    # Struct field: line):
         return ("field_access", 0.95)
     # Field access: .phone_number
     if re.search(rf'\.{variant}', line):
         return ("field_access", 0.95)
-    # Function param: phone_number: &str
-    if re.search(rf'{variant}\s*:\s*&', line):
+    # Function param: line):
         return ("param", 0.9)
     return ("usage", 0.7)
-
 
 def _classify_ruby(line: str, variant: str) -> tuple[str, float]:
     """Ruby-specific pattern matching."""
@@ -222,14 +206,12 @@ def _classify_ruby(line: str, variant: str) -> tuple[str, float]:
     # Attr accessor: attr_accessor :phone_number
     if re.search(rf'attr_\w+\s+:{variant}', line):
         return ("field_access", 0.95)
-    # Hash key: phone_number:
-    if re.search(rf'{variant}:', line):
+    # Hash key: line):
         return ("field_access", 0.9)
     # Method call: .phone_number
     if re.search(rf'\.{variant}', line):
         return ("field_access", 0.9)
     return ("usage", 0.7)
-
 
 def _classify_kotlin(line: str, variant: str) -> tuple[str, float]:
     """Kotlin-specific pattern matching."""
@@ -244,7 +226,6 @@ def _classify_kotlin(line: str, variant: str) -> tuple[str, float]:
         return ("field_access", 0.95)
     return ("usage", 0.7)
 
-
 def _classify_csharp(line: str, variant: str) -> tuple[str, float]:
     """C#-specific pattern matching."""
     # Property: public string PhoneNumber { get; set; }
@@ -258,7 +239,6 @@ def _classify_csharp(line: str, variant: str) -> tuple[str, float]:
         return ("assignment", 0.9)
     return ("usage", 0.7)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Search Function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,7 +248,7 @@ def find_field_consumers(
     file_path: str,
     field_name: str,
     language: str,
-    min_confidence: float = 0.5,
+    min_confidence: float = 0.5
 ) -> list[SmartMatch]:
     """
     Find all references to a field in a file with confidence scoring.
@@ -292,7 +272,7 @@ def find_field_consumers(
                         line_content=line.strip(),
                         match_type=match_type,
                         confidence=confidence,
-                        variant_matched=variant,
+                        variant_matched=variant
                     ))
                     break  # Only count each line once
     
@@ -300,13 +280,12 @@ def find_field_consumers(
     matches.sort(key=lambda m: m.confidence, reverse=True)
     return matches
 
-
 def file_is_consumer(
     file_content: str,
     file_path: str,
     field_name: str,
     language: str,
-    min_confidence: float = 0.5,
+    min_confidence: float = 0.5
 ) -> tuple[bool, float, list[SmartMatch]]:
     """
     Determine if a file is a consumer of the given field.
@@ -331,11 +310,10 @@ def file_is_consumer(
     
     return (True, overall_confidence, real_matches)
 
-
 def search_content_for_field(
     content: str,
     field_name: str,
-    language: str,
+    language: str
 ) -> bool:
     """Quick check: does this file contain meaningful references to the field?
     
