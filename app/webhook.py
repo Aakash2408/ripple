@@ -481,7 +481,7 @@ async def bitbucket_webhook(request: FastAPIRequest):
                         confidence="high", match_reason="Code search match",
                         language=_detect_lang(consumer_path),
                     )
-                    fixed_code, explanation = _generate_with_template(consumer_content, consumer_match, change)
+                    fixed_code, explanation = _generate_fix_with_rag_fallback(consumer_content, consumer_match, change, org)
                     if fixed_code != consumer_content:
                         pr_url = bb_create_fix_pr(
                             client, event["workspace"], event["repo_slug"],
@@ -629,7 +629,7 @@ async def gitlab_webhook(request: FastAPIRequest):
                         confidence="high", match_reason="Code search match",
                         language=_detect_lang(consumer_path),
                     )
-                    fixed_code, explanation = _generate_with_template(consumer_content, consumer_match, change)
+                    fixed_code, explanation = _generate_fix_with_rag_fallback(consumer_content, consumer_match, change, org)
                     if fixed_code != consumer_content:
                         mr_url = create_fix_mr(
                             client, event["project_id"], consumer_path,
@@ -937,8 +937,8 @@ async def _process_spec_change(
                     language=_detect_lang(consumer_file),
                 )
                 
-                fixed_code, explanation = _generate_with_template(
-                    consumer_content, consumer, change
+                fixed_code, explanation = _generate_fix_with_rag_fallback(
+                    consumer_content, consumer, change, org
                 )
                 
                 if fixed_code != consumer_content:
@@ -1156,6 +1156,48 @@ def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:
     if "content" in data:
         return base64.b64decode(data["content"]).decode()
     return ""
+
+
+def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "") -> tuple[str, str]:
+    """
+    Generate a fix using the RAG-first stack:
+    1. RAG exact match (similarity > 0.7) → apply learned pattern
+    2. RAG cluster archetype (score > 0.5) → apply archetype strategy
+    3. Fix templates (deterministic, per-language) → regex-based
+    4. Claude LLM (ONLY if 1-3 all fail) → last resort
+    
+    Returns (fixed_code, explanation).
+    """
+    # Try RAG first
+    try:
+        from .rag_engine import RagStore
+        from .rag_retriever import generate_fix_rag
+        
+        store = RagStore(collection_name=f"ripple_{org}" if org else "ripple_default")
+        
+        change_description = f"{change.change_type}: {change.field_name} in {change.method} {change.path}"
+        language = consumer.language or _detect_lang(consumer.file_path)
+        
+        result = generate_fix_rag(
+            code=content,
+            file_path=consumer.file_path,
+            field_name=change.field_name,
+            change_type=change.change_type,
+            change_description=change_description,
+            store=store,
+        )
+        
+        if result and result.fixed_code != content:
+            return result.fixed_code, f"[RAG/{result.source_type}] {result.explanation}"
+    except Exception:
+        pass  # RAG unavailable or failed — fall through to templates
+    
+    # Fallback to template engine
+    fixed_code, explanation = _generate_with_template(content, consumer, change)
+    if fixed_code != content:
+        return fixed_code, f"[template] {explanation}"
+    
+    return content, ""
 
 
 def _index_merged_prs(repo: str, token: str, store, platform: str = "github", max_prs: int = 100) -> dict:
