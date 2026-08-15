@@ -144,6 +144,37 @@ async def health():
     return {"healthy": True}
 
 
+@app.get("/test-llm")
+async def test_llm():
+    """Quick test that the Anthropic API key works. Calls Claude with a minimal prompt."""
+    import os
+    
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"status": "error", "message": "ANTHROPIC_API_KEY not set"}
+    
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=20,
+            messages=[{"role": "user", "content": "Reply with exactly: LLM_OK"}],
+        )
+        reply = response.content[0].text.strip()
+        return {
+            "status": "ok",
+            "model": "claude-sonnet-4-20250514",
+            "response": reply,
+            "key_prefix": api_key[:12] + "...",
+            "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
+        }
+    except ImportError:
+        return {"status": "error", "message": "anthropic package not installed"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)[:200]}
+
+
 # === GitHub App Installation Event ===
 
 @app.post("/webhook/install")
