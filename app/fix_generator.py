@@ -168,7 +168,7 @@ def _generate_with_template(
     field_name = breaking_change.field_name
     field_type = breaking_change.field_type
     
-    if breaking_change.change_type == "removed_field":
+    if breaking_change.change_type in ("removed_field", "field_removed"):
         return _remove_field_references(original_code, field_name, consumer.language)
     
     if breaking_change.change_type != "added_required_field":

@@ -123,11 +123,36 @@ async def dry_run_ui():
 def _detect_changes(before: str, after: str, contract_type: str) -> list[BreakingChange]:
     """Detect breaking changes between two spec versions."""
     try:
-        # diff_specs expects file paths, but we have content strings
-        # Use the basic diff for direct content comparison
-        return _basic_diff(before, after, contract_type)
+        if contract_type == "proto":
+            from .proto_diff import diff_proto
+            return diff_proto(before, after)
+        elif contract_type == "graphql":
+            from .graphql_diff import diff_graphql
+            return diff_graphql(before, after)
+        elif contract_type == "asyncapi":
+            from .asyncapi_diff import diff_asyncapi
+            return diff_asyncapi(before, after)
+        elif contract_type == "avro":
+            from .avro_diff import diff_avro
+            return diff_avro(before, after)
+        elif contract_type == "trpc":
+            from .trpc_diff import diff_trpc
+            return diff_trpc(before, after)
+        elif contract_type == "thrift":
+            from .thrift_diff import diff_thrift
+            return diff_thrift(before, after)
+        elif contract_type == "jsonschema":
+            from .jsonschema_diff import diff_jsonschema
+            return diff_jsonschema(before, after)
+        elif contract_type == "smithy":
+            from .smithy_diff import diff_smithy
+            return diff_smithy(before, after)
+        else:
+            # OpenAPI / database / default
+            return _basic_diff(before, after, contract_type)
     except Exception:
-        return []
+        # Fallback to basic diff on any error
+        return _basic_diff(before, after, contract_type)
 
 
 def _basic_diff(before: str, after: str, contract_type: str) -> list[BreakingChange]:
