@@ -14,14 +14,14 @@ const LINES: Line[] = [
   { text: "✓ billing-api/UserClient.ts — interface updated", tone: "ok" },
   { text: "✓ notifications/user_svc.py — parameter dropped", tone: "ok" },
   { text: "✓ tests/test_user_api.java — assertion fixed", tone: "ok" },
-  { text: "done in 14.2 seconds. 4 PRs opened.", tone: "accent" },
+  { text: "done in 14.2 seconds. 4 PRs opened.", tone: "accent" }
 ];
 
 const toneClass = {
   muted: "text-muted-foreground",
   warn: "text-[var(--warning)]",
   ok: "text-[var(--success)]",
-  accent: "text-accent",
+  accent: "text-accent"
 } as const;
 
 export function Terminal() {
