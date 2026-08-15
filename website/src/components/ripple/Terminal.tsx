@@ -4,16 +4,17 @@ import { LINKS } from "@/data/ripple";
 type Line = { text: string; tone?: "muted" | "warn" | "ok" | "accent" };
 
 const LINES: Line[] = [
-  { text: "# push a breaking change", tone: "muted" },
+  { text: "# push a breaking change to user.proto", tone: "muted" },
   { text: "$ git push origin main" },
-  { text: "# added required field 'idempotency_key' to POST /payments", tone: "muted" },
+  { text: "# removed field 'phone_number' from User message", tone: "muted" },
   { text: "⚠ 1 breaking change detected", tone: "warn" },
-  { text: "  POST /payments — added required field 'idempotency_key'", tone: "muted" },
-  { text: "🔍 finding consumers... found 3 across 3 repos", tone: "accent" },
-  { text: "✓ Python SDK — parameter added", tone: "ok" },
-  { text: "✓ Node SDK — interface updated", tone: "ok" },
-  { text: "✓ Java SDK — method signature fixed", tone: "ok" },
-  { text: "done in 14.2 seconds.", tone: "accent" },
+  { text: "  user.proto — removed required field 'phone_number'", tone: "muted" },
+  { text: "🔍 finding consumers... found 4 across 3 repos", tone: "accent" },
+  { text: "✓ auth-service/handler.go — reference removed", tone: "ok" },
+  { text: "✓ billing-api/UserClient.ts — interface updated", tone: "ok" },
+  { text: "✓ notifications/user_svc.py — parameter dropped", tone: "ok" },
+  { text: "✓ tests/test_user_api.java — assertion fixed", tone: "ok" },
+  { text: "done in 14.2 seconds. 4 PRs opened.", tone: "accent" },
 ];
 
 const toneClass = {
@@ -38,7 +39,7 @@ export function Terminal() {
         <span className="size-2.5 rounded-full bg-destructive/80" />
         <span className="size-2.5 rounded-full bg-[var(--warning)]/80" />
         <span className="size-2.5 rounded-full bg-[var(--success)]/80" />
-        <span className="ml-3 font-mono text-xs text-muted-foreground">ripple — payments-api</span>
+        <span className="ml-3 font-mono text-xs text-muted-foreground">ripple — platform/user-service</span>
       </div>
       <div className="min-h-[290px] p-4 font-mono text-[12.5px] leading-7 sm:text-[13px]">
         {LINES.slice(0, count).map((line, i) => (
