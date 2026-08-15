@@ -139,9 +139,30 @@ async def root():
     return {"status": "ok", "service": "ripple", "version": "0.1.0"}
 
 
+# --- Activity log (ring buffer, last 50 events) ---
+import time as _time
+_activity_log: list[dict] = []
+
+def _log_activity(action: str, details: dict = None):
+    """Log an activity event to the ring buffer."""
+    _activity_log.append({
+        "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
+        "action": action,
+        **(details or {}),
+    })
+    if len(_activity_log) > 50:
+        _activity_log.pop(0)
+
+
 @app.get("/health")
 async def health():
     return {"healthy": True}
+
+
+@app.get("/logs/recent")
+async def recent_logs():
+    """Return recent activity log for debugging (last 50 events)."""
+    return {"count": len(_activity_log), "logs": _activity_log[-30:]}
 
 
 @app.get("/test-llm")
@@ -269,6 +290,7 @@ async def learn_repo(request: FastAPIRequest):
     if local_path and os.path.isdir(local_path):
         stats = learner.learn_from_repo(local_path, since="12 months ago")
         return {
+        _log_activity("pr_merged_learned", {"pr": pr.get("number"), "repo": repo})
             "status": "learned",
             "repo": repo,
             "stats": stats,
@@ -326,6 +348,7 @@ async def github_webhook(request: FastAPIRequest):
             return _handle_pr_rejected(payload, pr)
     
     # Only handle push events for detection pipeline
+    _log_activity("webhook_received", {"event": event_type, "repo": payload.get("repository", {}).get("full_name", "?")})
     if event_type != "push":
         return {"status": "ignored", "reason": f"event_type={event_type}"}
     
@@ -863,6 +886,7 @@ async def _process_spec_change(
         breaking_changes = diff_result.breaking_changes
     
     if not breaking_changes:
+        _log_activity("no_breaking_changes", {"spec": spec_path})
         return {"status": "no_breaking_changes", "spec": spec_path}
     
     # Find consumer repos (from GitHub App installation)
@@ -1200,6 +1224,7 @@ def _handle_pr_merged(payload: dict, pr: dict) -> dict:
         )
         
         return {
+        _log_activity("pr_merged_learned", {"pr": pr.get("number"), "repo": repo})
             "status": "learned",
             "pr": pr.get("number"),
             "repo": repo,
@@ -1236,6 +1261,7 @@ def _handle_pr_rejected(payload: dict, pr: dict) -> dict:
         )
         
         return {
+        _log_activity("pr_rejected_learned", {"pr": pr.get("number"), "repo": repo})
             "status": "learned_negative",
             "pr": pr.get("number"),
             "repo": repo,
@@ -1301,6 +1327,7 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
         )
         
         if result and result.fixed_code != content:
+                _log_activity("fix_generated", {"source": result.source_type, "file": consumer.file_path, "confidence": result.confidence})
             return result.fixed_code, f"[RAG/{result.source_type}] {result.explanation}"
     except Exception:
         pass  # RAG unavailable or failed — fall through to templates
@@ -1308,6 +1335,7 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     # Fallback to template engine
     fixed_code, explanation = _generate_with_template(content, consumer, change)
     if fixed_code != content:
+    _log_activity("fix_generated", {"source": "template", "file": consumer.file_path})
         return fixed_code, f"[template] {explanation}"
     
     return content, ""
