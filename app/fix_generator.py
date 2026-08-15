@@ -169,7 +169,44 @@ def _generate_with_template(
     field_type = breaking_change.field_type
     
     if breaking_change.change_type in ("removed_field", "field_removed"):
+        # Use the comprehensive template engine
+        from .fix_templates import apply_fix_template
+        fixed, explanation = apply_fix_template(
+            code=original_code,
+            language=consumer.language or "unknown",
+            change_type="field_removed",
+            field_name=field_name,
+        )
+        if fixed != original_code:
+            return fixed, explanation
+        # Fallback to basic line removal
         return _remove_field_references(original_code, field_name, consumer.language)
+    
+    if breaking_change.change_type in ("field_renamed", "renamed_field"):
+        from .fix_templates import apply_fix_template
+        new_name = getattr(breaking_change, 'new_name', '') or ''
+        if new_name:
+            return apply_fix_template(
+                code=original_code,
+                language=consumer.language or "unknown",
+                change_type="field_renamed",
+                field_name=field_name,
+                new_name=new_name,
+            )
+    
+    if breaking_change.change_type in ("field_type_changed", "type_changed"):
+        from .fix_templates import apply_fix_template
+        old_type = getattr(breaking_change, 'old_type', '') or breaking_change.field_type.split(' → ')[0] if ' → ' in str(breaking_change.field_type) else ''
+        new_type = breaking_change.field_type.split(' → ')[1] if ' → ' in str(breaking_change.field_type) else ''
+        if old_type and new_type:
+            return apply_fix_template(
+                code=original_code,
+                language=consumer.language or "unknown",
+                change_type="type_changed",
+                field_name=field_name,
+                old_type=old_type,
+                new_type=new_type,
+            )
     
     if breaking_change.change_type != "added_required_field":
         return original_code, "Unsupported change type for template fix"
