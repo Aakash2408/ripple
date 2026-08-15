@@ -1642,20 +1642,47 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
     so we don't try to 'fix' the spec that was just changed.
     """
     from .smart_consumer_finder import generate_variants, file_is_consumer
+    from urllib.parse import quote
     
     # Generate search terms from the field name (not just the path)
     field_name = change.field_name
     variants = generate_variants(field_name)
     
-    # Use the most common variant for GitHub search
-    search_term = field_name  # snake_case is usually the proto field name
+    # Search for ALL naming variants, not just the proto snake_case name.
+    # GitHub code search treats phone_number / phoneNumber / PhoneNumber as
+    # distinct tokens, so a snake_case-only query silently misses Go
+    # (PhoneNumber) and TypeScript (phoneNumber) consumers entirely.
+    # Capped because GitHub rejects overly complex OR queries.
+    core_variants = []
+    for v in variants:
+        # Skip accessor-prefixed forms -- the bare name already matches the
+        # declaration site, which is what we need to rewrite.
+        if v.lower().startswith(("get", "set", "has")):
+            continue
+        if v not in core_variants:
+            core_variants.append(v)
+    core_variants = core_variants[:4] or [field_name]
     
-    # GitHub search API -- search for field name in code
-    data = _github_api(
-        "GET",
-        f"/search/code?q={search_term}+in:file+repo:{repo}",
-        token
-    )
+    term_query = " OR ".join(core_variants)
+    query = quote(f"{term_query} repo:{repo}", safe="")
+    
+    # GitHub search API -- search for field name in code.
+    # Code search is limited to ~30 req/min and enforces a burst
+    # ("secondary") limit, so a fan-out across many repos gets throttled.
+    # Retry once on a rate-limit response rather than silently returning [].
+    data = _github_api("GET", f"/search/code?q={query}", token)
+    
+    if "error" in data and data.get("error") in (403, 429):
+        time.sleep(2)
+        data = _github_api("GET", f"/search/code?q={query}", token)
+    
+    if "error" in data:
+        _log_activity("search_error", {
+            "repo": repo,
+            "terms": core_variants,
+            "err": str(data.get("message", data))[:150],
+        })
+        return []
     
     results = []
     if "items" in data:
