@@ -149,10 +149,10 @@ def _classify_typescript(line: str, variant: str) -> tuple[str, float]:
     if re.search(rf'{variant}\s*[?:]?\s*:', line):
         return ("field_access", 0.95)
     # Object property: phoneNumber: value or phoneNumber,
-    if re.search(rf'{variant}\s*[,}]', line):
+    if re.search(rf'{variant}\s*[,\}}]', line):
         return ("field_access", 0.9)
     # Destructuring: { phoneNumber } or { phoneNumber: alias }
-    if re.search(rf'\{[^}}]*{variant}[^}}]*\}}', line):
+    if re.search(rf'\{{[^}}]*{variant}[^}}]*\}}', line):
         return ("field_access", 0.9)
     # Dot access: user.phoneNumber
     if re.search(rf'\.\s*{variant}', line):
