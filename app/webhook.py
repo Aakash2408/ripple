@@ -831,8 +831,19 @@ async def _process_spec_change(
     4. Apply custom playbooks from .ripple.yaml
     5. Generate fixes + open PRs
     """
+    try:
+        return await _process_spec_change_inner(repo, spec_path, before_sha, after_sha, installation_id)
+    except Exception as e:
+        _log_activity("process_spec_error", {"repo": repo, "spec": spec_path, "error": str(e)[:200]})
+        return {"status": "error", "reason": str(e)[:200]}
+
+
+async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, installation_id=None):
+    """Inner processing -- separated so we can catch all exceptions."""
     token = _get_token(installation_id)
     org = repo.split("/")[0] if "/" in repo else "unknown"
+    
+    _log_activity("processing_spec", {"repo": repo, "spec": spec_path, "contract": _detect_contract_type(spec_path)})
     
     # Load .ripple.yaml from the repo if we haven't already
     if org not in _org_configs:
@@ -850,6 +861,7 @@ async def _process_spec_change(
     new_content = _fetch_file_at_sha(repo, spec_path, after_sha, token)
     
     if not old_content or not new_content:
+        _log_activity("fetch_failed", {"repo": repo, "spec": spec_path, "old": bool(old_content), "new": bool(new_content)})
         return {"status": "error", "reason": "could not fetch spec versions"}
     
     # Parse specs and diff -- route to correct engine based on contract type
@@ -892,8 +904,15 @@ async def _process_spec_change(
         _log_activity("no_breaking_changes", {"spec": spec_path})
         return {"status": "no_breaking_changes", "spec": spec_path}
     
+    _log_activity("breaking_changes_detected", {
+        "spec": spec_path,
+        "count": len(breaking_changes),
+        "changes": [{"type": c.change_type, "field": c.field_name} for c in breaking_changes[:5]],
+    })
+    
     # Find consumer repos (from GitHub App installation)
     consumer_repos = _find_consumer_repos(repo, token)
+    _log_activity("consumer_repos_found", {"count": len(consumer_repos), "repos": consumer_repos[:5]})
     
     # For each breaking change, use ENSEMBLE to find consumers
     prs_created = []
