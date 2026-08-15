@@ -168,6 +168,9 @@ def _generate_with_template(
     field_name = breaking_change.field_name
     field_type = breaking_change.field_type
     
+    if breaking_change.change_type == "removed_field":
+        return _remove_field_references(original_code, field_name, consumer.language)
+    
     if breaking_change.change_type != "added_required_field":
         return original_code, "Unsupported change type for template fix"
     
@@ -279,6 +282,87 @@ def _generate_with_template(
         explanation = "Unsupported language for template fix"
     
     return fixed_code, explanation
+
+
+def _remove_field_references(original_code: str, field_name: str, language: str) -> tuple[str, str]:
+    """
+    Remove all references to a deleted field from consumer code.
+    Works across all languages by:
+    1. Removing lines that contain the field name in common patterns
+    2. Cleaning up dangling commas and empty blocks
+    """
+    lines = original_code.split("\n")
+    removed_lines = []
+    result_lines = []
+    
+    # Generate variants of the field name
+    variants = _field_variants(field_name)
+    
+    for i, line in enumerate(lines):
+        line_lower = line.lower().replace("-", "_").replace(" ", "")
+        should_remove = False
+        
+        for variant in variants:
+            variant_lower = variant.lower().replace("-", "_").replace(" ", "")
+            if variant_lower in line_lower:
+                # Check it's a meaningful reference (not a comment about something else)
+                stripped = line.strip()
+                # Remove lines that are: assignments, struct fields, params, dict keys, interface props
+                if any([
+                    f"{field_name}" in line and ("=" in line or ":" in line or "," in line),
+                    f"'{field_name}'" in line,
+                    f'"{field_name}"' in line,
+                    f".{variant}" in line and variant != field_name[:3],  # method calls like .phoneNumber
+                    f"{variant}:" in line,  # Go struct field
+                    f"{variant} =" in line,  # assignment
+                    f"{variant}," in line,  # param in list
+                    f"self.{variant}" in line,  # Python instance attr
+                    f"this.{variant}" in line,  # JS/TS instance
+                ]):
+                    should_remove = True
+                    break
+        
+        if should_remove:
+            removed_lines.append((i, line))
+        else:
+            result_lines.append(line)
+    
+    if not removed_lines:
+        return original_code, "No references to removed field found"
+    
+    # Clean up dangling commas
+    fixed_code = "\n".join(result_lines)
+    # Remove trailing commas before closing braces/parens
+    fixed_code = re.sub(r',\s*(\n\s*[}\])])', r'\1', fixed_code)
+    # Remove double blank lines
+    fixed_code = re.sub(r'\n{3,}', '\n\n', fixed_code)
+    
+    explanation = f"Removed {len(removed_lines)} reference(s) to deleted field '{field_name}'"
+    return fixed_code, explanation
+
+
+def _field_variants(field_name: str) -> list[str]:
+    """Generate naming variants of a field: snake_case, camelCase, PascalCase, kebab-case."""
+    variants = [field_name]
+    
+    # snake_case → camelCase
+    parts = field_name.split("_")
+    if len(parts) > 1:
+        camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
+        pascal = "".join(p.capitalize() for p in parts)
+        variants.extend([camel, pascal])
+    
+    # camelCase → snake_case
+    snake = re.sub(r'([A-Z])', r'_\1', field_name).lower().lstrip('_')
+    if snake != field_name:
+        variants.append(snake)
+    
+    # kebab-case
+    kebab = field_name.replace("_", "-")
+    if kebab != field_name:
+        variants.append(kebab)
+    
+    return list(set(variants))
 
 
 def _compute_diff(original: str, fixed: str, filepath: str) -> str:
