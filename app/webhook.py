@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import ssl
 import base64
 from urllib.request import Request, urlopen
@@ -1612,12 +1613,23 @@ def _find_consumer_repos(source_repo: str, token: str) -> list[str]:
     
     max_repos = int(os.environ.get("RIPPLE_MAX_CONSUMER_REPOS", "20"))
     
+    # Repos that must never be treated as consumers. Ripple's own repo
+    # contains the field names as marketing/demo copy (e.g. the landing
+    # page terminal demo), which produced false-positive self-PRs.
+    self_excluded = {
+        r.strip().lower()
+        for r in os.environ.get("RIPPLE_EXCLUDE_REPOS", "").split(",")
+        if r.strip()
+    }
+    self_excluded.add(f"{owner}/ripple".lower())
+    
     if isinstance(data, list):
         candidates = [
             r["full_name"] for r in data
             if r["full_name"] != source_repo
             and not r.get("archived")
             and not r.get("fork")
+            and r["full_name"].lower() not in self_excluded
         ]
         repos.extend(candidates[:max_repos])
     return repos
@@ -1675,9 +1687,34 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
 
 
 def _is_code_file(filepath: str) -> bool:
-    """Check if file is code."""
+    """Check if file is code that could plausibly consume an API contract.
+    
+    Extension alone is not enough: a landing-page component (.tsx) can
+    mention a field name as demo/marketing copy without consuming the API.
+    Those produced false-positive PRs, so path-based exclusions apply too.
+    """
     exts = {".ts", ".tsx", ".js", ".py", ".java", ".go", ".rs", ".rb"}
-    return any(filepath.endswith(ext) for ext in exts)
+    if not any(filepath.endswith(ext) for ext in exts):
+        return False
+    
+    lowered = filepath.lower()
+    
+    # Directories that hold presentation, docs, or vendored code -- never
+    # real API consumers.
+    excluded_dirs = (
+        "website/", "docs/", "doc/", "site/", "landing/", "marketing/",
+        "examples/", "example/", "demo/", "samples/", "sample/",
+        "node_modules/", "vendor/", "third_party/", "dist/", "build/",
+        ".next/", "coverage/", "fixtures/", "__snapshots__/",
+    )
+    if any(seg in lowered for seg in excluded_dirs):
+        return False
+    
+    # Generated / minified artifacts
+    if lowered.endswith((".min.js", ".d.ts", ".pb.go", "_pb2.py", ".generated.ts")):
+        return False
+    
+    return True
 
 
 def _detect_lang(filepath: str) -> str:
@@ -1699,36 +1736,62 @@ def _create_fix_pr(
     """Create a PR with the fix in the consumer repo, including confidence report."""
     # Get default branch
     repo_data = _github_api("GET", f"/repos/{repo}", token)
+    if "error" in repo_data:
+        _log_activity("pr_error", {"step": "get_repo", "repo": repo, "err": str(repo_data)[:150]})
+        return ""
     default_branch = repo_data.get("default_branch", "main")
     
     # Get HEAD sha
     ref_data = _github_api("GET", f"/repos/{repo}/git/ref/heads/{default_branch}", token)
     if "object" not in ref_data:
+        _log_activity("pr_error", {"step": "get_ref", "repo": repo, "branch": default_branch, "err": str(ref_data)[:150]})
         return ""
     base_sha = ref_data["object"]["sha"]
     
-    # Create branch
-    branch = f"ripple/fix-{change.field_name}-{change.path.replace('/', '-').strip('-')}"
-    _github_api("POST", f"/repos/{repo}/git/refs", token, {
+    # Create branch. Sanitize to a valid git ref: git refuses names with
+    # consecutive/trailing dots, trailing dashes, or path separators.
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{change.field_name}-{change.path or ''}")
+    slug = re.sub(r"-+", "-", slug).strip("-.") or "fix"
+    branch = f"ripple/fix-{slug}"
+    ref_result = _github_api("POST", f"/repos/{repo}/git/refs", token, {
         "ref": f"refs/heads/{branch}",
         "sha": base_sha,
     })
+    # 422 "Reference already exists" is fine -- we reuse the branch.
+    if "error" in ref_result and "already exists" not in ref_result.get("message", ""):
+        _log_activity("pr_error", {"step": "create_branch", "repo": repo, "branch": branch, "err": str(ref_result)[:150]})
+        return ""
     
     # Get current file sha
     file_data = _github_api("GET", f"/repos/{repo}/contents/{file_path}?ref={branch}", token)
     file_sha = file_data.get("sha", "")
+    if not file_sha:
+        _log_activity("pr_error", {"step": "get_file_sha", "repo": repo, "file": file_path, "err": str(file_data)[:150]})
+        return ""
     
-    # Push fix
-    commit_msg = f"fix: Add required field '{change.field_name}' to {change.method.upper()} {change.path}"
-    _github_api("PUT", f"/repos/{repo}/contents/{file_path}", token, {
+    # Push fix. Message must match what actually happened -- this used to
+    # always say "Add required field" even for removals.
+    if change.change_type in ("field_removed", "removed_field"):
+        commit_msg = f"fix: Remove references to deleted field '{change.field_name}'"
+    elif change.change_type == "field_renamed":
+        commit_msg = f"fix: Rename field '{change.field_name}' to '{getattr(change, 'new_name', '') or 'new name'}'"
+    elif change.change_type in ("type_changed", "field_type_changed"):
+        commit_msg = f"fix: Update type of field '{change.field_name}'"
+    else:
+        commit_msg = f"fix: Adapt to breaking change in '{change.field_name}'"
+    
+    put_result = _github_api("PUT", f"/repos/{repo}/contents/{file_path}", token, {
         "message": commit_msg,
         "content": base64.b64encode(fixed_content.encode()).decode(),
         "branch": branch,
         "sha": file_sha,
     })
+    if "error" in put_result:
+        _log_activity("pr_error", {"step": "commit_fix", "repo": repo, "file": file_path, "err": str(put_result)[:150]})
+        return ""
     
     # Generate PR body with confidence scoring
-    change_description = f"Added required field `{change.field_name}` to `{change.method.upper()} {change.path}`"
+    change_description = f"`{change.change_type}` on field `{change.field_name}` in `{change.path or 'spec'}`"
     pr_body = format_pr_body(
         change_description=change_description,
         source_repo=source_repo,
@@ -1745,5 +1808,8 @@ def _create_fix_pr(
         "head": branch,
         "base": default_branch,
     })
+    if "error" in pr_data:
+        _log_activity("pr_error", {"step": "open_pr", "repo": repo, "branch": branch, "err": str(pr_data)[:150]})
+        return ""
     
     return pr_data.get("html_url", "")
