@@ -1158,29 +1158,47 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
     For monorepo support: exclude_path filters out the spec file itself
     so we don't try to 'fix' the spec that was just changed.
     """
-    # Use GitHub code search or contents API
-    endpoint = change.path  # e.g., "/users"
+    from .smart_consumer_finder import generate_variants, file_is_consumer
     
-    # GitHub search API
+    # Generate search terms from the field name (not just the path)
+    field_name = change.field_name
+    variants = generate_variants(field_name)
+    
+    # Use the most common variant for GitHub search
+    search_term = field_name  # snake_case is usually the proto field name
+    
+    # GitHub search API -- search for field name in code
     data = _github_api(
         "GET",
-        f"/search/code?q={endpoint}+in:file+repo:{repo}",
+        f"/search/code?q={search_term}+in:file+repo:{repo}",
         token
     )
     
     results = []
     if "items" in data:
-        for item in data["items"][:5]:  # Limit to 5 files
+        for item in data["items"][:10]:  # Check up to 10 files
             file_path = item["path"]
             # Skip the spec file itself (monorepo: don't fix the source)
             if file_path == exclude_path:
                 continue
-            if _is_code_file(file_path):
-                # Fetch file content
-                file_data = _github_api("GET", f"/repos/{repo}/contents/{file_path}", token)
-                if "content" in file_data:
-                    content = base64.b64decode(file_data["content"]).decode()
-                    results.append((file_path, content))
+            if not _is_code_file(file_path):
+                continue
+            
+            # Fetch file content
+            file_data = _github_api("GET", f"/repos/{repo}/contents/{file_path}", token)
+            if "content" not in file_data:
+                continue
+            
+            content = base64.b64decode(file_data["content"]).decode()
+            language = _detect_lang(file_path)
+            
+            # Smart filtering: only include if it's a REAL consumer (not just a comment)
+            is_consumer, confidence, matches = file_is_consumer(
+                content, file_path, field_name, language, min_confidence=0.5
+            )
+            
+            if is_consumer:
+                results.append((file_path, content))
     
     return results
 
