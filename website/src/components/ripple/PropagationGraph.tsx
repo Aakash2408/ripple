@@ -1,8 +1,8 @@
 const NODES = [
-  { id: "python-sdk", x: 78, y: 16 },
-  { id: "node-sdk", x: 86, y: 42 },
-  { id: "java-sdk", x: 80, y: 68 },
-  { id: "billing-svc", x: 62, y: 90 },
+  { id: "auth-service", x: 78, y: 16 },
+  { id: "billing-api", x: 86, y: 38 },
+  { id: "notifications", x: 80, y: 62 },
+  { id: "test-suite", x: 62, y: 86 },
 ];
 
 export function PropagationGraph() {
@@ -36,7 +36,7 @@ export function PropagationGraph() {
         <div className="absolute left-[6%] top-1/2 -translate-y-1/2">
           <div className="rounded-md border border-primary/60 bg-primary/10 px-3 py-2 text-center">
             <span className="font-mono text-[11px] text-primary">spec</span>
-            <p className="font-mono text-[10px] text-muted-foreground">POST /payments</p>
+            <p className="font-mono text-[10px] text-muted-foreground">user.proto</p>
           </div>
         </div>
 

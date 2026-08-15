@@ -50,22 +50,22 @@ export function Terminal() {
         <span className="inline-block h-4 w-2 translate-y-0.5 animate-pulse bg-primary" />
       </div>
       <div className="flex flex-wrap gap-2 border-t border-border px-4 py-3">
-        {[
-          { label: "Python PR →", href: LINKS.pythonPr },
-          { label: "Node PR →", href: LINKS.nodePr },
-          { label: "Java PR →", href: LINKS.javaPr },
-          { label: "GitLab MR →", href: LINKS.gitlabMr },
-        ].map((l) => (
-          <a
-            key={l.href}
-            href={l.href}
-            target="_blank"
-            rel="noreferrer"
-            className="rounded-md border border-border px-2.5 py-1.5 font-mono text-[11px] text-muted-foreground transition-colors hover:border-primary/60 hover:text-foreground"
-          >
-            {l.label}
-          </a>
-        ))}
+        <a
+          href="https://ripple-production-be7f.up.railway.app/dry-run"
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-md border border-primary/40 bg-primary/5 px-2.5 py-1.5 font-mono text-[11px] text-primary transition-colors hover:border-primary/60 hover:text-foreground"
+        >
+          Try it yourself (dry run) →
+        </a>
+        <a
+          href={LINKS.source}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-md border border-border px-2.5 py-1.5 font-mono text-[11px] text-muted-foreground transition-colors hover:border-primary/60 hover:text-foreground"
+        >
+          View source →
+        </a>
       </div>
     </div>
   );
