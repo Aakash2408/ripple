@@ -925,12 +925,23 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         change_type = _map_change_type(change)
         
         # --- ENSEMBLE CONSUMER FINDING ---
-        # Step 1: Grep-based search across repos
+        # Step 1: Grep-based search across repos.
+        # Searched ONCE and cached -- this used to run twice (once here,
+        # once in the fix loop below), doubling GitHub API calls.
+        consumer_files_by_repo = {}
         grep_results = []
         for consumer_repo in consumer_repos:
             consumer_files = _search_repo_for_consumers(consumer_repo, change, token, exclude_path=spec_path)
+            consumer_files_by_repo[consumer_repo] = consumer_files
             for file_path, content in consumer_files:
                 grep_results.append(file_path)
+        
+        _log_activity("consumer_search_complete", {
+            "field": change.field_name,
+            "repos_searched": len(consumer_repos),
+            "files_found": len(grep_results),
+            "files": grep_results[:5],
+        })
         
         # Step 2: Ensemble prediction (grep + playbook + history + multi-invoker)
         ensemble_predictions = ensemble.find_all_consumers(
@@ -971,7 +982,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         ]
         
         for consumer_repo in consumer_repos:
-            consumer_files = _search_repo_for_consumers(consumer_repo, change, token, exclude_path=spec_path)
+            consumer_files = consumer_files_by_repo.get(consumer_repo, [])
             
             for consumer_file, consumer_content in consumer_files:
                 # Check ignore patterns
@@ -995,6 +1006,13 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                     consumer_content, consumer, change, org
                 )
                 
+                _log_activity("fix_generated", {
+                    "repo": consumer_repo,
+                    "file": consumer_file,
+                    "changed": fixed_code != consumer_content,
+                    "source": explanation[:60] if explanation else "",
+                })
+                
                 if fixed_code != consumer_content:
                     # Find this file's confidence from ensemble predictions
                     file_confidence = 0.7  # default grep confidence
@@ -1009,6 +1027,11 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                     
                     # Only create PR if confidence is high enough
                     if not should_create_pr(file_confidence, min_confidence):
+                        _log_activity("pr_skipped_low_confidence", {
+                            "file": consumer_file,
+                            "confidence": file_confidence,
+                            "min_required": min_confidence,
+                        })
                         continue
                     
                     pr_url = _create_fix_pr(
@@ -1019,6 +1042,11 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                         reasons=file_reasons,
                         all_predictions=ensemble_predictions[:5],
                     )
+                    _log_activity("pr_result", {
+                        "repo": consumer_repo,
+                        "file": consumer_file,
+                        "url": pr_url or "FAILED",
+                    })
                     if pr_url:
                         prs_created.append(pr_url)
                         # Track for lifecycle (pending -> merged -> reverted)
@@ -1566,19 +1594,32 @@ def _find_consumer_repos(source_repo: str, token: str) -> list[str]:
     
     Includes the source repo itself (monorepo support) — consumers
     can live in the same repo as the spec.
+    
+    Filters to non-archived, non-fork repos sorted by recent activity.
+    Forks and stale repos are almost never consumers of your own spec,
+    and searching them burns GitHub API quota (each repo = 1+ API call).
     """
     # Always include the source repo (monorepo support)
     repos = [source_repo]
     
-    # Get all other repos for the user/org
+    # Get all other repos for the user/org, most recently pushed first
     owner = source_repo.split("/")[0]
-    data = _github_api("GET", f"/users/{owner}/repos?per_page=100", token)
+    data = _github_api(
+        "GET",
+        f"/users/{owner}/repos?per_page=100&sort=pushed&direction=desc",
+        token,
+    )
+    
+    max_repos = int(os.environ.get("RIPPLE_MAX_CONSUMER_REPOS", "20"))
     
     if isinstance(data, list):
-        repos.extend([
+        candidates = [
             r["full_name"] for r in data
-            if r["full_name"] != source_repo and not r.get("archived")
-        ])
+            if r["full_name"] != source_repo
+            and not r.get("archived")
+            and not r.get("fork")
+        ]
+        repos.extend(candidates[:max_repos])
     return repos
 
 
