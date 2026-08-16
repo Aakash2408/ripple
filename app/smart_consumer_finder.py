@@ -123,9 +123,71 @@ def classify_match(line: str, variant: str, language: str) -> tuple[str, float]:
         return _classify_kotlin(stripped, variant)
     elif language in ("csharp", "c#"):
         return _classify_csharp(stripped, variant)
+    elif language == "yaml":
+        return _classify_yaml(stripped, variant)
+    elif language == "shell":
+        return _classify_shell(stripped, variant)
     
     # Default: medium confidence
     return ("unknown_usage", 0.6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config and script languages
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Measured on the PropBench replay: 137 files that a real merged PR had to change
+# were skipped entirely because Ripple had no matcher for their language. On
+# kubernetes#109798 that was 24 of 36 label files -- YAML manifests and shell
+# scripts, i.e. MOST of the actual work in that change. No amount of tuning the
+# code matchers reaches them.
+#
+# These differ from code languages in one important way: a reference inside
+# quotes is a REAL reference, not a false positive. `name: "podsecuritypolicy"`
+# is exactly as meaningful as the unquoted form, so the string-literal demotion
+# that protects code matchers must not apply here.
+
+def _classify_yaml(line: str, variant: str) -> tuple[str, float]:
+    """Classify a reference in a YAML/manifest file.
+
+    Case-INSENSITIVE, unlike the code classifiers. find_field_consumers matches
+    variants case-insensitively but code classifiers then match case-sensitively
+    -- a mismatch that already caused one bug in this file. For config it is
+    worse, because the needed variant is often not generated at all:
+    generate_variants('podsecuritypolicy') cannot produce 'PodSecurityPolicy',
+    since splitting an unseparated lowercase compound needs a dictionary. So
+    `kind: PodSecurityPolicy` fell through every specific pattern to the 0.70
+    fallback. In config, PodSecurityPolicy / podsecuritypolicy /
+    pod-security-policy all denote the same resource.
+    """
+    I = re.IGNORECASE
+    # `variant:` as a mapping key -- the strongest signal.
+    if re.match(rf'^-?\s*["\']?{re.escape(variant)}["\']?\s*:', line, I):
+        return ("yaml_key", 0.95)
+    # `- variant` as a sequence item (RBAC rules, resource lists).
+    if re.match(rf'^-\s*["\']?{re.escape(variant)}["\']?\s*$', line, I):
+        return ("yaml_list_item", 0.92)
+    # `key: variant` or `key: [a, variant]` -- referenced as a value.
+    if re.search(rf':\s*.*(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])', line, I):
+        return ("yaml_value", 0.90)
+    return ("yaml_reference", 0.70)
+
+
+def _classify_shell(line: str, variant: str) -> tuple[str, float]:
+    """Classify a reference in a shell script. Case-insensitive -- see
+    _classify_yaml for why config languages differ from code here."""
+    I = re.IGNORECASE
+    # $VAR / ${VAR}
+    if re.search(rf'\$\{{?{re.escape(variant)}\b', line, I):
+        return ("shell_variable", 0.95)
+    # VAR= assignment (including export / local / readonly)
+    if re.match(rf'^(?:export\s+|local\s+|readonly\s+|declare\s+-\w+\s+)?'
+                rf'{re.escape(variant)}=', line, I):
+        return ("shell_assignment", 0.95)
+    # A path segment or flag value -- how manifests and dirs get referenced.
+    if re.search(rf'(?<![A-Za-z0-9])[-/\w.]*{re.escape(variant)}[-/\w.]*', line, I):
+        return ("shell_argument", 0.80)
+    return ("shell_reference", 0.70)
 
 
 def _is_comment(line: str, language: str) -> bool:
@@ -138,7 +200,18 @@ def _is_comment(line: str, language: str) -> bool:
 
 
 def _is_string_literal_only(line: str, variant: str, language: str) -> bool:
-    """Check if the variant only appears inside a string literal (not as code)."""
+    """Check if the variant only appears inside a string literal (not as code).
+
+    Does NOT apply to config and script languages. In YAML a quoted value is a
+    real reference -- `name: "podsecuritypolicy"` means exactly what the
+    unquoted form means -- and in shell, quoted paths and arguments are the
+    normal way to reference something. Demoting those to 0.3 would put them
+    below min_confidence and silently drop the very files these matchers were
+    added to catch.
+    """
+    if language in ("yaml", "shell"):
+        return False
+
     # If variant appears in quotes but not outside them, it's a string
     in_quotes = re.findall(r'["\']([^"\']*)["\']', line)
     outside_quotes = re.sub(r'["\'][^"\']*["\']', '', line)

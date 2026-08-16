@@ -269,6 +269,12 @@ LANG_MAP = {
     '.py': 'python', '.java': 'java', '.rs': 'rust', '.rb': 'ruby',
     '.kt': 'kotlin', '.cs': 'csharp', '.swift': 'swift', '.php': 'php',
     '.scala': 'scala', '.dart': 'dart',
+    # Config and scripts. Measured on the PropBench replay: 137 files a real PR
+    # had to change were skipped for having no matcher -- 24 of 36 on
+    # kubernetes#109798, i.e. most of that change. Manifests and scripts
+    # reference removed resources by name just as source does.
+    '.yaml': 'yaml', '.yml': 'yaml',
+    '.sh': 'shell', '.bash': 'shell', '.zsh': 'shell',
 }
 
 FRAMEWORK_PATTERNS = {

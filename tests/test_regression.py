@@ -856,6 +856,54 @@ def test_apply_fix_template_called_with_the_real_signature():
     assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
 
 
+def test_config_languages_are_matched_not_skipped():
+    """YAML and shell files were skipped entirely for having no matcher.
+
+    Measured on the PropBench replay: 137 files that a real merged PR had to
+    change were excluded on language alone -- 24 of 36 on kubernetes#109798,
+    i.e. most of that change. Adding these matchers moved 41 files from
+    "excluded" to "scored" and flagged 26 of them.
+
+    Two rules that differ from the code matchers, both load-bearing:
+      1. A quoted value IS a reference. `name: "podsecuritypolicy"` means what
+         the unquoted form means, so the string-literal demotion to 0.3 (below
+         min_confidence) must not apply.
+      2. Matching is case-insensitive. generate_variants('podsecuritypolicy')
+         cannot produce 'PodSecurityPolicy' -- splitting an unseparated
+         lowercase compound needs a dictionary -- so `kind: PodSecurityPolicy`
+         fell to the 0.70 fallback until the classifiers ignored case.
+    """
+    from app.smart_consumer_finder import find_field_consumers
+    from app.rag_engine import _detect_language
+
+    assert _detect_language("a/b.yaml") == "yaml"
+    assert _detect_language("a/b.yml") == "yaml"
+    assert _detect_language("hack/local-up-cluster.sh") == "shell"
+
+    # Case differs from the symbol, and the value is what carries the reference.
+    ms = find_field_consumers("kind: PodSecurityPolicy\n", "psp.yaml",
+                              "podsecuritypolicy", "yaml")
+    assert ms, "case-insensitive config match regressed"
+    assert ms[0].confidence >= 0.90, \
+        f"expected a specific classification, got {ms[0].match_type} " \
+        f"{ms[0].confidence} -- the 0.70 fallback means no pattern fired"
+
+    # A quoted value must not be demoted as a string literal.
+    q = find_field_consumers('  name: "podsecuritypolicy"\n', "psp.yaml",
+                             "podsecuritypolicy", "yaml")
+    assert q and q[0].confidence >= 0.5, \
+        "quoted YAML value demoted below min_confidence"
+
+    # Shell variables and path arguments.
+    sh = find_field_consumers('kubectl create -f podsecuritypolicy/psp.yaml\n',
+                              "up.sh", "podsecuritypolicy", "shell")
+    assert sh and sh[0].match_type.startswith("shell_")
+
+    # Comments are still excluded, as for every other language.
+    assert find_field_consumers("# see podsecuritypolicy for history\n",
+                                "x.sh", "podsecuritypolicy", "shell") == []
+
+
 def test_package_vector_finds_what_symbol_search_cannot():
     """A deleted PACKAGE propagates by path, not by name.
 
