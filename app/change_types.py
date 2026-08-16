@@ -181,3 +181,25 @@ def describe(change_type: str) -> str:
 
 def all_known_change_types() -> list:
     return sorted(CHANGE_TYPE_MAP)
+
+
+def is_wire_only(change_type: str) -> bool:
+    """True when NO source-level fix exists or is appropriate.
+
+    Callers need this to distinguish two situations that look identical from
+    the outside, because both leave the code unchanged:
+
+        wire-only      correctly nothing to fix -- must NOT open a PR, but
+                       MUST still be reported, since a changed field number
+                       silently corrupts data between old and new peers
+        failure        we could not produce a fix -- a gap worth surfacing
+
+    Without the distinction, a wire break would either be reported as a
+    failure (noise) or swallowed as a no-op (silence).
+    """
+    return category(change_type) == WIRE_ONLY
+
+
+def is_judgment(change_type: str) -> bool:
+    """True when a fix needs a human decision (partial fix + marker)."""
+    return category(change_type) == JUDGMENT

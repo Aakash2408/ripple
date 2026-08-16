@@ -780,6 +780,27 @@ def apply_fix_template(
         )
         return result, explanation
 
+    elif op == 'wire_incompatible':
+        # A proto field number or thrift field id changed. This breaks the
+        # SERIALIZATION contract, not the source contract: consumer code never
+        # references field numbers, so there is nothing in the source to fix.
+        #
+        # Returning the code unchanged is therefore the CORRECT outcome, not a
+        # failure. The distinction matters because unchanged code means no PR
+        # opens -- callers must use is_wire_only() to tell "correctly nothing
+        # to do" apart from "we could not fix it", and must still surface the
+        # break, because it silently corrupts data between old and new peers.
+        explanation = (
+            f"NO SOURCE CHANGE REQUIRED: '{field_name}' had its field "
+            f"number/id changed. This is a WIRE-COMPATIBILITY break -- "
+            f"previously serialized data and any peer running the old schema "
+            f"will misinterpret this field. Source code does not reference "
+            f"field numbers, so no consumer edit can fix it. Resolve by "
+            f"restoring the original number, or by coordinating a synchronised "
+            f"redeploy of all producers and consumers."
+        )
+        return code, explanation
+
     else:
         # Every change_type the engines emit is classified in change_types.py,
         # so reaching here means either a genuinely new dialect or a category

@@ -63,6 +63,7 @@ from .trpc_diff import diff_trpc
 from .thrift_diff import diff_thrift
 from .jsonschema_diff import diff_jsonschema
 from .smithy_diff import diff_smithy
+from .change_types import is_wire_only, is_judgment, category as change_category
 from .github_app_auth import (
     is_app_configured, get_installation_token,
     list_installation_repositories, AppAuthError,
@@ -1026,11 +1027,29 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
     warnings = []
     ensemble_stats = {"grep": 0, "playbook": 0, "history": 0, "multi_invoker": 0, "custom": 0}
     
+    wire_only_changes = []
     for change in breaking_changes:
         # Determine contract type from spec file
         contract_type = _detect_contract_type(spec_path)
         change_type = _map_change_type(change)
-        
+
+        # A changed proto field number / thrift field id breaks the WIRE
+        # contract, not the source contract. No consumer edit can fix it, so
+        # searching every repo for consumers would burn hundreds of API calls
+        # to reach a guaranteed no-op. Report it and move on -- reporting
+        # matters because old and new peers silently misinterpret the field.
+        if is_wire_only(change.change_type):
+            wire_only_changes.append(change.field_name)
+            _log_activity("wire_only_change", {
+                "spec": spec_path,
+                "field": change.field_name,
+                "change_type": change.change_type,
+                "action": "no source fix exists -- consumers not searched",
+                "impact": "old/new peers misinterpret this field; restore the "
+                          "original number or redeploy producers and consumers together",
+            })
+            continue
+
         # --- ENSEMBLE CONSUMER FINDING ---
         # Step 1: Grep-based search across repos.
         # Searched ONCE and cached -- this used to run twice (once here,
@@ -1231,6 +1250,10 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         "spec": spec_path,
         "breaking_changes": len(breaking_changes),
         "prs_created": prs_created,
+        # Wire-only breaks produce no PR by design (no source fix exists), so
+        # they are reported separately -- otherwise a run with only wire breaks
+        # looks identical to a run that found nothing.
+        "wire_only_changes": wire_only_changes,
         "ensemble_stats": ensemble_stats,
         "warnings": warnings,
         "config_loaded": org in _org_configs and bool(_org_configs[org].playbooks),

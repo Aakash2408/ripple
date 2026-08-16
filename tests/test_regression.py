@@ -995,6 +995,62 @@ def test_enum_arm_matching_treats_underscore_as_a_boundary():
     assert "Status_LEGACY" not in fixed, "underscore-prefixed enum not matched"
 
 
+def test_wire_only_returns_code_unchanged_and_says_so_explicitly():
+    """A changed proto field number / thrift field id breaks the WIRE
+    contract, not the source contract -- consumer code never references field
+    numbers, so leaving the code unchanged is CORRECT, not a failure.
+
+    The distinction matters because unchanged code means no PR opens, which
+    otherwise looks identical to 'we could not fix it'.
+    """
+    from app.fix_templates import apply_fix_template
+
+    code = 'type U struct {\n\tPhone string `protobuf:"bytes,4,opt"`\n}'
+    for ct in ("field_number_changed", "field_id_changed"):
+        for lang in ("go", "typescript", "python", "java"):
+            fixed, expl = apply_fix_template(code, lang, ct, "phone_number")
+            assert fixed == code, f"{ct}/{lang} modified source for a wire break"
+            assert "NO SOURCE CHANGE REQUIRED" in expl, f"{ct}/{lang}: {expl[:60]}"
+            # must not read as a failure or an unsupported type
+            for bad in ("Unknown change_type", "Unclassified",
+                        "No mechanical template", "Error:"):
+                assert bad not in expl, f"{ct}/{lang} reads as failure: {expl[:70]}"
+
+
+def test_wire_only_predicate_separates_the_three_categories():
+    from app.change_types import is_wire_only, is_judgment, category
+
+    assert is_wire_only("field_number_changed")
+    assert is_wire_only("field_id_changed")
+    assert not is_wire_only("field_removed")
+    assert not is_wire_only("rpc_removed")
+
+    assert is_judgment("rpc_removed")
+    assert not is_judgment("field_number_changed")
+
+    assert category("field_removed") == "mechanical"
+
+
+def test_webhook_short_circuits_wire_only_before_consumer_search():
+    """Searching every repo for consumers of a wire-only break would spend
+    hundreds of API calls to reach a guaranteed no-op, and a run containing
+    only wire breaks must not look like a run that found nothing."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "app", "webhook.py")).read()
+
+    assert "if is_wire_only(change.change_type):" in src, \
+        "wire-only changes are not short-circuited"
+    assert '"wire_only_change"' in src, "wire-only breaks are not logged"
+    assert '"wire_only_changes": wire_only_changes' in src, \
+        "wire-only breaks are not reported in the result"
+
+    # the short-circuit must come BEFORE the consumer search
+    idx_guard = src.find("if is_wire_only(change.change_type):")
+    idx_search = src.find("consumer_files = _search_repo_for_consumers")
+    assert idx_guard < idx_search, \
+        "wire-only guard runs after the consumer search, wasting API calls"
+
+
 # ===================================================================
 # runner (works without pytest)
 # ===================================================================
