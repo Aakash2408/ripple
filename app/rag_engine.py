@@ -580,9 +580,52 @@ def index_single_commit(repo_path: str, commit_sha: str, store: RagStore) -> dic
     return stats
 
 
+def _as_file_list(container: dict) -> list[str]:
+    """Read a file list from either the 'files' (list) or 'file' (str) shape.
+
+    Every PropBench entry uses `files:` as a LIST. The original indexer read
+    `.get('file')` -- a key that appears zero times in 881 entries -- so it
+    silently produced empty paths for every record, which made language
+    detection resolve to 'unknown' throughout.
+    """
+    files = container.get('files')
+    if isinstance(files, list):
+        return [f for f in files if isinstance(f, str) and f.strip()]
+    if isinstance(files, str) and files.strip():
+        return [files]
+    single = container.get('file')
+    if isinstance(single, str) and single.strip():
+        return [single]
+    return []
+
+
 def index_from_propbench(propbench_dir: str, store: RagStore) -> dict:
-    """Load PropBench YAML entries and index as fix examples."""
-    stats = {'entries_loaded': 0, 'examples_stored': 0, 'languages': set()}
+    """Load PropBench YAML entries and index as fix examples.
+
+    IMPORTANT -- what this can and cannot yield.
+
+    PropBench is a *prediction* benchmark: each entry records that when a
+    trigger file changes, certain consequence files must change too. It does
+    NOT record what the fix was -- across 881 entries and 5,077 consequences,
+    not one carries a diff. So while this reads the schema correctly, the
+    examples it produces have no fix content and no change_type, and
+    PatternStore.ingest_examples() will correctly reject them as unfixable.
+
+    That is the honest outcome, not a bug to work around: a retrievable
+    pattern that cannot produce a fix is worse than no pattern, because it can
+    win retrieval and then return nothing.
+
+    The stats therefore report `entries_without_diff` and `parse_errors` so
+    that outcome is visible here, at the source, instead of only showing up as
+    a filtered-to-zero count further downstream.
+    """
+    stats = {
+        'entries_loaded': 0,
+        'examples_stored': 0,
+        'entries_without_diff': 0,
+        'parse_errors': 0,
+        'languages': set(),
+    }
 
     try:
         import yaml
@@ -602,34 +645,66 @@ def index_from_propbench(propbench_dir: str, store: RagStore) -> dict:
                 docs = list(yaml.safe_load_all(content))
             else:
                 docs = _minimal_yaml_parse(content)
+        except Exception as e:
+            # Was a bare `continue`, so a corrupt or unreadable entry vanished
+            # without trace and the total silently under-reported.
+            stats['parse_errors'] += 1
+            stats.setdefault('parse_error_files', []).append(f"{yf.name}: {str(e)[:80]}")
+            continue
 
-            for doc in docs:
-                if not doc or not isinstance(doc, dict):
+        for doc in docs:
+            if not doc or not isinstance(doc, dict):
+                continue
+            trigger = doc.get('trigger', {}) or {}
+            consequences = doc.get('consequences', []) or []
+            if not consequences:
+                continue
+
+            stats['entries_loaded'] += 1
+
+            trigger_files = _as_file_list(trigger)
+            trigger_file = trigger_files[0] if trigger_files else ''
+            # Real key is 'intent'; 'diff_summary' is a SUMMARY string such as
+            # "Primary change: .gitignore (+1/-0)" -- deliberately not used as
+            # trigger_diff, since passing a summary off as a diff would make an
+            # unusable example look complete.
+            trigger_desc = (
+                trigger.get('intent')
+                or trigger.get('description')
+                or trigger.get('diff_summary')
+                or (f"change in {trigger_file}" if trigger_file else "unspecified change")
+            )
+            trigger_diff = trigger.get('diff', '') or ''
+            # No PropBench entry carries a change_type. 'modified' is left
+            # deliberately unmapped in change_types.py, so these are filtered
+            # rather than being handed an invented fix strategy.
+            change_type = trigger.get('change_type', 'modified')
+            field_name = trigger.get('field_name', '') or trigger.get('name', '') or 'unknown'
+            repo_name = (
+                doc.get('source_repo')
+                or doc.get('repo')
+                or trigger.get('package')
+                or yf.parent.name
+            )
+
+            if not trigger_diff:
+                stats['entries_without_diff'] += 1
+
+            for cons in consequences:
+                if not isinstance(cons, dict):
                     continue
-                trigger = doc.get('trigger', {}) or {}
-                consequences = doc.get('consequences', []) or []
-                if not consequences:
-                    continue
-
-                stats['entries_loaded'] += 1
-                trigger_file = trigger.get('file', '')
-                trigger_desc = trigger.get('description', '') or f"change in {trigger_file}"
-                change_type = trigger.get('change_type', 'modified')
-                field_name = trigger.get('field_name', '') or trigger.get('name', 'unknown')
-                repo_name = doc.get('repo', '') or yf.parent.name
-
-                for cons in consequences:
-                    if not isinstance(cons, dict):
-                        continue
-                    fix_file = cons.get('file', '')
+                # One example per consequence FILE -- entries list several, and
+                # reading a single scalar dropped all but nothing (the scalar
+                # key never existed).
+                for fix_file in _as_file_list(cons) or ['']:
                     lang = _detect_language(fix_file)
 
                     example = FixExample(
                         trigger_description=trigger_desc,
                         trigger_file=trigger_file,
-                        trigger_diff=trigger.get('diff', ''),
+                        trigger_diff=trigger_diff,
                         fix_file=fix_file,
-                        fix_diff=cons.get('diff', ''),
+                        fix_diff=cons.get('diff', '') or '',
                         language=lang,
                         change_type=change_type,
                         field_name=field_name,
@@ -639,8 +714,6 @@ def index_from_propbench(propbench_dir: str, store: RagStore) -> dict:
                     store.add_example(example)
                     stats['examples_stored'] += 1
                     stats['languages'].add(lang)
-        except Exception:
-            continue
 
     stats['languages'] = sorted(stats['languages'])
     return stats

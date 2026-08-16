@@ -856,6 +856,75 @@ def test_apply_fix_template_called_with_the_real_signature():
     assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
 
 
+def test_propbench_indexer_reads_the_real_schema():
+    """PropBench entries use `files:` (a LIST); the indexer read `file` (a str).
+
+    That key appears ZERO times across 881 real entries, so every record
+    produced an empty path and language detection resolved to 'unknown'
+    throughout -- the indexer had never actually read the corpus.
+
+    Also pins the honest half: PropBench carries no diffs, so entries must
+    still be reported via entries_without_diff and rejected downstream. A
+    retrievable pattern that cannot produce a fix is worse than no pattern,
+    because it can win retrieval and then return nothing.
+    """
+    import tempfile
+    from pathlib import Path as _Path
+    from app.rag_engine import index_from_propbench, RagStore as _EngineStore
+    from app.rag_store import PatternStore
+
+    entry = """
+id: fixture-001
+source_repo: acme/widgets
+trigger:
+  package: widgets
+  files:
+  - api/user.proto
+  intent: Removed phone_number from User
+  diff_summary: 'Primary change: api/user.proto (+0/-1)'
+consequences:
+- package: consumer
+  files:
+  - src/handler.go
+  - src/client.ts
+  description: 'Co-changed'
+  mechanical: true
+  relationship: co-change
+"""
+    with tempfile.TemporaryDirectory() as td:
+        (_Path(td) / "e.yaml").write_text(entry)
+        store = _EngineStore(collection_name="test_pb_schema")
+        stats = index_from_propbench(td, store)
+
+        assert stats["entries_loaded"] == 1, f"entry not read: {stats}"
+        # Both consequence files must yield an example -- reading a scalar key
+        # dropped them entirely.
+        assert stats["examples_stored"] == 2, \
+            f"expected one example per consequence file, got {stats}"
+        assert stats["entries_without_diff"] == 1, \
+            "an entry with no diff must be counted, not silently passed through"
+        assert stats["parse_errors"] == 0
+
+        ex = store.all_examples()
+        assert all(e.fix_file for e in ex), "fix_file empty -- 'files' list not read"
+        assert all(e.trigger_file == "api/user.proto" for e in ex), \
+            "trigger_file empty -- trigger 'files' list not read"
+        assert {e.language for e in ex} == {"go", "typescript"}, \
+            f"language detection needs a real path, got {[e.language for e in ex]}"
+        assert all(e.trigger_description == "Removed phone_number from User" for e in ex), \
+            "trigger description should come from 'intent'"
+        # diff_summary is a summary, NOT a diff -- passing it off as one would
+        # make an unusable example look complete.
+        assert all(not e.trigger_diff for e in ex), \
+            "diff_summary must not be presented as trigger_diff"
+
+        # And the honest outcome: no diffs means no usable fix patterns.
+        ps = PatternStore(collection_name="test_pb_schema_patterns")
+        res = ps.ingest_examples(ex)
+        assert res["added"] == 0 and ps.count() == 0, \
+            f"diff-less entries must not become fix patterns: {res}"
+
+
 def test_pr_body_makes_no_unearned_learning_claims():
     """The PR body must not claim learning that has not happened.
 
