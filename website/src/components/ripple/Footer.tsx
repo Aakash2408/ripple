@@ -69,7 +69,7 @@ export function Footer() {
             links={[
               { label: "Source code", href: LINKS.source, external: true },
               { label: "PropBench research", href: LINKS.research, external: true },
-              { label: "Python SDK PR", href: LINKS.pythonPr, external: true },
+              { label: "Ripple-opened PRs", href: LINKS.allFixPrs, external: true },
               { label: "GitLab MR", href: LINKS.gitlabMr, external: true },
             ]}
           />

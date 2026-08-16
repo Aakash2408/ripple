@@ -8,13 +8,12 @@ const LINES: Line[] = [
   { text: "$ git push origin main" },
   { text: "# removed field 'phone_number' from User message", tone: "muted" },
   { text: "⚠ 1 breaking change detected", tone: "warn" },
-  { text: "  user.proto — removed required field 'phone_number'", tone: "muted" },
-  { text: "🔍 finding consumers... found 4 across 3 repos", tone: "accent" },
-  { text: "✓ auth-service/handler.go — reference removed", tone: "ok" },
-  { text: "✓ billing-api/UserClient.ts — interface updated", tone: "ok" },
-  { text: "✓ notifications/user_svc.py — parameter dropped", tone: "ok" },
-  { text: "✓ tests/test_user_api.java — assertion fixed", tone: "ok" },
-  { text: "done in 14.2 seconds. 4 PRs opened.", tone: "accent" },
+  { text: "  user.proto — removed field 'phone_number'", tone: "muted" },
+  { text: "🔍 finding consumers... found 3 across 3 repos", tone: "accent" },
+  { text: "✓ auth-service/handler.go — reference removed (95%)", tone: "ok" },
+  { text: "✓ billing-api/UserClient.ts — interface updated (95%)", tone: "ok" },
+  { text: "⚠ notifications/user_svc.py — 2 call sites need review", tone: "warn" },
+  { text: "3 PRs opened. 2 complete, 1 flagged for a human.", tone: "accent" },
 ];
 
 const toneClass = {
@@ -50,6 +49,30 @@ export function Terminal() {
         <span className="inline-block h-4 w-2 translate-y-0.5 animate-pulse bg-primary" />
       </div>
       <div className="flex flex-wrap gap-2 border-t border-border px-4 py-3">
+        <a
+          href={LINKS.authServicePr}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-md border border-[var(--success)]/40 bg-[var(--success)]/5 px-2.5 py-1.5 font-mono text-[11px] text-[var(--success)] transition-colors hover:border-[var(--success)]/60 hover:text-foreground"
+        >
+          Go PR →
+        </a>
+        <a
+          href={LINKS.billingApiPr}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-md border border-[var(--success)]/40 bg-[var(--success)]/5 px-2.5 py-1.5 font-mono text-[11px] text-[var(--success)] transition-colors hover:border-[var(--success)]/60 hover:text-foreground"
+        >
+          TypeScript PR →
+        </a>
+        <a
+          href={LINKS.notificationsPr}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-md border border-[var(--warning)]/40 bg-[var(--warning)]/5 px-2.5 py-1.5 font-mono text-[11px] text-[var(--warning)] transition-colors hover:border-[var(--warning)]/60 hover:text-foreground"
+        >
+          Python PR (partial) →
+        </a>
         <a
           href="https://ripple-production-be7f.up.railway.app/dry-run"
           target="_blank"
