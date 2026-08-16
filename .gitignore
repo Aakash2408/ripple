@@ -6,3 +6,10 @@ venv/
 dist/
 *.egg-info/
 .DS_Store
+
+# Credentials -- must never be committed. The GitHub App private key can
+# mint installation tokens for every repo the App is installed on.
+*.pem
+*.key
+*private-key*
+data/tokens.json
