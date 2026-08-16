@@ -7,15 +7,17 @@ export const LINKS = {
   research: "https://github.com/Aakash2408/Propbench",
   researchPaper: "https://www.researchgate.net/publication/412220063_PropBench_A_Benchmark_for_Measuring_Engineering_Judgment_in_Change_Propagation",
 
-  // Live PRs opened by Ripple from a single push to user-proto (2026-08-16).
-  // These match the terminal demo narrative: user.proto drops phone_number,
-  // Ripple fixes the Go / TypeScript / Python consumers.
-  // NOTE: these are regenerated with new numbers each time the demo pipeline
-  // is re-run, so prefer `allFixPrs` for anything long-lived.
-  authServicePr: "https://github.com/Aakash2408/auth-service/pull/3",
-  billingApiPr: "https://github.com/Aakash2408/billing-api/pull/3",
-  notificationsPr: "https://github.com/Aakash2408/notifications-svc/pull/4",
-  // Never goes stale: every PR authored by the Ripple app, across all repos.
+  // Per-repo listings of every PR the Ripple app has opened, filtered by
+  // author. Deliberately NOT pinned to a PR number: the demo pipeline
+  // reopens these on each run, so pull/1 -> pull/2 -> pull/3 within a day.
+  // A filtered listing always resolves to the current PR for that repo.
+  authServicePr:
+    "https://github.com/Aakash2408/auth-service/pulls?q=is%3Apr+author%3Aapp%2Fripple-api",
+  billingApiPr:
+    "https://github.com/Aakash2408/billing-api/pulls?q=is%3Apr+author%3Aapp%2Fripple-api",
+  notificationsPr:
+    "https://github.com/Aakash2408/notifications-svc/pulls?q=is%3Apr+author%3Aapp%2Fripple-api",
+  // Every Ripple-opened PR across all repos.
   allFixPrs:
     "https://github.com/search?q=org%3AAakash2408+is%3Apr+author%3Aapp%2Fripple-api&type=pullrequests",
 
