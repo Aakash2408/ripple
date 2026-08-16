@@ -1058,7 +1058,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                             )
                             source = SourceChange(
                                 repo=repo,
-                                commit_sha=event.get("after", "")[:12],
+                                commit_sha=(after_sha or "")[:12],
                                 pr_number=None,
                                 pr_url=None,
                                 title=f"{change.change_type}: {change.field_name}",
@@ -1673,7 +1673,7 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
     data = _github_api("GET", f"/search/code?q={query}", token)
     
     if "error" in data and data.get("error") in (403, 429):
-        time.sleep(2)
+        _time.sleep(2)
         data = _github_api("GET", f"/search/code?q={query}", token)
     
     if "error" in data:
