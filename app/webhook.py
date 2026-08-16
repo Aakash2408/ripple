@@ -1930,7 +1930,31 @@ def _create_fix_pr(
         "base": default_branch,
     })
     if "error" in pr_data:
+        # A Ripple PR for this same field can already be open -- either the
+        # customer re-pushed the same change, or a prior run created it.
+        # GitHub returns 422 here. The fix commit was already pushed to the
+        # branch above, so that PR is now up to date: return it instead of
+        # reporting failure and producing nothing.
+        existing = _find_open_pr_for_branch(repo, branch, default_branch, token)
+        if existing:
+            _log_activity("pr_updated_existing", {
+                "repo": repo, "branch": branch, "url": existing,
+            })
+            return existing
         _log_activity("pr_error", {"step": "open_pr", "repo": repo, "branch": branch, "err": str(pr_data)[:150]})
         return ""
     
     return pr_data.get("html_url", "")
+
+
+def _find_open_pr_for_branch(
+    repo: str, branch: str, base: str, token: str
+) -> str:
+    """Return the URL of an open PR whose head is `branch`, if any."""
+    owner = repo.split("/")[0]
+    prs = _github_api(
+        "GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}&base={base}", token
+    )
+    if isinstance(prs, list) and prs:
+        return prs[0].get("html_url", "")
+    return ""
