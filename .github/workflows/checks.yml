@@ -25,10 +25,17 @@ jobs:
       - name: Install runtime deps
         run: |
           python -m pip install --upgrade pip
-          # Only what the tests actually import. sentence-transformers and
-          # chromadb are heavy and the RAG paths degrade gracefully without
-          # them, so they are intentionally excluded from CI.
-          pip install pyyaml cryptography certifi
+          # app/webhook.py imports fastapi at module level, and 5 tests
+          # import app.webhook, so fastapi+pydantic are REQUIRED here. My
+          # first version of this file omitted them on the assumption that
+          # the tests only needed stdlib -- CI failed on its first run with
+          # 46/51 and five ModuleNotFoundError.
+          #
+          # sentence-transformers and chromadb are deliberately EXCLUDED:
+          # they are ~2GB, and the RAG paths degrade gracefully without them
+          # (that degradation is now logged as rag_unavailable rather than
+          # being silent, so its absence here is visible, not hidden).
+          pip install fastapi uvicorn pydantic pyyaml cryptography certifi
 
       - name: Undefined-name check
         # ast.parse only validates SYNTAX. A NameError from an aliased import
