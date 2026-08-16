@@ -417,6 +417,137 @@ def test_presentation_dir_heuristic_is_gone_but_vendored_still_excluded():
 
 
 # ===================================================================
+# CLASS 6: RESILIENCE -- transient faults must not kill a run
+# ===================================================================
+
+def test_transient_connection_error_is_retried():
+    """RemoteDisconnected is NOT an HTTPError, so it previously escaped
+    _github_api and killed the whole spec run with
+    'Remote end closed connection without response'. The tree fallback
+    issues hundreds of calls, so a mid-run blip must not discard the work."""
+    import http.client
+    from app import webhook as wh
+
+    calls = {"n": 0}
+    real = wh.urlopen
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise http.client.RemoteDisconnected("closed")
+        return real(*a, **k)
+
+    wh.urlopen = flaky
+    try:
+        wh._github_api("GET", "/zen", "invalid-token")
+        assert calls["n"] == 3, f"expected 2 retries then success, got {calls['n']} attempts"
+    finally:
+        wh.urlopen = real
+
+
+def test_exhausted_retries_return_error_not_exception():
+    """After the retry budget, return an error dict. Raising here would
+    abort the run; returning '' would look like 'no consumers found'."""
+    import http.client
+    from app import webhook as wh
+
+    real = wh.urlopen
+
+    def always_fail(*a, **k):
+        raise http.client.RemoteDisconnected("boom")
+
+    wh.urlopen = always_fail
+    try:
+        result = wh._github_api("GET", "/zen", "t")
+        assert result.get("error") == "transient", f"unexpected: {result}"
+        assert "RemoteDisconnected" in result.get("message", "")
+    finally:
+        wh.urlopen = real
+
+
+def test_permanent_http_errors_are_not_retried():
+    """404/422 cannot be fixed by retrying -- burning the budget on them
+    would slow every run for nothing."""
+    from urllib.error import HTTPError
+    from app import webhook as wh
+
+    calls = {"n": 0}
+    real = wh.urlopen
+
+    def not_found(*a, **k):
+        calls["n"] += 1
+        raise HTTPError("u", 404, "Not Found", {}, None)
+
+    wh.urlopen = not_found
+    try:
+        result = wh._github_api("GET", "/nope", "t")
+        assert result.get("error") == 404
+        assert calls["n"] == 1, f"404 should not be retried, made {calls['n']} calls"
+    finally:
+        wh.urlopen = real
+
+
+def test_tree_scan_respects_call_budget():
+    """An unbounded scan across a wide installation scope is what triggered
+    the connection drops. Budget exhaustion must stop the scan and be
+    logged, never silently truncate."""
+    from app import webhook as wh
+    budget = {"remaining": 0}
+    before = len(wh._activity_log)
+
+    class _Change:
+        field_name = "phone_number"
+
+    result = wh._scan_repo_tree_for_consumers(
+        "Aakash2408/user-proto", _Change(), "invalid", "", budget
+    )
+    assert result == [], "no results expected with an invalid token"
+    assert budget["remaining"] == 0
+    assert len(wh._activity_log) >= before
+
+
+def test_variant_order_is_deterministic():
+    """generate_variants() returned a set(), and Python randomises string
+    hashes per process -- so order changed every run. The search query takes
+    only the first few variants, so which ones got searched was random and a
+    consumer could be found on one run and silently missed on the next."""
+    order = generate_variants("phone_number")
+    for _ in range(20):
+        assert generate_variants("phone_number") == order, "variant order unstable"
+    # canonical conventions must come before accessor forms
+    assert order.index("phone_number") < order.index("getPhoneNumber")
+    assert order.index("phoneNumber") < order.index("getPhoneNumber")
+    assert order.index("PhoneNumber") < order.index("getPhoneNumber")
+
+
+def test_confidence_is_stable_and_uses_strongest_match():
+    """The membership test is case-INSENSITIVE but classify_match is
+    case-SENSITIVE, and the loop used to break on the first hit. For
+    `PhoneNumber: phone,` both phoneNumber and PhoneNumber pass membership
+    but only PhoneNumber scores 0.95, so the result depended on random
+    variant order. All matching variants are now scored, strongest wins."""
+    go_line = "\t\tPhoneNumber: phone,"
+    results = {
+        file_is_consumer(go_line, "handler.go", "phone_number", "go", 0.5)[1]
+        for _ in range(20)
+    }
+    assert len(results) == 1, f"confidence unstable across runs: {results}"
+    assert results.pop() >= 0.9, "field assignment should score high"
+
+
+def test_case_mismatched_variant_does_not_lower_score():
+    """A Go struct-field assignment must score as a field assignment even
+    though a camelCase variant also passes the case-insensitive membership
+    test."""
+    _, conf, matches = file_is_consumer(
+        "\t\tPhoneNumber: phone,", "handler.go", "phone_number", "go", 0.5
+    )
+    assert conf >= 0.9, f"expected >=0.9 for struct field assignment, got {conf}"
+    assert matches[0].variant_matched == "PhoneNumber", \
+        f"strongest variant should win, got {matches[0].variant_matched}"
+
+
+# ===================================================================
 # runner (works without pytest)
 # ===================================================================
 

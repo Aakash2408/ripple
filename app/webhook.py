@@ -24,7 +24,26 @@ import re
 import ssl
 import base64
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+import http.client
+import socket
+
+# Transient network faults worth retrying. RemoteDisconnected is the one that
+# killed live runs: GitHub closes the connection under a burst of calls, and
+# it is NOT an HTTPError so it previously escaped _github_api entirely.
+_TRANSIENT_ERRORS = (
+    URLError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    socket.timeout,
+    TimeoutError,
+    OSError,          # covers ssl.SSLEOFError and assorted socket errors
+)
+_API_MAX_RETRIES = 3
+_BACKOFF_BASE = 0.75  # seconds; 0.75, 1.5, 3.0
 
 try:
     from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
@@ -942,8 +961,15 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         # once in the fix loop below), doubling GitHub API calls.
         consumer_files_by_repo = {}
         grep_results = []
+        # Shared API-call budget for this change. The tree fallback costs one
+        # call per candidate file, so without a ceiling a wide installation
+        # scope issues hundreds of rapid requests and GitHub drops the
+        # connection mid-run.
+        tree_budget = {"remaining": int(os.environ.get("RIPPLE_TREE_CALL_BUDGET", "150"))}
         for consumer_repo in consumer_repos:
-            consumer_files = _search_repo_for_consumers(consumer_repo, change, token, exclude_path=spec_path)
+            consumer_files = _search_repo_for_consumers(
+                consumer_repo, change, token, exclude_path=spec_path, budget=tree_budget
+            )
             consumer_files_by_repo[consumer_repo] = consumer_files
             for file_path, content, _detect_conf in consumer_files:
                 grep_results.append(file_path)
@@ -1257,22 +1283,39 @@ def _get_token(installation_id: int = None) -> str:
     return os.environ.get("GITHUB_TOKEN", "")
 
 
-def _github_api(method: str, path: str, token: str, data: dict = None) -> dict:
-    """Make GitHub API request with SSL fix."""
+def _github_api(method: str, path: str, token: str, data: dict = None,
+                _attempt: int = 0) -> dict:
+    """Make a GitHub API request, retrying transient failures.
+
+    Previously only HTTPError was caught, so a dropped connection
+    (http.client.RemoteDisconnected, socket timeout, URLError) propagated
+    out and killed the ENTIRE spec run with
+    "Remote end closed connection without response".
+
+    That is easy to hit: the tree-walk fallback issues up to 41 calls per
+    repo across every repo in scope, and GitHub starts closing connections
+    under that burst. A single blip on call 200 of 370 should not discard
+    all the work, so transient faults are retried with backoff and only
+    become errors after the budget is exhausted.
+
+    Retryable: connection resets, timeouts, 429, and 5xx.
+    Not retryable: 404, 422 and friends -- retrying cannot change those.
+    """
     url = f"https://api.github.com{path}"
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "ripple-app",
     }
-    
+
     body = json.dumps(data).encode() if data else None
     if body:
         headers["Content-Type"] = "application/json"
-    
+
     req = Request(url, data=body, headers=headers, method=method)
-    
+
     try:
-        with urlopen(req, timeout=15, context=SSL_CTX) as resp:
+        with urlopen(req, timeout=20, context=SSL_CTX) as resp:
             raw = resp.read().decode()
             # DELETE and some PUT/PATCH endpoints return 204 No Content with
             # an empty body -- json.loads("") raises JSONDecodeError.
@@ -1282,9 +1325,42 @@ def _github_api(method: str, path: str, token: str, data: dict = None) -> dict:
                 return json.loads(raw)
             except ValueError:
                 return {"status": getattr(resp, "status", 200), "raw": raw[:200]}
+
     except HTTPError as e:
         error_body = e.read().decode() if hasattr(e, 'read') else ""
+        # Secondary rate limits and server errors are worth retrying.
+        if e.code in (429, 500, 502, 503, 504) and _attempt < _API_MAX_RETRIES:
+            delay = _retry_delay(e, _attempt)
+            _time.sleep(delay)
+            return _github_api(method, path, token, data, _attempt + 1)
         return {"error": e.code, "message": error_body[:200]}
+
+    except _TRANSIENT_ERRORS as e:
+        if _attempt < _API_MAX_RETRIES:
+            _time.sleep(_BACKOFF_BASE * (2 ** _attempt))
+            return _github_api(method, path, token, data, _attempt + 1)
+        _log_activity("api_transient_failed", {
+            "path": path[:80],
+            "err": f"{type(e).__name__}: {str(e)[:120]}",
+            "attempts": _attempt + 1,
+        })
+        return {"error": "transient", "message": f"{type(e).__name__}: {str(e)[:160]}"}
+
+
+def _retry_delay(err, attempt: int) -> float:
+    """Honour Retry-After / rate-limit reset when GitHub provides it."""
+    try:
+        retry_after = err.headers.get("Retry-After")
+        if retry_after:
+            return min(float(retry_after), 30.0)
+        reset = err.headers.get("X-RateLimit-Reset")
+        if reset:
+            wait = float(reset) - _time.time()
+            if 0 < wait <= 30:
+                return wait
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return _BACKOFF_BASE * (2 ** attempt)
 
 
 def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:
@@ -1724,7 +1800,9 @@ def _find_consumer_repos(source_repo: str, token: str,
     return repos
 
 
-def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, exclude_path: str = "") -> list[tuple[str, str]]:
+def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
+                               exclude_path: str = "",
+                               budget: dict = None) -> list[tuple[str, str, float]]:
     """Search a repo for files that consume the changed endpoint.
     
     For monorepo support: exclude_path filters out the spec file itself
@@ -1809,44 +1887,65 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
     # Fall back to walking the repo tree, which is always current.
     if not results:
         _log_activity("search_fallback_tree", {"repo": repo, "reason": "code search returned 0"})
-        results = _scan_repo_tree_for_consumers(repo, change, token, exclude_path)
+        results = _scan_repo_tree_for_consumers(repo, change, token, exclude_path, budget)
     
     return results
 
 
 def _scan_repo_tree_for_consumers(
-    repo: str, change: BreakingChange, token: str, exclude_path: str = ""
-) -> list[tuple[str, str]]:
+    repo: str, change: BreakingChange, token: str, exclude_path: str = "",
+    budget: dict = None,
+) -> list[tuple[str, str, float]]:
     """Find consumers by listing the repo tree directly (no search index).
 
-    Slower than code search on large repos, but always up to date. Used as
-    a fallback so freshly-created repos still work.
+    Slower than code search but always up to date. In practice this is now
+    the PRIMARY path, not a rare fallback: code search returns 0 results for
+    installation-token requests and for recently created repos.
+
+    Because each candidate file costs one API call, an unbounded scan across
+    every repo in scope issues hundreds of rapid requests and GitHub starts
+    closing connections. `budget` caps total content fetches per spec change
+    and is reported when exhausted, so a truncated scan is never silent.
     """
     from .smart_consumer_finder import file_is_consumer
-    
+
     field_name = change.field_name
     max_files = int(os.environ.get("RIPPLE_MAX_TREE_FILES", "40"))
-    
+    max_blob_bytes = int(os.environ.get("RIPPLE_MAX_BLOB_BYTES", "200000"))
+
     repo_data = _github_api("GET", f"/repos/{repo}", token)
     if "error" in repo_data:
         return []
     default_branch = repo_data.get("default_branch", "main")
-    
+
     tree = _github_api(
         "GET", f"/repos/{repo}/git/trees/{default_branch}?recursive=1", token
     )
     if "tree" not in tree:
         return []
-    
+
     candidates = [
         node["path"] for node in tree["tree"]
         if node.get("type") == "blob"
         and node["path"] != exclude_path
         and _is_code_file(node["path"])
+        # Tree API reports size; giant files are not hand-edited consumers
+        # and are expensive to fetch.
+        and node.get("size", 0) <= max_blob_bytes
     ][:max_files]
-    
+
     results = []
     for file_path in candidates:
+        if budget is not None:
+            if budget.get("remaining", 0) <= 0:
+                _log_activity("tree_scan_budget_exhausted", {
+                    "repo": repo,
+                    "skipped_from": file_path,
+                    "note": "raise RIPPLE_TREE_CALL_BUDGET if consumers are being missed",
+                })
+                break
+            budget["remaining"] -= 1
+
         file_data = _github_api(
             "GET", f"/repos/{repo}/contents/{file_path}?ref={default_branch}", token
         )
@@ -1856,13 +1955,13 @@ def _scan_repo_tree_for_consumers(
             content = base64.b64decode(file_data["content"]).decode()
         except (ValueError, UnicodeDecodeError):
             continue
-        
+
         is_consumer, confidence, matches = file_is_consumer(
             content, file_path, field_name, _detect_lang(file_path), min_confidence=0.5
         )
         if is_consumer:
             results.append((file_path, content, confidence))
-    
+
     if results:
         _log_activity("tree_scan_found", {
             "repo": repo,

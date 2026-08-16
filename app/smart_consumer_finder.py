@@ -31,10 +31,30 @@ class SmartMatch:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_variants(field_name: str) -> list[str]:
-    """Generate all naming convention variants of a field name."""
-    variants = set()
-    variants.add(field_name)  # original
-    
+    """Generate all naming convention variants of a field name.
+
+    Returns them in a DETERMINISTIC, priority order: the canonical naming
+    conventions first, then accessor-prefixed forms.
+
+    This previously built a `set()` and returned it directly. Python
+    randomizes string hashes per process, so the order changed on every run,
+    with two consequences:
+
+      * file_is_consumer() reported the confidence of whichever variant
+        happened to match first, so the same file scored 0.95 on one run and
+        0.70 on the next.
+      * the code-search query takes only the first few variants, so which
+        ones got searched was random -- a snake_case Python consumer could be
+        found on one run and silently missed on the next.
+
+    Order is now fixed, so discovery and scoring are reproducible.
+    """
+    ordered = []
+
+    def add(v):
+        if v and len(v) > 2 and v not in ordered:
+            ordered.append(v)
+
     # Split into parts
     if "_" in field_name:
         parts = field_name.split("_")
@@ -43,24 +63,28 @@ def generate_variants(field_name: str) -> list[str]:
         parts = re.sub(r'([A-Z])', r'_\1', field_name).lower().strip('_').split('_')
     else:
         parts = [field_name]
-    
-    # Generate variants
+
     snake = "_".join(parts).lower()
     camel = parts[0].lower() + "".join(p.capitalize() for p in parts[1:])
     pascal = "".join(p.capitalize() for p in parts)
     upper_snake = "_".join(parts).upper()
     kebab = "-".join(parts).lower()
-    
-    variants.update([snake, camel, pascal, upper_snake, kebab])
-    
-    # Proto-specific: phone_number → PhoneNumber (Go generated), phone_number (Python pb2)
-    # Also: getPhoneNumber, setPhoneNumber, hasPhoneNumber (Java getters/setters)
-    variants.add(f"get{pascal}")
-    variants.add(f"set{pascal}")
-    variants.add(f"has{pascal}")
-    variants.add(f"Get{pascal}")  # Go exported
-    
-    return [v for v in variants if v and len(v) > 2]
+
+    # Canonical conventions first -- these are the declaration-site names
+    # that actually need rewriting, and the ones worth spending a limited
+    # search query on.
+    add(field_name)      # exactly as written in the contract
+    add(snake)           # python, proto, ruby
+    add(camel)           # typescript, javascript, java fields
+    add(pascal)          # go exported, c#
+    add(upper_snake)     # constants
+    add(kebab)           # json/yaml keys
+
+    # Accessor forms last: they are usages, not declarations.
+    for prefix in ("get", "set", "has", "Get", "Set", "Has"):
+        add(f"{prefix}{pascal}")
+
+    return ordered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,26 +299,44 @@ def find_field_consumers(
     
     Returns only matches above min_confidence, sorted by confidence desc.
     Filters out comments, string literals, and other false positives.
+
+    Per line, EVERY matching variant is classified and the strongest result
+    wins. The previous version broke out of the variant loop on the first
+    case-insensitive hit, which was wrong in a subtle way: the membership
+    test (`variant.lower() in line.lower()`) is case-insensitive, but
+    classify_match uses case-SENSITIVE regexes. So for a Go line like
+
+        PhoneNumber: phone,
+
+    both `phoneNumber` and `PhoneNumber` pass the membership test, yet only
+    `PhoneNumber` matches rf'{variant}\\s*:' and scores 0.95 as a field
+    assignment. Whichever variant came first was locked in -- and variant
+    order used to be randomised per process, so the same file scored 0.95 on
+    one run and 0.70 on the next.
     """
     variants = generate_variants(field_name)
     matches = []
     
     lines = file_content.split("\n")
     for i, line in enumerate(lines, 1):
+        lowered = line.lower()
+        best = None
         for variant in variants:
-            if variant.lower() in line.lower():
-                match_type, confidence = classify_match(line, variant, language)
-                
-                if confidence >= min_confidence:
-                    matches.append(SmartMatch(
-                        file_path=file_path,
-                        line_number=i,
-                        line_content=line.strip(),
-                        match_type=match_type,
-                        confidence=confidence,
-                        variant_matched=variant,
-                    ))
-                    break  # Only count each line once
+            if variant.lower() not in lowered:
+                continue
+            match_type, confidence = classify_match(line, variant, language)
+            if best is None or confidence > best[1]:
+                best = (match_type, confidence, variant)
+        
+        if best is not None and best[1] >= min_confidence:
+            matches.append(SmartMatch(
+                file_path=file_path,
+                line_number=i,
+                line_content=line.strip(),
+                match_type=best[0],
+                confidence=best[1],
+                variant_matched=best[2],
+            ))
     
     # Sort by confidence descending
     matches.sort(key=lambda m: m.confidence, reverse=True)

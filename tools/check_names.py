@@ -111,12 +111,56 @@ def check(path: str) -> list:
         "__name__", "__file__", "__doc__", "self", "cls",
     }
 
+    # Map every function/lambda/class to its enclosing scopes so a closure
+    # can see names bound by the function it is nested in. Without this a
+    # helper like:
+    #
+    #     def outer():
+    #         ordered = []
+    #         def add(v):
+    #             ordered.append(v)   # <- reported as undefined
+    #
+    # produced a false positive, and a checker that cries wolf gets ignored.
+    enclosing = {}
+
+    def walk_scopes(node, stack):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.Lambda, ast.ClassDef)):
+                enclosing[child] = list(stack)
+                walk_scopes(child, stack + [child])
+            else:
+                walk_scopes(child, stack)
+
+    walk_scopes(tree, [])
+
     problems = []
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         allowed = safe | local_bindings(fn)
+        # Names from every enclosing scope are visible to this closure
+        for outer in enclosing.get(fn, []):
+            if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                allowed |= local_bindings(outer)
+            elif isinstance(outer, ast.Lambda):
+                la = outer.args
+                for group in (getattr(la, "posonlyargs", []), la.args, la.kwonlyargs):
+                    for a in group:
+                        allowed.add(a.arg)
+
+        # Only inspect statements belonging to THIS function, not nested ones
+        nested = {
+            n for n in ast.walk(fn)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn
+        }
+        nested_nodes = set()
+        for n in nested:
+            nested_nodes.update(ast.walk(n))
+
         for node in ast.walk(fn):
+            if node in nested_nodes:
+                continue
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 if node.id not in allowed:
                     problems.append((node.lineno, fn.name, node.id))
