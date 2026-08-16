@@ -96,7 +96,7 @@ export const CONTRACTS = [
 export const INTELLIGENCE = [
   {
     title: "Co-change Learning",
-    body: "Scans git history. Files that always change together? Ripple knows.",
+    body: "Scans git history so files that always change together are treated as related. Built and benchmarked; not yet enabled on the hosted service.",
   },
   {
     title: "Consumer Graph",
@@ -132,7 +132,7 @@ export const INTELLIGENCE = [
   },
   {
     title: "AI Confidence",
-    body: "Every PR shows why Ripple made this fix, with a confidence score based on repo-specific learning.",
+    body: "Every PR shows why Ripple made this fix, with a per-factor confidence breakdown and the provenance of the fix that produced it.",
   },
   {
     title: "12 Languages",
@@ -183,7 +183,7 @@ export const COMPARE_ROWS: { label: string; values: string[] }[] = [
   { label: "Generates fix code", values: ["✓", "—", "—", "—"] },
   { label: "Opens PRs automatically", values: ["✓", "✓", "—", "—"] },
   { label: "Contract types", values: ["10", "0", "1", "1"] },
-  { label: "Learns from git history", values: ["✓", "—", "—", "—"] },
+  { label: "Learns from git history", values: ["⚠ built", "—", "—", "—"] },
   { label: "Change Impact Report", values: ["✓", "—", "—", "—"] },
   { label: "Platforms", values: ["7", "1", "1", "1"] },
   { label: "Self-hosted option", values: ["✓", "—", "—", "—"] },
@@ -194,10 +194,10 @@ export const COMPARE_ROWS: { label: string; values: string[] }[] = [
 ];
 
 export const RESEARCH_STATS = [
-  { value: "874", label: "Real engineering changes analyzed" },
-  { value: "5,200+", label: "Consequence files classified" },
-  { value: "82%", label: "Package-level recall (ensemble)" },
-  { value: "5", label: "Independent learning channels" },
+  { value: "882", label: "Real engineering changes analyzed" },
+  { value: "1,223", label: "Consequence files classified" },
+  { value: "82%", label: "Package-level recall (ensemble, on the benchmark)" },
+  { value: "50", label: "Repositories, 10 languages" },
 ];
 
 export const PRICING = [

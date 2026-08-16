@@ -856,6 +856,46 @@ def test_apply_fix_template_called_with_the_real_signature():
     assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
 
 
+def test_pr_body_makes_no_unearned_learning_claims():
+    """The PR body must not claim learning that has not happened.
+
+    Every PR previously carried "Learning: enabled" and "PropBench v1 (882
+    entries)" in its footer, plus "Similar fixes merged without revert" and
+    "Co-change pattern detected in git history" in the confidence table. None
+    was true: propbench_data/ is not vendored into this repo, no learning
+    channel runs in the hosted deployment, and no prior merge is tracked.
+
+    A PR that overstates what it did costs more trust than one admitting a
+    partial fix, so these strings are pinned absent.
+    """
+    from app.confidence import format_pr_body
+
+    body = format_pr_body(
+        change_description="removed field phone_number",
+        source_repo="acme/user-proto",
+        confidence=0.95,
+        sources=["template"],
+        reasons=[],
+        consumer_file="handler.go",
+    )
+
+    forbidden = [
+        "Learning: enabled",
+        "PropBench v1 (882 entries)",
+        "Similar fixes merged without revert",
+        "Co-change pattern detected in git history",
+    ]
+    for claim in forbidden:
+        assert claim not in body, f"unearned claim back in PR body: {claim!r}"
+
+    # And the honest replacements must actually be present, so this test fails
+    # if the rows are deleted rather than corrected.
+    assert "not a measurement of past merges" in body, \
+        "historical-accuracy row must state it is a prior, not a measurement"
+    assert "Static reference match in consumer source" in body, \
+        "observation row must describe what actually matched"
+
+
 def test_rag_fallback_to_template_is_not_labelled_as_rag():
     """RAG's own chain returns '[RAG/template]' when it finds no learned
     pattern. Checking for '[RAG' before 'template' would claim

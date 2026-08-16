@@ -330,14 +330,39 @@ async def github_install_webhook(request: FastAPIRequest):
         from .rag_engine import RagStore, index_from_propbench
         store = RagStore(collection_name=f"ripple_{org}")
         
-        # Pre-load PropBench general knowledge (882 patterns)
+        # Pre-load PropBench general knowledge.
+        # Two bugs lived here and together explain why the RAG store has always
+        # been empty:
+        #   1. propbench_data/ is NOT vendored into this repo (the 882 entries
+        #      live in the separate judgment-engine repo), so os.path.exists()
+        #      was False and this block silently appended nothing. A missing
+        #      dataset must be reported, not skipped in silence.
+        #   2. index_from_propbench() returns 'entries_loaded'/'examples_stored',
+        #      never 'indexed' -- so this reported patterns: 0 even on success.
         try:
-            propbench_dir = os.path.join(os.path.dirname(__file__), "..", "propbench_data")
+            propbench_dir = os.environ.get("RIPPLE_PROPBENCH_DIR") or os.path.join(
+                os.path.dirname(__file__), "..", "propbench_data"
+            )
             if os.path.exists(propbench_dir):
                 pb_stats = index_from_propbench(propbench_dir, store)
-                results.append({"source": "propbench", "status": "loaded", "patterns": pb_stats.get("indexed", 0)})
+                results.append({
+                    "source": "propbench",
+                    "status": "loaded",
+                    "entries_loaded": pb_stats.get("entries_loaded", 0),
+                    "patterns": pb_stats.get("examples_stored", 0),
+                })
+            else:
+                results.append({
+                    "source": "propbench",
+                    "status": "MISSING",
+                    "reason": (
+                        f"dataset not found at {propbench_dir} -- no PropBench "
+                        f"pattern has been loaded, so RAG retrieval cannot match. "
+                        f"Vendor the dataset or set RIPPLE_PROPBENCH_DIR."
+                    ),
+                })
         except Exception as e:
-            results.append({"source": "propbench", "status": "skipped", "reason": str(e)[:100]})
+            results.append({"source": "propbench", "status": "error", "reason": str(e)[:200]})
         
         # For each repo: scan merged PRs via GitHub API + index into RAG
         for repo in repos:

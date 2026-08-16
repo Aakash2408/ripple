@@ -142,17 +142,34 @@ uvicorn app.webhook:app --port 8000
 5. **PR** — Opens a pull request with the fix, confidence badge, and clear explanation
 6. **Visualize** — Maps your full dependency graph (`/graph` endpoint) in ASCII, Mermaid, or D3 format
 
-## It Learns Your Codebase
+## Learning — what is built, and what is actually running
 
-Ripple gets smarter the more you use it:
+Ripple has five learning channels in the codebase. **None of them is currently
+active in the hosted deployment**, so today every fix comes from the
+deterministic template layer. This section tracks the gap honestly rather than
+describing the design as though it were live.
 
-- **Co-change learning** — Scans git history on install. If two files always changed together, Ripple knows they're related.
-- **Consumer graph** — Builds a persistent map of which services depend on which APIs. Updates on every push.
-- **Multi-invoker detection** — Warns when a shared config/schema has multiple consumers (prevents the "I deleted a block and broke an unrelated service" problem).
-- **Pattern playbooks** — Knows that proto changes also affect `*_pb2.py`, `*.pb.go`, and test files.
-- **Custom playbooks** — Define your own patterns in `.ripple.yaml` (see below).
+| Channel | Built | Active in prod | Blocker |
+|---|---|---|---|
+| Co-change from git history | ✅ | ❌ | needs a local clone (`git -C <path> log`); the hosted server has none, and the graph is in-memory only |
+| Merged-PR pattern indexing | ✅ | ❌ | runs only on the `installation` webhook event, which does not re-fire for existing installs |
+| PropBench pattern pre-load | ✅ | ❌ | `propbench_data/` is not vendored here — the 882 entries live in the separate PropBench repo |
+| Consumer graph | ✅ | ⚠️ | rebuilt per run, not persisted (`/health/storage` reports `durable: false` until a volume is mounted) |
+| Multi-invoker detection | ✅ | ✅ | runs per-change, no stored state required |
 
-Result: 3x better consumer detection than grep alone.
+What this means in practice: the RAG retriever executes on every fix and
+correctly reports `No RAG pattern or cluster match` because its store is empty.
+That is the system being honest, not the system working. Fixes are labelled
+`[RAG/template]`, and the PR body attributes them to the template layer.
+
+Two things that **are** live and do improve detection over plain grep:
+
+- **Multi-invoker detection** — warns when a shared config or schema has several
+  consumers, which is the "I deleted a block and broke an unrelated service"
+  failure.
+- **Pattern playbooks** — proto changes also touch `*_pb2.py`, `*.pb.go`, and
+  test files; language-aware variant generation matches `phone_number`,
+  `phoneNumber`, and `PhoneNumber` rather than one casing.
 
 ## Change Impact Report
 
@@ -251,7 +268,10 @@ graph LR
   billing-service -->|GraphQL| reporting-dashboard
 ```
 
-The graph updates live as Ripple learns your codebase. Every push refines the consumer map.
+The graph is rebuilt from the current scan on every push. It is not yet
+persisted between runs — `/health/storage` reports `durable: false` until a
+volume is mounted — so it reflects the latest push rather than accumulated
+history.
 
 ## AI Confidence Badge
 
@@ -278,13 +298,19 @@ Badges appear in the PR title and body. CI/CD gates can be configured to only au
 
 ## Research: PropBench
 
-Ripple is backed by **PropBench** — a research benchmark proving that most "senior engineering judgment" in change propagation is actually learnable patterns:
+Ripple is backed by **PropBench** — a research benchmark for measuring
+engineering judgment in change propagation:
 
-- **268** real engineering changes from **24** repositories
+- **882** real engineering changes (640 open-source + 242 internal) from **50** repositories across **10** languages
 - **1,223** consequence files classified into **8** miss categories
-- **7%** file recall with naming only → **17%** with co-change learning → **82%** package recall with ensemble
+- Baseline recall on the benchmark: **7%** file recall from naming conventions alone → **17%** when co-change history is added → **82%** package recall with the full ensemble
 
 Key finding: **39%** of propagation targets are cross-package — invisible to any single-repo tool.
+
+Those recall figures are **results measured on the benchmark**, not a description
+of the hosted deployment. Ripple's co-change channel is built but not active in
+production (see [Learning](#learning--what-is-built-and-what-is-actually-running)),
+so the 17% figure is not what the live service currently delivers.
 
 Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](https://github.com/Aakash2408/Propbench)
 
@@ -301,7 +327,7 @@ Paper: [PropBench: A Benchmark for Engineering Judgment in Change Propagation](h
 | Monorepo support | ✅ | — | — | — |
 | Dep graph visualization | ✅ | — | — | — |
 | Contract types | 10 | 0 | 1 | 1 |
-| Learns from git history | ✅ | — | — | — |
+| Learns from git history | ⚠️ built, not yet active | — | — | — |
 | Change Impact Report | ✅ | — | — | — |
 | Platforms (7) | ✅ (GH+GL+BB+Phab+Gerrit+CRUX+Git) | GH only | GH only | GH only |
 | Self-hosted option | ✅ | — | — | — |
@@ -578,7 +604,9 @@ GET  /docs              — Swagger UI (auto-generated)
 
 ## Dashboard
 
-See what Ripple has learned about your org:
+See what Ripple has observed across your org (repos monitored, breaks detected,
+PRs opened, languages seen — from the current activity window, not accumulated
+history):
 
 ```
 GET /dashboard        — web UI (monitored repos, activity, stats)

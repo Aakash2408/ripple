@@ -198,9 +198,9 @@ function Index() {
         <Section
           id="intelligence"
           index="02"
-          eyebrow="It gets smarter"
-          title="Not just grep. It learns your codebase."
-          lead="Three independent learning channels combine into a persistent, repo-specific dependency map."
+          eyebrow="Beyond grep"
+          title="Not just grep. Language-aware, cross-repo."
+          lead="Language-aware variant matching, multi-invoker detection, and a consumer graph. The history-learning channels are built and benchmarked; they are not yet enabled on the hosted service."
         >
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {INTELLIGENCE.map((f) => (
