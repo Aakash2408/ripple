@@ -607,6 +607,19 @@ async def bitbucket_webhook(request: FastAPIRequest):
         # Find consumers and create PRs
         prs_created = []
         for change in breaking_changes:
+            # Wire-only breaks (proto field number / thrift field id) have no
+            # source-level fix, so searching consumers is a guaranteed no-op.
+            # Report and skip -- same rule as the GitHub path.
+            if is_wire_only(change.change_type):
+                _log_activity("wire_only_change", {
+                    "platform": "bitbucket",
+                    "spec": spec_path,
+                    "field": change.field_name,
+                    "change_type": change.change_type,
+                    "action": "no source fix exists -- consumers not searched",
+                })
+                continue
+
             consumers = client.search_code(event["workspace"], event["repo_slug"], change.path)
             for consumer in consumers[:5]:
                 consumer_path = consumer.get("path", "")
@@ -754,6 +767,17 @@ async def gitlab_webhook(request: FastAPIRequest):
         # Find consumers and create MRs
         mrs_created = []
         for change in breaking_changes:
+            # Wire-only breaks have no source-level fix -- see the GitHub path.
+            if is_wire_only(change.change_type):
+                _log_activity("wire_only_change", {
+                    "platform": "gitlab",
+                    "spec": spec_path,
+                    "field": change.field_name,
+                    "change_type": change.change_type,
+                    "action": "no source fix exists -- consumers not searched",
+                })
+                continue
+
             # Search for consumers in the same project
             consumers = client.search_code(event["project_id"], change.path)
             for consumer in consumers[:5]:

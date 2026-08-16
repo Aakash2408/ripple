@@ -1051,6 +1051,124 @@ def test_webhook_short_circuits_wire_only_before_consumer_search():
         "wire-only guard runs after the consumer search, wasting API calls"
 
 
+def test_rag_path_handles_every_change_type_without_crashing():
+    """Stages 2-4 verified the direct template path. RAG wraps it with its own
+    argument shuffling, so it needs its own coverage check."""
+    import tempfile
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        import importlib
+        from app import rag_store as rs
+        importlib.reload(rs)
+        from app import rag_retriever as rr
+        importlib.reload(rr)
+        from app.change_types import CHANGE_TYPE_MAP
+
+        go = "func f(c *C) error {\n\tr, err := c.DeleteUser(ctx)\n\treturn err\n}"
+        bad = []
+        for ct in sorted(CHANGE_TYPE_MAP):
+            for lang in ("go", "python"):
+                try:
+                    res = rr.generate_fix_rag(
+                        code=go, file_path="h.go", field_name="DeleteUser",
+                        change_type=ct, language=lang,
+                    )
+                    if ("Unknown change_type" in res.explanation
+                            or "Unclassified" in res.explanation):
+                        bad.append(f"{ct}/{lang}")
+                except Exception as e:
+                    bad.append(f"{ct}/{lang}: {type(e).__name__}")
+        assert not bad, f"RAG path failures: {bad[:8]}"
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+
+
+def test_ingest_skips_types_that_can_never_produce_a_fix():
+    """rag_engine's diff heuristic emits 'field_added' (an optional add is not
+    breaking) and 'modified' (unclassifiable). Storing those as fix patterns
+    lets them win a retrieval score against a real change and then produce
+    nothing."""
+    import tempfile
+    from dataclasses import dataclass
+
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        import importlib
+        from app import rag_store as rs
+        importlib.reload(rs)
+
+        @dataclass
+        class Ex:
+            change_type: str
+            language: str = "go"
+            field_name: str = "phone_number"
+            fix_file: str = "h.go"
+            repo_name: str = "o/r"
+            added_at: float = 0.0
+
+        store = rs.PatternStore("t")
+        store.load()
+        stats = store.ingest_examples([
+            Ex("field_removed"),               # fixable
+            Ex("rpc_removed"),                 # fixable (judgment)
+            Ex("field_added"),                 # non-breaking -> skip
+            Ex("field_number_changed"),        # wire-only -> skip
+            Ex("modified"),                    # unclassified -> skip
+        ])
+        assert stats["added"] == 2, stats
+        assert stats["skipped_unfixable"] == 3, stats
+        assert stats["skipped_reasons"].get("wire_only") == 1, stats
+        assert stats["skipped_reasons"].get("non_breaking") == 1, stats
+        assert stats["skipped_reasons"].get("unclassified") == 1, stats
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+
+
+def test_all_webhook_paths_guard_wire_only():
+    """The guard was initially only on the GitHub path, so GitLab and
+    Bitbucket would search every consumer for a break that has no source fix
+    -- hundreds of API calls to reach a guaranteed no-op."""
+    import re as _re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, "app", "webhook.py")).read().split("\n")
+
+    loops = [i for i, l in enumerate(lines)
+             if "for change in breaking_changes:" in l]
+    assert len(loops) >= 3, f"expected 3 per-change loops, found {len(loops)}"
+
+    unguarded = []
+    for i in loops:
+        window = "\n".join(lines[i:i + 16])
+        if "is_wire_only" not in window:
+            fn = "?"
+            for j in range(i, 0, -1):
+                m = _re.match(r"(?:async )?def (\w+)", lines[j])
+                if m:
+                    fn = m.group(1)
+                    break
+            unguarded.append(fn)
+    assert not unguarded, f"platform paths missing the wire-only guard: {unguarded}"
+
+
+def test_is_fixable_separates_all_four_categories():
+    from app.change_types import is_fixable, category
+
+    assert is_fixable("field_removed")          # mechanical
+    assert is_fixable("rpc_removed")            # judgment
+    assert not is_fixable("field_number_changed")   # wire_only
+    assert not is_fixable("field_added")            # non_breaking
+    assert not is_fixable("modified")               # unclassified
+    assert category("field_added") == "non_breaking"
+
+
 # ===================================================================
 # runner (works without pytest)
 # ===================================================================

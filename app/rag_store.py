@@ -178,19 +178,37 @@ class PatternStore:
             self.patterns.append(pattern)
             return pattern.pattern_id
 
-    def ingest_examples(self, examples) -> int:
+    def ingest_examples(self, examples) -> dict:
         """Fold rag_engine FixExamples into aggregated FixPatterns.
 
         This is the connection between indexing and retrieval. Without it the
         indexed PropBench corpus and scanned merged PRs sit in a store that
         retrieval never reads.
+
+        Examples whose change_type can never produce a fix are SKIPPED rather
+        than stored: rag_engine's diff heuristic emits 'field_added' (adding an
+        optional field is not breaking) and 'modified' (unclassifiable), and
+        wire-only breaks have no source fix. Storing those would let them win a
+        retrieval score against a real change and then produce nothing.
+
+        Returns counts so the filtering is visible instead of silent.
         """
-        added = 0
+        from .change_types import is_fixable, category as _category
+
+        stats = {"added": 0, "skipped_unfixable": 0, "skipped_incomplete": 0,
+                 "skipped_reasons": {}}
         for ex in examples or []:
             change_type = getattr(ex, "change_type", "") or ""
             language = getattr(ex, "language", "") or ""
             field_name = getattr(ex, "field_name", "") or ""
             if not change_type or not language:
+                stats["skipped_incomplete"] += 1
+                continue
+            if not is_fixable(change_type):
+                stats["skipped_unfixable"] += 1
+                reason = _category(change_type) or "unclassified"
+                stats["skipped_reasons"][reason] = \
+                    stats["skipped_reasons"].get(reason, 0) + 1
                 continue
             pid = self.make_pattern_id(change_type, language, field_name)
             self.add_pattern(FixPattern(
@@ -204,9 +222,9 @@ class PatternStore:
                 last_used=getattr(ex, "added_at", 0.0) or 0.0,
                 example_count=1,
             ))
-            added += 1
+            stats["added"] += 1
         self._rebuild_clusters()
-        return added
+        return stats
 
     def _rebuild_clusters(self) -> None:
         """Derive cluster archetypes from the current patterns."""

@@ -40,6 +40,7 @@ JUDGMENT     A partial mechanical fix is possible but completing it changes
 MECHANICAL = "mechanical"
 WIRE_ONLY = "wire_only"
 JUDGMENT = "judgment"
+NON_BREAKING = "non_breaking"
 
 
 # canonical operation -> (category, human description)
@@ -54,6 +55,11 @@ CANONICAL_OPS = {
     "add_required": (JUDGMENT, "a required field/argument/header was added"),
     "restrict_schema": (JUDGMENT, "schema was narrowed (signature, additionalProperties)"),
     "wire_incompatible": (WIRE_ONLY, "field number/id changed -- wire break, no source fix"),
+    # Adding an OPTIONAL field breaks nothing: existing consumers keep
+    # compiling and keep deserializing. rag_engine's diff heuristic emits
+    # 'field_added' for these, and storing them as fix patterns would pollute
+    # the RAG store with entries that can never produce a fix.
+    "add_optional": (NON_BREAKING, "an optional field was added -- not a breaking change"),
 }
 
 
@@ -127,6 +133,15 @@ CHANGE_TYPE_MAP = {
     # --- wire-only -------------------------------------------------------
     "field_number_changed": "wire_incompatible",   # proto
     "field_id_changed": "wire_incompatible",       # thrift
+
+    # --- emitted by rag_engine's diff heuristic during PropBench/git
+    #     indexing, not by the diff engines ---------------------------------
+    "field_added": "add_optional",                 # optional add: not breaking
+    # NOTE: rag_engine also emits 'modified', deliberately left UNMAPPED.
+    # It means "the diff changed something we could not classify", which is
+    # genuinely unknown -- mapping it to an operation would invent a fix
+    # strategy for an unidentified change. ingest_examples() filters it out
+    # and reports the count instead of silently storing an unusable pattern.
 }
 
 
@@ -203,3 +218,14 @@ def is_wire_only(change_type: str) -> bool:
 def is_judgment(change_type: str) -> bool:
     """True when a fix needs a human decision (partial fix + marker)."""
     return category(change_type) == JUDGMENT
+
+
+def is_fixable(change_type: str) -> bool:
+    """True when a fix pattern for this type could ever produce a change.
+
+    Used to filter the RAG store at ingest. Storing patterns for types that
+    can never yield a fix -- wire-only breaks, non-breaking additions, or
+    unclassified diffs -- pollutes retrieval: they would be scored against
+    real changes and could win, then produce nothing.
+    """
+    return category(change_type) in (MECHANICAL, JUDGMENT)
