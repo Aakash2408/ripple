@@ -509,6 +509,96 @@ def _remove_enum_value(code: str, variants: dict, lang: str) -> str:
     return _apply_patterns(code, patterns, names)
 
 
+# ---------------------------------------------------------------------------
+# JUDGMENT operations
+#
+# These CANNOT be completed mechanically without changing behaviour:
+#   remove_operation  deleting a call site removes functionality
+#   add_required      inventing a value for a new required field is a guess
+#   restrict_schema   narrowing a signature needs a semantic decision
+#
+# But leaving the code untouched is not acceptable either: fixed_code ==
+# content means no PR opens, so a detected breaking change produces silence --
+# the exact failure this whole plan exists to remove.
+#
+# So: annotate every affected site with a precise, greppable marker and let
+# find_residual_references flag the rest. The diff is non-empty (a PR opens),
+# points at exact lines, and never pretends to be a finished fix.
+# ---------------------------------------------------------------------------
+
+_LINE_COMMENT = {
+    'go': '//', 'typescript': '//', 'javascript': '//', 'java': '//',
+    'rust': '//', 'kotlin': '//', 'csharp': '//', 'c#': '//',
+    'swift': '//', 'scala': '//', 'dart': '//', 'php': '//',
+    'python': '#', 'ruby': '#', 'shell': '#', 'yaml': '#',
+}
+
+MARKER = 'RIPPLE-ACTION-REQUIRED'
+
+
+def _comment_token(lang: str) -> str:
+    return _LINE_COMMENT.get(lang, '#')
+
+
+def _matches_symbol(line: str, names: set) -> bool:
+    """Symbol match where '_' counts as a boundary (Status_LEGACY, get_user)."""
+    return any(
+        re.search(rf'(?<![A-Za-z0-9]){re.escape(n)}(?![A-Za-z0-9])', line)
+        for n in names
+    )
+
+
+def _annotate_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:
+    """Insert a marker comment above each line referencing the symbol.
+
+    Returns (annotated_code, sites_annotated). Skips lines that are already
+    comments, and never annotates the same line twice.
+    """
+    token = _comment_token(lang)
+    out = []
+    count = 0
+    prev_was_marker = False
+    for line in code.split('\n'):
+        stripped = line.strip()
+        is_comment = stripped.startswith(token) or stripped.startswith('*')
+        if (not is_comment and stripped and _matches_symbol(line, names)
+                and not prev_was_marker):
+            indent = line[:len(line) - len(line.lstrip())]
+            out.append(f"{indent}{token} {MARKER}: {note}")
+            count += 1
+        out.append(line)
+        prev_was_marker = MARKER in line
+    return '\n'.join(out), count
+
+
+def _comment_out_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:
+    """Comment OUT lines referencing the symbol, with a marker above.
+
+    Used only for remove_operation: the call target no longer exists, so the
+    line cannot compile as written. Commenting it out keeps the original
+    visible in the diff, whereas deleting it would hide that functionality was
+    dropped.
+
+    This does NOT guarantee a compiling file -- commenting out an assignment
+    can leave dependent statements referencing undefined variables. Resolving
+    that is the human decision the marker exists to prompt.
+    """
+    token = _comment_token(lang)
+    out = []
+    count = 0
+    for line in code.split('\n'):
+        stripped = line.strip()
+        is_comment = stripped.startswith(token) or stripped.startswith('*')
+        if not is_comment and stripped and _matches_symbol(line, names):
+            indent = line[:len(line) - len(line.lstrip())]
+            out.append(f"{indent}{token} {MARKER}: {note}")
+            out.append(f"{indent}{token} {stripped}")
+            count += 1
+            continue
+        out.append(line)
+    return '\n'.join(out), count
+
+
 # --- Main entry point ---
 
 def apply_fix_template(
@@ -630,6 +720,63 @@ def apply_fix_template(
         explanation = (
             f"Renamed type '{field_name}' -> '{new_name}' across all case "
             f"variants. {replacements} replacements made."
+        )
+        return result, explanation
+
+    elif op == 'remove_operation':
+        # The rpc/method/endpoint no longer exists, so the call site cannot
+        # compile as written. Comment it out rather than delete it: deleting
+        # would hide that functionality was dropped, and commenting keeps the
+        # original line visible in the diff for whoever decides the fix.
+        note = (f"'{field_name}' was removed from the contract. This call is "
+                f"commented out -- restore an equivalent or delete deliberately.")
+        result, sites = _comment_out_sites(code, _symbol_names(variants), lang, note)
+        explanation = (
+            f"PARTIAL: '{field_name}' was removed from the service contract. "
+            f"Commented out {sites} call site(s) and marked each with {MARKER}. "
+            f"NOTE: this file may still not compile -- commenting out an "
+            f"assignment can leave dependent statements referencing undefined "
+            f"variables. Removing an operation drops functionality, so the "
+            f"replacement is a human decision and Ripple deliberately did not "
+            f"choose one."
+        )
+        return result, explanation
+
+    elif op == 'add_required':
+        # Deliberately does NOT invent a value. Guessing a required field's
+        # value is a silent behaviour change and the most likely way to ship a
+        # confidently wrong fix.
+        note = (f"required field '{field_name}' was added to the contract -- "
+                f"supply a value at this construction site.")
+        result, sites = _annotate_sites(code, _symbol_names(variants), lang, note)
+        if sites == 0:
+            token = _comment_token(lang)
+            result = (f"{token} {MARKER}: required field '{field_name}' added "
+                      f"to the contract; no construction site detected in this "
+                      f"file -- verify manually.\n" + code)
+            sites = 1
+        explanation = (
+            f"PARTIAL: required field '{field_name}' was added. Marked "
+            f"{sites} site(s) with {MARKER}. Ripple did NOT invent a value: "
+            f"choosing one silently changes behaviour, so the value is left to "
+            f"a human."
+        )
+        return result, explanation
+
+    elif op == 'restrict_schema':
+        note = (f"schema for '{field_name}' was narrowed (signature/type/"
+                f"additionalProperties) -- verify this call still satisfies it.")
+        result, sites = _annotate_sites(code, _symbol_names(variants), lang, note)
+        if sites == 0:
+            token = _comment_token(lang)
+            result = (f"{token} {MARKER}: schema for '{field_name}' was "
+                      f"narrowed; no direct reference found in this file -- "
+                      f"verify manually.\n" + code)
+            sites = 1
+        explanation = (
+            f"PARTIAL: the schema for '{field_name}' was narrowed. Marked "
+            f"{sites} site(s) with {MARKER}. Reconciling a narrowed schema "
+            f"requires a semantic decision Ripple cannot make safely."
         )
         return result, explanation
 

@@ -870,6 +870,132 @@ def test_rag_fallback_to_template_is_not_labelled_as_rag():
 
 
 # ===================================================================
+# CLASS 10: CHANGE TYPE COVERAGE -- detection must not outrun fixing
+# ===================================================================
+
+def test_every_emitted_change_type_is_classified():
+    """An unclassified change_type reaches fix_templates as 'Unknown
+    change_type', leaves the code unchanged, and therefore opens NO PR --
+    Ripple detects a breaking change and silently does nothing."""
+    from app.change_types import canonical_op
+    import ast as _ast
+    import glob as _glob
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    emitted = set()
+    paths = sorted(_glob.glob(os.path.join(root, "app", "*diff*.py")))
+    paths.append(os.path.join(root, "app", "diff_engine.py"))
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        for node in _ast.walk(_ast.parse(open(path).read())):
+            if not isinstance(node, _ast.Call):
+                continue
+            for kw in node.keywords:
+                if (kw.arg == "change_type"
+                        and isinstance(kw.value, _ast.Constant)
+                        and isinstance(kw.value.value, str)):
+                    emitted.add(kw.value.value)
+            if getattr(node.func, "id", "") == "_bc" and node.args:
+                a = node.args[0]
+                if isinstance(a, _ast.Constant) and isinstance(a.value, str):
+                    emitted.add(a.value)
+
+    unclassified = [ct for ct in sorted(emitted) if not canonical_op(ct)]
+    assert not unclassified, f"unclassified change types: {unclassified}"
+    assert len(emitted) >= 40, f"expected ~47 emitted types, found {len(emitted)}"
+
+
+def test_no_change_type_returns_unknown_from_templates():
+    """Every emitted type must reach a handler in fix_templates."""
+    from app.change_types import CHANGE_TYPE_MAP
+    from app.fix_templates import apply_fix_template
+
+    escapes = []
+    for ct in sorted(CHANGE_TYPE_MAP):
+        for lang in ("go", "typescript", "python", "java"):
+            _, expl = apply_fix_template(
+                "x = 1", lang, ct, "Thing",
+                new_name="Other", old_type="A", new_type="B",
+            )
+            if "Unknown change_type" in expl or "Unclassified" in expl:
+                escapes.append(f"{ct}/{lang}")
+    assert not escapes, f"unknown-type escapes: {escapes[:8]}"
+
+
+def test_judgment_types_produce_a_non_empty_marked_diff():
+    """A judgment type that returns the code unchanged opens no PR, which is
+    the silence this work exists to remove. Each must produce a marked diff."""
+    from app.change_types import CHANGE_TYPE_MAP, category
+    from app.fix_templates import apply_fix_template, MARKER
+
+    code = "func f(c *Client) error {\n\tr, err := c.svc.DeleteUser(ctx)\n\treturn err\n}"
+    empty = []
+    for ct in sorted(CHANGE_TYPE_MAP):
+        if category(ct) != "judgment":
+            continue
+        fixed, _ = apply_fix_template(code, "go", ct, "DeleteUser")
+        if fixed == code or MARKER not in fixed:
+            empty.append(ct)
+    assert not empty, f"judgment types producing no marked diff: {empty}"
+
+
+def test_add_required_never_invents_a_value():
+    """Guessing a required field's value is a silent behaviour change and the
+    most likely way to ship a confidently wrong fix."""
+    from app.fix_templates import apply_fix_template, MARKER
+
+    py = "def create(name, email):\n    return User(name=name, email=email)"
+    fixed, expl = apply_fix_template(py, "python", "required_field_added", "country")
+    body = "\n".join(l for l in fixed.splitlines() if MARKER not in l)
+    assert "country=" not in body, "invented a value for the new required field"
+    assert "country" not in body, "leaked the field name into code"
+    import ast as _ast
+    _ast.parse(fixed)  # annotation must not break the file
+
+
+def test_remove_operation_comments_out_rather_than_deletes():
+    """Deleting the call would hide that functionality was dropped; the
+    original line must stay visible in the diff."""
+    from app.fix_templates import apply_fix_template, MARKER
+
+    go = "func f(c *Client) error {\n\tr, err := c.svc.DeleteUser(ctx)\n\treturn err\n}"
+    fixed, expl = apply_fix_template(go, "go", "rpc_removed", "DeleteUser")
+    assert MARKER in fixed
+    assert "// \tr, err := c.svc.DeleteUser(ctx)" in fixed or \
+           "// r, err := c.svc.DeleteUser(ctx)" in fixed, \
+           "original call line was deleted instead of commented"
+    # Must NOT claim the file compiles -- commenting an assignment can leave
+    # dependents referencing undefined variables.
+    assert "so the file compiles" not in expl, "false compile claim in explanation"
+    assert "may still not compile" in expl, "missing the honest caveat"
+
+
+def test_case_arm_removal_does_not_orphan_the_body():
+    """Removing only 'case X:' leaves its statements dangling in the switch,
+    which does not compile."""
+    from app.fix_templates import apply_fix_template
+
+    go = ("switch s {\ncase userpb.Status_LEGACY:\n\treturn 1\n"
+          "case userpb.Status_ACTIVE:\n\treturn 2\n}")
+    fixed, _ = apply_fix_template(go, "go", "enum_value_removed", "LEGACY")
+    assert "LEGACY" not in fixed
+    assert "return 1" not in fixed, "arm body was orphaned"
+    assert "Status_ACTIVE" in fixed and "return 2" in fixed, "wrong arm removed"
+
+
+def test_enum_arm_matching_treats_underscore_as_a_boundary():
+    """Go protobuf enums render as Status_LEGACY, and \\bLEGACY\\b does NOT
+    match there because '_' is a word character -- the same underscore trap
+    that made consumer confidence non-deterministic."""
+    from app.fix_templates import apply_fix_template
+
+    go = "switch s {\ncase userpb.Status_LEGACY:\n\treturn 1\n}"
+    fixed, _ = apply_fix_template(go, "go", "enum_value_removed", "LEGACY")
+    assert "Status_LEGACY" not in fixed, "underscore-prefixed enum not matched"
+
+
+# ===================================================================
 # runner (works without pytest)
 # ===================================================================
 
