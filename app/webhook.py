@@ -214,6 +214,56 @@ async def health():
     return {"healthy": True}
 
 
+@app.get("/health/storage")
+async def health_storage():
+    """Report where state is stored and whether it is DURABLE.
+
+    Railway container filesystems are ephemeral unless a volume is mounted,
+    so activity/tokens written to /app/data survive restarts but are lost on
+    every redeploy. That is exactly what erased the successful 08:49 run
+    before it could be inspected.
+
+    Rather than leaving that as an assumption, this reports it: `durable`
+    is true only when the resolved directory is a real mount point (a
+    Railway volume) rather than container-local scratch.
+    """
+    from . import activity as _act
+    from .tls import describe as _tls_describe
+
+    store_dir = str(_act._store_dir())
+    path = _act._store_path()
+
+    # A mounted volume shows up as a distinct device from the container root.
+    durable = False
+    reason = "container-local (lost on redeploy)"
+    try:
+        if os.path.ismount(store_dir):
+            durable, reason = True, "volume mount detected"
+        else:
+            root_dev = os.stat("/").st_dev
+            if os.stat(store_dir).st_dev != root_dev:
+                durable, reason = True, "separate device (volume)"
+    except OSError as e:
+        reason = f"could not determine: {type(e).__name__}"
+
+    return {
+        "healthy": True,
+        "storage": {
+            "dir": store_dir,
+            "activity_file": str(path),
+            "activity_exists": path.exists(),
+            "event_count": len(_act.all_events()),
+            "durable": durable,
+            "durability_reason": reason,
+            "hint": None if durable else (
+                "Mount a Railway volume at /app/data (or set RIPPLE_DATA_DIR "
+                "to a mounted path) so activity and tokens survive redeploys."
+            ),
+        },
+        "tls": _tls_describe(),
+    }
+
+
 @app.get("/logs/recent")
 async def recent_logs():
     """Return recent activity log for debugging (last 50 events)."""
@@ -1151,8 +1201,17 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                                 labels=[LABEL_AUTO_FIX, LABEL_PENDING],
                             )
                             track_fix_pr(source, fix)
-                        except Exception:
-                            pass  # lifecycle tracking is optional
+                        except Exception as e:
+                            # Lifecycle tracking is optional, but it must not
+                            # be INVISIBLE: an undefined `event` reference
+                            # lived in this exact block for weeks, so the
+                            # pending -> merged -> reverted state machine had
+                            # never once run and nothing reported it.
+                            _log_activity("lifecycle_tracking_failed", {
+                                "repo": consumer_repo,
+                                "pr": pr_url,
+                                "err": f"{type(e).__name__}: {str(e)[:160]}",
+                            })
     
     # Update consumer graph with observations
     graph = get_graph(org)
@@ -1535,8 +1594,17 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
         
         if result and result.fixed_code != content:
             return result.fixed_code, f"[RAG/{result.source_type}] {result.explanation}"
-    except Exception:
-        pass  # RAG unavailable or failed — fall through to templates
+    except Exception as e:
+        # RAG is layers 1-2 of a 4-layer fix stack (~1000 lines across
+        # rag_engine.py + rag_retriever.py). Swallowing this silently meant
+        # the entire retrieval subsystem could be broken while the pipeline
+        # looked healthy -- every PR would just say [template] and nobody
+        # would know the learned-pattern path had stopped working.
+        _log_activity("rag_unavailable", {
+            "file": getattr(consumer, "file_path", ""),
+            "err": f"{type(e).__name__}: {str(e)[:160]}",
+            "falling_back_to": "template",
+        })
     
     # Fallback to template engine
     fixed_code, explanation = _generate_with_template(content, consumer, change)
@@ -1655,7 +1723,17 @@ def _fetch_gitlab_merged_mrs(repo: str, token: str, max_prs: int) -> list[dict]:
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             mrs_data = json.loads(resp.read().decode())
-    except Exception:
+    except Exception as e:
+        # Install-time indexing feeds the RAG store. Silent failure here
+        # meant Ripple learned nothing from this repo's merged PRs and
+        # reported no reason -- fixes would silently fall back to templates
+        # forever.
+        _log_activity("pr_index_fetch_failed", {
+            "repo": repo,
+            "platform": "gitlab",
+            "err": f"{type(e).__name__}: {str(e)[:140]}",
+            "impact": "RAG learns nothing from this repo",
+        })
         return []
     
     for mr in mrs_data[:max_prs]:
@@ -1668,7 +1746,11 @@ def _fetch_gitlab_merged_mrs(repo: str, token: str, max_prs: int) -> list[dict]:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 changes_data = json.loads(resp.read().decode())
             files = [c["new_path"] for c in changes_data.get("changes", [])]
-        except Exception:
+        except Exception as e:
+            _log_activity("pr_index_files_failed", {
+                "repo": repo, "platform": "gitlab",
+                "err": f"{type(e).__name__}: {str(e)[:120]}",
+            })
             files = []
         
         prs.append({
@@ -1693,7 +1775,12 @@ def _fetch_bitbucket_merged_prs(repo: str, token: str, max_prs: int) -> list[dic
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-    except Exception:
+    except Exception as e:
+        _log_activity("pr_index_fetch_failed", {
+            "repo": repo, "platform": "bitbucket",
+            "err": f"{type(e).__name__}: {str(e)[:140]}",
+            "impact": "RAG learns nothing from this repo",
+        })
         return []
     
     for pr_data in data.get("values", [])[:max_prs]:
@@ -1706,7 +1793,11 @@ def _fetch_bitbucket_merged_prs(repo: str, token: str, max_prs: int) -> list[dic
             with urllib.request.urlopen(req, timeout=30) as resp:
                 diff_data = json.loads(resp.read().decode())
             files = [d.get("new", {}).get("path", "") for d in diff_data.get("values", [])]
-        except Exception:
+        except Exception as e:
+            _log_activity("pr_index_files_failed", {
+                "repo": repo, "platform": "bitbucket",
+                "err": f"{type(e).__name__}: {str(e)[:120]}",
+            })
             files = []
         
         prs.append({
@@ -1742,8 +1833,11 @@ def _fetch_git_log_prs(repo_path: str, max_prs: int) -> list[dict]:
         
         if current_pr:
             prs.append(current_pr)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_activity("pr_index_gitlog_failed", {
+            "repo": repo_path,
+            "err": f"{type(e).__name__}: {str(e)[:140]}",
+        })
     
     return prs[:max_prs]
 

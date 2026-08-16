@@ -1,0 +1,51 @@
+name: checks
+
+# Every fix from 2026-08-16 is pinned by a test in tests/test_regression.py.
+# Without CI those tests only run when someone remembers to invoke them, so
+# nothing prevents a regression -- which matters here because most of the
+# bugs were SILENT (a value computed then discarded, a function defined and
+# never called) and would not surface until a customer noticed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches the Railway runtime
+
+      - name: Install runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          # Only what the tests actually import. sentence-transformers and
+          # chromadb are heavy and the RAG paths degrade gracefully without
+          # them, so they are intentionally excluded from CI.
+          pip install pyyaml cryptography certifi
+
+      - name: Undefined-name check
+        # ast.parse only validates SYNTAX. A NameError from an aliased import
+        # (`import time as _time` then `time.sleep()`) only fails at runtime,
+        # which is how it reached production once already.
+        run: python tools/check_names.py app/*.py
+
+      - name: Regression suite
+        run: python tests/test_regression.py
+
+      - name: Diff-engine audit
+        # Fails if any engine regains a non-nesting block regex or loses
+        # comment stripping.
+        run: python tools/audit_diff_engines.py
+
+      - name: Fail-silent audit (report only)
+        # Not gating yet: 51 sites remain, many legitimately silent. Printed
+        # so the number is visible in every build and can be ratcheted down.
+        continue-on-error: true
+        run: python tools/audit_fail_silent.py
