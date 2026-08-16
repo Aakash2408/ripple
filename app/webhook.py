@@ -2327,12 +2327,25 @@ def _create_fix_pr(
         # A Ripple PR for this same field can already be open -- either the
         # customer re-pushed the same change, or a prior run created it.
         # GitHub returns 422 here. The fix commit was already pushed to the
-        # branch above, so that PR is now up to date: return it instead of
-        # reporting failure and producing nothing.
+        # branch above, so return that PR instead of reporting failure and
+        # producing nothing -- but its DESCRIPTION is now stale, so refresh it
+        # below rather than assuming the PR is up to date.
         existing = _find_open_pr_for_branch(repo, branch, default_branch, token)
         if existing:
+            # The branch now carries a NEW commit, so the existing PR's body
+            # describes a fix that is no longer what is proposed -- a stale
+            # impact report, confidence table and footer. Refresh them, or the
+            # PR silently misdescribes its own diff.
+            pr_number = existing.rstrip("/").rsplit("/", 1)[-1]
+            patched = _github_api(
+                "PATCH", f"/repos/{repo}/pulls/{pr_number}", token,
+                {"title": commit_msg, "body": pr_body},
+            )
+            body_refreshed = not (isinstance(patched, dict) and "error" in patched)
             _log_activity("pr_updated_existing", {
                 "repo": repo, "branch": branch, "url": existing,
+                "body_refreshed": body_refreshed,
+                **({} if body_refreshed else {"patch_err": str(patched)[:150]}),
             })
             return existing
         _log_activity("pr_error", {"step": "open_pr", "repo": repo, "branch": branch, "err": str(pr_data)[:150]})
