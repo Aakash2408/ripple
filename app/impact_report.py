@@ -121,7 +121,7 @@ def generate_impact_report(
     source_file: str,
     fixed_files: list[dict],
     scanned_files: list[dict],
-    repo_files: list[str] = None
+    repo_files: list[str] = None,
 ) -> ImpactReport:
     """
     Generate an impact report from fix results and repo scan.
@@ -138,7 +138,7 @@ def generate_impact_report(
     """
     report = ImpactReport(
         breaking_change_summary=breaking_change_summary,
-        source_file=source_file
+        source_file=source_file,
     )
     
     # Add fixed items
@@ -148,7 +148,7 @@ def generate_impact_report(
             category=_classify_file(f["file_path"]),
             action=Action.FIXED,
             reason=f.get("reason", "Removed broken reference"),
-            line_numbers=f.get("line_numbers")
+            line_numbers=f.get("line_numbers"),
         ))
     
     # Add scanned/left-alone items
@@ -159,7 +159,7 @@ def generate_impact_report(
             category=Category(s.get("category", _classify_file(s["file_path"]).value)),
             action=action,
             reason=s.get("reason", "No breaking reference found"),
-            line_numbers=s.get("line_refs", None)
+            line_numbers=s.get("line_refs", None),
         ))
     
     # If repo files provided, check for docs/examples/tests not yet scanned
@@ -175,7 +175,7 @@ def generate_impact_report(
                     file_path=f,
                     category=cat,
                     action=Action.NEEDS_MANUAL,
-                    reason="Not scanned — may reference changed entity"
+                    reason="Not scanned — may reference changed entity",
                 ))
     
     return report
@@ -183,7 +183,7 @@ def generate_impact_report(
 def classify_consumer_files(
     consumer_files: list[str],
     changed_field: str,
-    file_contents: dict[str, str] = None
+    file_contents: dict[str, str] = None,
 ) -> list[dict]:
     """
     Classify consumer files as safe-to-leave or needs-manual-review.
@@ -209,7 +209,7 @@ def classify_consumer_files(
                 "file_path": file_path,
                 "category": cat.value,
                 "action": "left",
-                "reason": f"No reference to `{changed_field}` found"
+                "reason": f"No reference to `{changed_field}` found",
             })
         elif cat == Category.TEST:
             ref_str = _format_line_refs(line_refs)
@@ -218,7 +218,7 @@ def classify_consumer_files(
                 "category": cat.value,
                 "action": "left",
                 "reason": f"Test references `{changed_field}` but still passes (field was optional)",
-                "line_refs": ref_str
+                "line_refs": ref_str,
             })
         elif cat == Category.DOCS:
             ref_str = _format_line_refs(line_refs)
@@ -227,7 +227,7 @@ def classify_consumer_files(
                 "category": cat.value,
                 "action": "manual",
                 "reason": f"Documentation mentions `{changed_field}` — update recommended",
-                "line_refs": ref_str
+                "line_refs": ref_str,
             })
         elif cat == Category.EXAMPLE:
             ref_str = _format_line_refs(line_refs)
@@ -236,7 +236,7 @@ def classify_consumer_files(
                 "category": cat.value,
                 "action": "manual",
                 "reason": f"Example uses `{changed_field}` — may confuse new users",
-                "line_refs": ref_str
+                "line_refs": ref_str,
             })
         else:
             ref_str = _format_line_refs(line_refs)
@@ -245,7 +245,7 @@ def classify_consumer_files(
                 "category": cat.value,
                 "action": "manual",
                 "reason": f"References `{changed_field}` — review needed",
-                "line_refs": ref_str
+                "line_refs": ref_str,
             })
     
     return results
@@ -274,7 +274,7 @@ def scan_file_for_references(content: str, field_name: str, max_refs: int = 5) -
                 refs.append({
                     "line_number": i,
                     "line_content": line.strip()[:80],  # Truncate long lines
-                    "match": variant
+                    "match": variant,
                 })
                 break  # Only one match per line
         
@@ -369,5 +369,5 @@ def _category_emoji(cat: Category) -> str:
         Category.TEST: "🧪",
         Category.DOCS: "📝",
         Category.EXAMPLE: "📖",
-        Category.CONFIG: "⚙️"
+        Category.CONFIG: "⚙️",
     }.get(cat, "📄")
