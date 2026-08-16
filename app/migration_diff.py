@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .diff_engine import BreakingChange
+from .schema_parse import strip_comments, extract_blocks
 
 
 @dataclass
@@ -105,15 +106,13 @@ def parse_prisma_schema(content: str) -> dict[str, Table]:
     """
     tables = {}
     
-    model_pattern = re.compile(
-        r'model\s+(\w+)\s*\{([^}]+)\}',
-        re.DOTALL
-    )
+    # schema_parse: brace-aware extraction plus comment stripping, matching
+    # the other engines. Prisma models cannot nest today, so the old
+    # r'\{([^}]+)\}' happened to work -- but it was the same latent hazard,
+    # and consistency means one parsing primitive across all engines.
+    clean = strip_comments(content, hash_comments=False)
     
-    for match in model_pattern.finditer(content):
-        model_name = match.group(1)
-        body = match.group(2)
-        
+    for model_name, body in extract_blocks(clean, 'model'):
         columns = {}
         for line in body.strip().split('\n'):
             line = line.strip()

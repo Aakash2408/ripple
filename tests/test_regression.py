@@ -619,17 +619,43 @@ def test_ported_engines_still_detect_real_removals():
 
 
 def test_no_engine_uses_the_non_nesting_regex():
-    """The [^}]* pattern must not come back in any diff engine."""
+    """The [^}]* pattern must not come back in any diff engine.
+
+    Uses AST rather than line matching so the docstrings that *explain* the
+    old pattern are not mistaken for live code -- a line-based check flagged
+    three explanatory comments as violations.
+
+    Any standalone string EXPRESSION is treated as documentation. That is
+    broader than "docstring" on purpose: proto_diff.py opens with
+    `from __future__ import annotations`, so its module docstring is not
+    body[0] and Python does not classify it as a docstring at all.
+    """
+    import ast
     import glob
     import os
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     offenders = []
+
     for path in glob.glob(os.path.join(root, "app", "*diff*.py")):
-        for i, line in enumerate(open(path).read().splitlines(), 1):
-            stripped = line.strip()
-            if "[^}]" in line and not stripped.startswith("#"):
-                offenders.append(f"{os.path.basename(path)}:{i}")
-    assert not offenders, f"non-nesting block regex reintroduced: {offenders}"
+        tree = ast.parse(open(path).read())
+
+        # Any bare string statement is prose, not a regex
+        documentation = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Expr)
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)):
+                documentation.add(id(node.value))
+
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and id(node) not in documentation
+                    and "[^}]" in node.value):
+                offenders.append(f"{os.path.basename(path)}:{node.lineno}")
+
+    assert not offenders, f"non-nesting block regex in live code: {offenders}"
 
 
 # ===================================================================
