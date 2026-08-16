@@ -295,6 +295,128 @@ def test_extract_blocks_ignores_braces_in_strings():
 
 
 # ===================================================================
+# CLASS 5: AUTH / SCOPE -- the band-aids must stay deleted
+# ===================================================================
+
+def test_app_jwt_is_valid_rs256_within_github_limits():
+    """A malformed App JWT means every installation token exchange fails,
+    which surfaces later as 'no consumers found'."""
+    import base64
+    import json as _json
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from app import github_app_auth as gaa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+    token = gaa.build_app_jwt(app_id="42", private_key_pem=pem)
+    header_b64, payload_b64, sig_b64 = token.split(".")
+
+    def _d(part):
+        return _json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+
+    assert _d(header_b64)["alg"] == "RS256"
+    payload = _d(payload_b64)
+    assert payload["iss"] == "42"
+    assert payload["exp"] - payload["iat"] <= 600, "GitHub caps App JWT at 10 min"
+
+    sig = base64.urlsafe_b64decode(sig_b64 + "=" * (-len(sig_b64) % 4))
+    key.public_key().verify(
+        sig, f"{header_b64}.{payload_b64}".encode(),
+        padding.PKCS1v15(), hashes.SHA256(),
+    )  # raises on invalid signature
+
+
+def test_private_key_accepts_escaped_newline_pem():
+    """Railway and most env-var stores carry PEMs with literal \\n."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from app import github_app_auth as gaa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+    old = os.environ.get("GITHUB_APP_PRIVATE_KEY")
+    try:
+        os.environ["GITHUB_APP_PRIVATE_KEY"] = pem.replace("\n", "\\n")
+        loaded = gaa.get_private_key()
+        assert "-----BEGIN" in loaded and "\n" in loaded
+        gaa.build_app_jwt(app_id="1", private_key_pem=loaded)
+    finally:
+        if old is None:
+            os.environ.pop("GITHUB_APP_PRIVATE_KEY", None)
+        else:
+            os.environ["GITHUB_APP_PRIVATE_KEY"] = old
+
+
+def test_missing_app_config_raises_not_returns_empty():
+    """Silent '' would look identical to a healthy no-op downstream."""
+    from app import github_app_auth as gaa
+    saved = {k: os.environ.pop(k, None)
+             for k in ("GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY",
+                       "GITHUB_APP_PRIVATE_KEY_PATH")}
+    try:
+        assert gaa.is_app_configured() is False
+        raised = False
+        try:
+            gaa.build_app_jwt()
+        except gaa.AppAuthError:
+            raised = True
+        assert raised, "misconfigured App auth must raise, not return ''"
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_repo_cap_bandaid_is_gone():
+    """RIPPLE_MAX_CONSUMER_REPOS silently dropped consumers for anyone with
+    more repos than the cap -- the same silent-false-negative class we
+    removed from the parser. It must not come back."""
+    source = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "webhook.py")).read()
+    assert "RIPPLE_MAX_CONSUMER_REPOS" not in source, \
+        "repo cap heuristic reintroduced"
+
+
+def test_self_repo_blocklist_bandaid_is_gone():
+    """The hardcoded '{owner}/ripple' exclusion suppressed a symptom of
+    unscoped discovery. Authoritative installation scope replaces it."""
+    source = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "webhook.py")).read()
+    assert 'f"{owner}/ripple"' not in source, "self-repo blocklist reintroduced"
+    assert "RIPPLE_EXCLUDE_REPOS" not in source, "exclude-repos heuristic reintroduced"
+
+
+def test_presentation_dir_heuristic_is_gone_but_vendored_still_excluded():
+    """Deleting the marketing/docs guesses must NOT also delete the
+    objectively-correct vendored/generated exclusions."""
+    from app.webhook import _is_code_file
+    # judgment-call dirs are no longer blanket-excluded
+    assert _is_code_file("examples/client.go") is True
+    assert _is_code_file("website/src/api/userClient.ts") is True
+    # vendored + generated remain excluded
+    assert _is_code_file("node_modules/foo/index.js") is False
+    assert _is_code_file("vendor/pkg/thing.go") is False
+    assert _is_code_file("gen/user/v1/user.pb.go") is False
+    assert _is_code_file("api/user_pb2.py") is False
+    assert _is_code_file("dist/bundle.min.js") is False
+    # ordinary source still qualifies
+    assert _is_code_file("internal/handler/user.go") is True
+
+
+# ===================================================================
 # runner (works without pytest)
 # ===================================================================
 

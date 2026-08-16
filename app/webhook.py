@@ -44,6 +44,10 @@ from .trpc_diff import diff_trpc
 from .thrift_diff import diff_thrift
 from .jsonschema_diff import diff_jsonschema
 from .smithy_diff import diff_smithy
+from .github_app_auth import (
+    is_app_configured, get_installation_token,
+    list_installation_repositories, AppAuthError,
+)
 from .consumer_finder import find_consumers, ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
@@ -912,7 +916,9 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
     })
     
     # Find consumer repos (from GitHub App installation)
-    consumer_repos = _find_consumer_repos(repo, token)
+    # Find consumer repos. With App auth this is the authoritative
+    # installation scope, not a guess at which repos might be consumers.
+    consumer_repos = _find_consumer_repos(repo, token, installation_id)
     _log_activity("consumer_repos_found", {"count": len(consumer_repos), "repos": consumer_repos[:5]})
     
     # For each breaking change, use ENSEMBLE to find consumers
@@ -1205,9 +1211,28 @@ async def get_propbench_results():
 
 
 def _get_token(installation_id: int = None) -> str:
-    """Get GitHub token (personal or installation)."""
-    # For now: use personal token. With a real GitHub App, you'd exchange
-    # the installation_id for an installation access token.
+    """Get a GitHub token for this installation.
+
+    Prefers a real GitHub App installation token, which is scoped to the
+    repositories the customer actually granted, expires in an hour, and is
+    minted per installation (so the service is multi-tenant).
+
+    Falls back to GITHUB_TOKEN for local development and single-user
+    self-hosting, where no App installation exists. That fallback is a
+    supported mode, not a shortcut -- but it cannot scope discovery, so
+    _find_consumer_repos reports when it is active.
+    """
+    if installation_id and is_app_configured():
+        try:
+            return get_installation_token(installation_id)
+        except AppAuthError as e:
+            # Loud, not silent: a misconfigured App would otherwise look
+            # exactly like "this repo has no consumers".
+            _log_activity("app_auth_failed", {
+                "installation_id": installation_id,
+                "err": str(e)[:200],
+                "falling_back_to_pat": bool(os.environ.get("GITHUB_TOKEN")),
+            })
     return os.environ.get("GITHUB_TOKEN", "")
 
 
@@ -1598,48 +1623,83 @@ def _fetch_git_log_prs(repo_path: str, max_prs: int) -> list[dict]:
     return prs[:max_prs]
 
 
-def _find_consumer_repos(source_repo: str, token: str) -> list[str]:
-    """Find repos that might consume APIs from the source repo.
-    
-    Includes the source repo itself (monorepo support) — consumers
-    can live in the same repo as the spec.
-    
-    Filters to non-archived, non-fork repos sorted by recent activity.
-    Forks and stale repos are almost never consumers of your own spec,
-    and searching them burns GitHub API quota (each repo = 1+ API call).
+def _find_consumer_repos(source_repo: str, token: str,
+                         installation_id: int = None) -> list[str]:
+    """Return the repos to search for consumers of `source_repo`.
+
+    App mode (correct): GitHub tells us exactly which repositories the
+    customer granted this installation. That list is authoritative and
+    already scoped, which is why this function no longer needs a repo cap,
+    a fork filter, or a self-repo blocklist -- three heuristics that
+    existed only because a personal access token could see every repo the
+    human owned. The cap in particular silently dropped consumers for
+    anyone with more repos than the limit.
+
+    PAT mode (degraded): no installation scope exists. Prefer an explicit
+    allowlist; otherwise enumerate owned repos and SAY SO, because an
+    unscoped guess must never look like an authoritative answer.
+
+    The source repo is always included for monorepo support -- consumers
+    can live alongside the spec.
     """
-    # Always include the source repo (monorepo support)
-    repos = [source_repo]
-    
-    # Get all other repos for the user/org, most recently pushed first
+    # --- authoritative path -------------------------------------------
+    if installation_id and is_app_configured():
+        try:
+            installed = list_installation_repositories(installation_id)
+            repos = [source_repo] + [r for r in installed if r != source_repo]
+            _log_activity("consumer_scope", {
+                "mode": "app_installation",
+                "authoritative": True,
+                "count": len(repos),
+            })
+            return repos
+        except AppAuthError as e:
+            _log_activity("consumer_scope_error", {
+                "mode": "app_installation",
+                "err": str(e)[:200],
+            })
+
+    # --- explicit allowlist -------------------------------------------
+    allowlist = [
+        r.strip() for r in os.environ.get("RIPPLE_CONSUMER_REPOS", "").split(",")
+        if r.strip()
+    ]
+    if allowlist:
+        repos = [source_repo] + [r for r in allowlist if r != source_repo]
+        _log_activity("consumer_scope", {
+            "mode": "explicit_allowlist",
+            "authoritative": True,
+            "count": len(repos),
+        })
+        return repos
+
+    # --- degraded: unscoped enumeration -------------------------------
     owner = source_repo.split("/")[0]
     data = _github_api(
         "GET",
         f"/users/{owner}/repos?per_page=100&sort=pushed&direction=desc",
         token,
     )
-    
-    max_repos = int(os.environ.get("RIPPLE_MAX_CONSUMER_REPOS", "20"))
-    
-    # Repos that must never be treated as consumers. Ripple's own repo
-    # contains the field names as marketing/demo copy (e.g. the landing
-    # page terminal demo), which produced false-positive self-PRs.
-    self_excluded = {
-        r.strip().lower()
-        for r in os.environ.get("RIPPLE_EXCLUDE_REPOS", "").split(",")
-        if r.strip()
-    }
-    self_excluded.add(f"{owner}/ripple".lower())
-    
+    repos = [source_repo]
+    truncated = False
     if isinstance(data, list):
         candidates = [
             r["full_name"] for r in data
-            if r["full_name"] != source_repo
-            and not r.get("archived")
-            and not r.get("fork")
-            and r["full_name"].lower() not in self_excluded
+            if r["full_name"] != source_repo and not r.get("archived")
         ]
-        repos.extend(candidates[:max_repos])
+        # Paging beyond one page is not attempted here; report it rather
+        # than pretend the list is complete.
+        truncated = len(data) >= 100
+        repos.extend(candidates)
+
+    _log_activity("consumer_scope", {
+        "mode": "unscoped_owner_enumeration",
+        "authoritative": False,
+        "count": len(repos),
+        "possibly_truncated": truncated,
+        "hint": "configure GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY, "
+                "or set RIPPLE_CONSUMER_REPOS, for scoped discovery",
+    })
     return repos
 
 
@@ -1790,11 +1850,10 @@ def _scan_repo_tree_for_consumers(
 
 
 def _is_code_file(filepath: str) -> bool:
-    """Check if file is code that could plausibly consume an API contract.
-    
-    Extension alone is not enough: a landing-page component (.tsx) can
-    mention a field name as demo/marketing copy without consuming the API.
-    Those produced false-positive PRs, so path-based exclusions apply too.
+    """Is this a file a human would hand-edit to adapt to a contract change?
+
+    Extension alone is insufficient: vendored dependencies and generated
+    code carry real source extensions but must never be patched by a PR.
     """
     exts = {".ts", ".tsx", ".js", ".py", ".java", ".go", ".rs", ".rb"}
     if not any(filepath.endswith(ext) for ext in exts):
@@ -1802,20 +1861,31 @@ def _is_code_file(filepath: str) -> bool:
     
     lowered = filepath.lower()
     
-    # Directories that hold presentation, docs, or vendored code -- never
-    # real API consumers.
-    excluded_dirs = (
-        "website/", "docs/", "doc/", "site/", "landing/", "marketing/",
-        "examples/", "example/", "demo/", "samples/", "sample/",
+    # Vendored dependencies and build output. Excluding these is not a
+    # heuristic -- they are never hand-edited source, so a PR touching them
+    # is always wrong.
+    non_source_dirs = (
         "node_modules/", "vendor/", "third_party/", "dist/", "build/",
-        ".next/", "coverage/", "fixtures/", "__snapshots__/",
+        ".next/", "coverage/", "target/debug/", "target/release/",
+        "site-packages/", ".venv/", "venv/",
     )
-    if any(seg in lowered for seg in excluded_dirs):
+    if any(seg in lowered for seg in non_source_dirs):
         return False
     
-    # Generated / minified artifacts
-    if lowered.endswith((".min.js", ".d.ts", ".pb.go", "_pb2.py", ".generated.ts")):
+    # Generated code: regenerated from the contract, so editing it is
+    # pointless -- the generator output changes when the spec changes.
+    if lowered.endswith((".min.js", ".d.ts", ".pb.go", "_pb2.py",
+                         "_pb2_grpc.py", ".generated.ts", ".g.dart")):
         return False
+    
+    # NOTE: 'website/', 'docs/', 'marketing/', 'examples/' were previously
+    # excluded here to stop Ripple opening a PR against its own landing
+    # page. That was suppressing a symptom of unscoped repo discovery, not
+    # a real rule -- a customer can legitimately call an API from an
+    # example app or a docs site. Now that installation scope is
+    # authoritative, cross-repo false positives are gone, and per-customer
+    # exclusions belong in .ripple.yaml `ignore:` (already honoured via
+    # config.should_ignore) rather than in a hardcoded list here.
     
     return True
 
