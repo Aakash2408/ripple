@@ -49,16 +49,40 @@ def _remove_lines_matching(code: str, pattern: re.Pattern) -> str:
 
 
 def _clean_trailing_commas(code: str) -> str:
-    """Remove trailing commas before closing brackets/parens."""
-    code = re.sub(r',(\s*\n\s*[)\]}])', r'\1', code)
-    code = re.sub(r',(\s*[)\]}])', r'\1', code)
+    """Remove only genuinely INVALID comma artifacts.
+
+    A trailing comma before a closing bracket on the next line is NOT an
+    artifact -- it is valid in Python, JS/TS, and Rust, and is REQUIRED in
+    Go composite literals:
+
+        req := &pb.Request{
+            Name:  name,
+            Email: email,     <-- removing this comma breaks compilation
+        }
+
+    Stripping it produced PRs that did not build. Only collapse sequences
+    that are invalid in every supported language: doubled commas left
+    behind by a removed middle element, and a comma directly after an
+    opening bracket from a removed first element.
+    """
+    # ",," or ", ,"  ->  ","   (removed a middle element)
+    code = re.sub(r',(\s*),', r',\1', code)
+    # "(," / "[," / "{,"  ->  "(" / "[" / "{"   (removed the first element)
+    code = re.sub(r'([(\[{])\s*,\s*', r'\1', code)
     return code
 
 
 def _remove_empty_blocks(code: str) -> str:
-    """Remove empty parameter lists that became () with only whitespace."""
-    code = re.sub(r'\(\s*,\s*', '(', code)
-    code = re.sub(r',\s*\)', ')', code)
+    """Collapse argument lists that became empty.
+
+    Uses [^\\S\\n]* (horizontal whitespace only) rather than \\s* so a
+    legitimate multi-line trailing comma before ')' is preserved -- \\s
+    matches newlines and would strip the comma Go requires.
+    """
+    # "( ,"  ->  "("   (removed the first argument)
+    code = re.sub(r'\([^\S\n]*,[^\S\n]*', '(', code)
+    # "a, )" on ONE line  ->  "a)"   (dangling comma, same line only)
+    code = re.sub(r',[^\S\n]*\)', ')', code)
     return code
 
 

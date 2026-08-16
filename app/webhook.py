@@ -1710,6 +1710,74 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
             if is_consumer:
                 results.append((file_path, content))
     
+    # Code search depends on GitHub's search INDEX, which lags for newly
+    # created or recently pushed repos -- it returns total_count=0 even
+    # though the files exist. That silently breaks the most important
+    # moment: the first push after a customer installs Ripple.
+    # Fall back to walking the repo tree, which is always current.
+    if not results:
+        _log_activity("search_fallback_tree", {"repo": repo, "reason": "code search returned 0"})
+        results = _scan_repo_tree_for_consumers(repo, change, token, exclude_path)
+    
+    return results
+
+
+def _scan_repo_tree_for_consumers(
+    repo: str, change: BreakingChange, token: str, exclude_path: str = ""
+) -> list[tuple[str, str]]:
+    """Find consumers by listing the repo tree directly (no search index).
+
+    Slower than code search on large repos, but always up to date. Used as
+    a fallback so freshly-created repos still work.
+    """
+    from .smart_consumer_finder import file_is_consumer
+    
+    field_name = change.field_name
+    max_files = int(os.environ.get("RIPPLE_MAX_TREE_FILES", "40"))
+    
+    repo_data = _github_api("GET", f"/repos/{repo}", token)
+    if "error" in repo_data:
+        return []
+    default_branch = repo_data.get("default_branch", "main")
+    
+    tree = _github_api(
+        "GET", f"/repos/{repo}/git/trees/{default_branch}?recursive=1", token
+    )
+    if "tree" not in tree:
+        return []
+    
+    candidates = [
+        node["path"] for node in tree["tree"]
+        if node.get("type") == "blob"
+        and node["path"] != exclude_path
+        and _is_code_file(node["path"])
+    ][:max_files]
+    
+    results = []
+    for file_path in candidates:
+        file_data = _github_api(
+            "GET", f"/repos/{repo}/contents/{file_path}?ref={default_branch}", token
+        )
+        if "content" not in file_data:
+            continue
+        try:
+            content = base64.b64decode(file_data["content"]).decode()
+        except (ValueError, UnicodeDecodeError):
+            continue
+        
+        is_consumer, confidence, matches = file_is_consumer(
+            content, file_path, field_name, _detect_lang(file_path), min_confidence=0.5
+        )
+        if is_consumer:
+            results.append((file_path, content))
+    
+    if results:
+        _log_activity("tree_scan_found", {
+            "repo": repo,
+            "scanned": len(candidates),
+            "found": len(results),
+            "files": [f for f, _ in results][:5],
+        })
     return results
 
 
