@@ -326,6 +326,189 @@ TYPE_CHANGE_HANDLERS: dict[str, Callable[[str, str, str], str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# remove_type / remove_enum_value / rename_type
+#
+# Driven by per-language pattern tables rather than 16 hand-written functions
+# (2 operations x 8 languages). Same coverage, one place to audit.
+#
+# {name} is substituted with each case variant of the symbol. Patterns are
+# applied line-wise with re.MULTILINE, so each removes a whole statement.
+# ---------------------------------------------------------------------------
+
+# References to a REMOVED TYPE: imports, declarations, annotations,
+# constructions. Removal leaves the surrounding code thinner but may not make
+# it compile -- anything left is surfaced by find_residual_references and the
+# PR is marked partial, exactly as with removed fields.
+_TYPE_REF_PATTERNS = {
+    'go': [
+        r'^\s*(?:var|const)\s+\w+\s+\*?{name}\b.*$',      # var u User
+        r'^\s*\w+\s*:?=\s*&?{name}\s*\{{.*$',              # u := User{
+        r'^\s*\w+\s+\*?{name}\s*$',                        # struct field of that type
+        r'^\s*.*\b{name}\s*\{{\s*\}}.*$',                  # User{}
+    ],
+    'typescript': [
+        r'^\s*import\s+.*\b{name}\b.*$',
+        r'^\s*(?:let|const|var)\s+\w+\s*:\s*{name}\b.*$',
+        r'^\s*\w+\s*:\s*{name}\b.*$',                      # interface prop / param
+        r'^\s*.*\bnew\s+{name}\s*\(.*$',
+    ],
+    'python': [
+        r'^\s*from\s+\S+\s+import\s+.*\b{name}\b.*$',
+        r'^\s*import\s+.*\b{name}\b.*$',
+        r'^\s*\w+\s*:\s*{name}\b.*$',                      # annotation
+        r'^\s*\w+\s*=\s*{name}\s*\(.*$',                   # construction
+    ],
+    'java': [
+        r'^\s*import\s+.*\b{name}\s*;.*$',
+        r'^\s*(?:private|public|protected)?\s*{name}\s+\w+\s*;.*$',
+        r'^\s*{name}\s+\w+\s*=\s*new\s+{name}\s*\(.*$',
+    ],
+    'rust': [
+        r'^\s*use\s+.*\b{name}\b.*$',
+        r'^\s*let\s+\w+\s*:\s*{name}\b.*$',
+        r'^\s*\w+\s*:\s*{name}\s*,?\s*$',
+        r'^\s*let\s+\w+\s*=\s*{name}\s*\{{.*$',
+    ],
+    'ruby': [
+        r'^\s*require\s+.*{name}.*$',
+        r'^\s*\w+\s*=\s*{name}\.new\b.*$',
+    ],
+    'kotlin': [
+        r'^\s*import\s+.*\b{name}\b.*$',
+        r'^\s*(?:val|var)\s+\w+\s*:\s*{name}\b.*$',
+        r'^\s*\w+\s*:\s*{name}\s*,?\s*$',
+    ],
+    'csharp': [
+        r'^\s*using\s+.*\b{name}\b.*$',
+        r'^\s*(?:public|private|protected)?\s*{name}\s+\w+\s*(?:\{{\s*get.*)?$',
+        r'^\s*var\s+\w+\s*=\s*new\s+{name}\s*\(.*$',
+    ],
+}
+
+# References to a REMOVED ENUM VALUE: switch/case arms, match arms, and
+# qualified constant references.
+_ENUM_VALUE_PATTERNS = {
+    'go': [
+        r'^\s*case\s+.*\b{name}\b.*:.*$',
+        r'^\s*.*\b\w+_{name}\b.*$',
+    ],
+    'typescript': [
+        r'^\s*case\s+.*\b{name}\b.*:.*$',
+        r'^\s*{name}\s*=.*,?\s*$',                         # enum member decl
+        r'^\s*.*\b\w+\.{name}\b.*$',
+    ],
+    'python': [
+        r'^\s*{name}\s*=.*$',                              # Enum member
+        r'^\s*(?:elif|if)\s+.*\b{name}\b.*:\s*$',
+        r'^\s*case\s+.*\b{name}\b.*:\s*$',                 # match/case
+    ],
+    'java': [
+        r'^\s*case\s+{name}\s*:.*$',
+        r'^\s*{name}\s*,?\s*$',                            # enum constant
+    ],
+    'rust': [
+        r'^\s*{name}\s*=>.*$',                             # match arm
+        r'^\s*{name}\s*,\s*$',                             # enum variant
+    ],
+    'ruby': [
+        r'^\s*when\s+.*\b{name}\b.*$',
+        r'^\s*{name}\s*=.*$',
+    ],
+    'kotlin': [
+        r'^\s*{name}\s*->.*$',                             # when branch
+        r'^\s*{name}\s*,?\s*$',
+    ],
+    'csharp': [
+        r'^\s*case\s+.*\b{name}\b.*:.*$',
+        r'^\s*{name}\s*,?\s*$',
+    ],
+}
+
+
+def _apply_patterns(code: str, patterns: list, names: set) -> str:
+    """Apply each {name}-templated pattern for every case variant."""
+    for raw in patterns:
+        for name in names:
+            pattern = raw.replace('{name}', re.escape(name))
+            code = re.sub(pattern + r'\n?', '', code, flags=re.MULTILINE)
+    return code
+
+
+def _symbol_names(variants: dict) -> set:
+    """Case variants worth matching for a type or enum symbol."""
+    return {v for v in (variants.get('pascal'), variants.get('camel'),
+                        variants.get('snake'), variants.get('upper_snake')) if v}
+
+
+def _remove_type_reference(code: str, variants: dict, lang: str) -> str:
+    patterns = _TYPE_REF_PATTERNS.get(lang)
+    if patterns is None:
+        # Unsupported language: drop whole lines mentioning the type.
+        return _generic_remove(code, variants)
+    return _apply_patterns(code, patterns, _symbol_names(variants))
+
+
+def _remove_case_block(code: str, names: set, lang: str) -> str:
+    """Remove a whole switch/case arm, including its body.
+
+    Removing only the `case X:` line orphans the statements beneath it:
+
+        switch s {
+            return 1          <- was the body of the removed arm
+        case Status_ACTIVE:
+
+    which does not compile. C-style languages need the arm body removed up to
+    the next case/default or the closing brace.
+    """
+    c_style = lang in ('go', 'typescript', 'javascript', 'java', 'csharp', 'c#')
+    if not c_style:
+        return code
+
+    lines = code.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        is_case = stripped.startswith('case ') or stripped.startswith('case\t')
+        # Boundary must treat '_' as a separator: Go protobuf enums render as
+        # Status_LEGACY, and \bLEGACY\b does NOT match there because '_' is a
+        # word character. Same underscore-boundary trap as the consumer
+        # matcher hit earlier.
+        if is_case and any(
+            re.search(rf'(?<![A-Za-z0-9]){re.escape(n)}(?![A-Za-z0-9])', line)
+            for n in names
+        ):
+            # Skip this arm: the case line plus its body up to the next
+            # case/default, or the block's closing brace.
+            indent = len(line) - len(line.lstrip())
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                nstr = nxt.strip()
+                if nstr.startswith('case ') or nstr.startswith('default'):
+                    break
+                # closing brace at or above the case's indentation ends the switch
+                if nstr.startswith('}') and (len(nxt) - len(nxt.lstrip())) <= indent:
+                    break
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
+
+def _remove_enum_value(code: str, variants: dict, lang: str) -> str:
+    names = _symbol_names(variants)
+    # Whole-arm removal first, so bodies are not orphaned.
+    code = _remove_case_block(code, names, lang)
+    patterns = _ENUM_VALUE_PATTERNS.get(lang)
+    if patterns is None:
+        return _generic_remove(code, variants)
+    return _apply_patterns(code, patterns, names)
+
+
 # --- Main entry point ---
 
 def apply_fix_template(
@@ -356,8 +539,14 @@ def apply_fix_template(
     ct = change_type.lower().strip().replace('-', '_')
     variants = name_variants(field_name)
 
-    # Normalize change_type aliases
-    if ct in ('field_removed', 'removed_field'):
+    # Route through the canonical taxonomy so every engine dialect reaches a
+    # handler. Previously this matched 3 literal strings and returned
+    # "Unknown change_type" for the other 44 -- which left the code unchanged,
+    # so no PR opened and a detected breaking change produced silence.
+    from .change_types import canonical_op, category, describe
+    op = canonical_op(ct)
+
+    if op == 'remove_field':
         handler = REMOVE_HANDLERS.get(lang)
         if handler is None:
             # Fallback: generic line removal for unsupported languages
@@ -373,7 +562,7 @@ def apply_fix_template(
         )
         return result, explanation
 
-    elif ct in ('field_renamed', 'renamed_field'):
+    elif op == 'rename_field':
         if not new_name:
             return code, "Error: new_name required for rename operations."
         old_variants = name_variants(field_name)
@@ -390,7 +579,7 @@ def apply_fix_template(
         )
         return result, explanation
 
-    elif ct in ('type_changed', 'field_type_changed'):
+    elif op == 'change_field_type':
         if not old_type or not new_type:
             return code, "Error: old_type and new_type required for type change operations."
         handler = TYPE_CHANGE_HANDLERS.get(lang)
@@ -406,9 +595,59 @@ def apply_fix_template(
         )
         return result, explanation
 
-    else:
-        return code, f"Unknown change_type: '{change_type}'. Supported: field_removed, field_renamed, type_changed."
+    elif op == 'remove_type':
+        result = _remove_type_reference(code, variants, lang)
+        result = _postprocess(result)
+        lines_removed = len(code.split('\n')) - len(result.split('\n'))
+        explanation = (
+            f"Removed references to deleted type '{field_name}' "
+            f"({lines_removed} lines affected): imports, declarations, type "
+            f"annotations and constructions for {lang}. Any remaining usage is "
+            f"flagged for review -- a deleted type cannot always be resolved "
+            f"mechanically."
+        )
+        return result, explanation
 
+    elif op == 'remove_enum_value':
+        result = _remove_enum_value(code, variants, lang)
+        result = _postprocess(result)
+        lines_removed = len(code.split('\n')) - len(result.split('\n'))
+        explanation = (
+            f"Removed references to deleted enum value '{field_name}' "
+            f"({lines_removed} lines affected): switch/case arms, match arms "
+            f"and constant declarations for {lang}."
+        )
+        return result, explanation
+
+    elif op == 'rename_type':
+        if not new_name:
+            return code, "Error: new_name required for rename operations."
+        result = _rename_field(code, name_variants(field_name), name_variants(new_name))
+        replacements = sum(
+            code.count(name_variants(field_name)[s]) - result.count(name_variants(field_name)[s])
+            for s in ('snake', 'camel', 'pascal', 'upper_snake')
+        )
+        explanation = (
+            f"Renamed type '{field_name}' -> '{new_name}' across all case "
+            f"variants. {replacements} replacements made."
+        )
+        return result, explanation
+
+    else:
+        # Every change_type the engines emit is classified in change_types.py,
+        # so reaching here means either a genuinely new dialect or a category
+        # handled in a later stage (judgment / wire-only). Report the category
+        # rather than a bare "unknown", so the caller can act on it.
+        cat = category(ct)
+        if cat:
+            return code, (
+                f"No mechanical template for '{change_type}' "
+                f"(category: {cat}) -- {describe(ct)}."
+            )
+        return code, (
+            f"Unclassified change_type: '{change_type}'. "
+            f"Add it to app/change_types.py CHANGE_TYPE_MAP."
+        )
 
 def _generic_remove(code: str, variants: dict[str, str]) -> str:
     """Fallback removal for unsupported languages: remove lines containing field name variants."""
