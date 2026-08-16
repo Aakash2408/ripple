@@ -89,9 +89,14 @@ app.include_router(bitbucket_oauth_router)
 app.include_router(dry_run_router)
 
 # SSL context for GitHub API calls (Amazon dev desktop fix)
-SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode = ssl.CERT_NONE
+from .tls import make_ssl_context, describe as _describe_tls
+
+# TLS context with certificate verification ENABLED. This previously set
+# check_hostname=False + verify_mode=CERT_NONE under a comment calling it an
+# "SSL fix", which actually disabled TLS entirely. These requests now carry
+# GitHub App installation tokens that grant write access to customer repos,
+# so accepting any certificate is not acceptable. See app/tls.py.
+SSL_CTX = make_ssl_context()
 
 # Per-org learned knowledge (persists across requests)
 _org_learners: dict[str, HistoryLearner] = {}

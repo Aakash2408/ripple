@@ -34,7 +34,9 @@ from urllib.request import Request, urlopen
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-SSL_CTX = ssl.create_default_context()
+from app.tls import make_ssl_context
+
+SSL_CTX = make_ssl_context()
 RAILWAY = "https://ripple-production-be7f.up.railway.app"
 
 

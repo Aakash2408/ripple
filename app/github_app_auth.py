@@ -50,11 +50,11 @@ import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-SSL_CTX = ssl.create_default_context()
-try:  # match webhook.py behaviour on hosts with incomplete CA bundles
-    SSL_CTX.check_hostname = True
-except Exception:  # pragma: no cover
-    pass
+from .tls import make_ssl_context
+
+# Verification stays ON: these calls carry the App JWT and mint installation
+# tokens with write access to customer repositories.
+SSL_CTX = make_ssl_context()
 
 _API = "https://api.github.com"
 
