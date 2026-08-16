@@ -343,6 +343,146 @@ def find_field_consumers(
     return matches
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Path-locality matching (PACKAGE vector)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A breaking change propagates by one of two vectors:
+#
+#   symbol   a declared identifier was removed; consumers name it
+#   package  a directory was deleted; consumers are files INSIDE it, plus files
+#            that import its path -- most of which never name any single symbol
+#
+# Ripple only had the symbol matcher, so package deletions were largely
+# invisible to it. Measured on kubernetes#109798 ("Remove PodSecurityPolicy
+# admission plugin"): 31 of 32 files it failed to flag lived under
+# pkg/security/podsecuritypolicy/, and the path said so plainly while nothing in
+# their content named a shared identifier.
+#
+# These functions are deliberately SEPARATE from find_field_consumers rather
+# than folded into it: the symbol path is exercised by the live webhook and its
+# behaviour must stay bit-identical. match_type values are prefixed `package_`
+# so the two signals remain distinguishable in any output that mixes them.
+
+_IMPORT_LINE = re.compile(
+    r"^\s*(?:import|from|use|require|include|using|#include|export\s+\*\s+from)\b"
+    r"|require\s*\(|from\s+['\"]"
+    # Go and similar put each path on its own line inside an import block, with
+    # no keyword: `\t"k8s.io/kubernetes/pkg/security/podsecuritypolicy"` -- and
+    # optionally an alias before it. Without this, real imports were demoted to
+    # package_path_ref (0.80) instead of package_import (0.95).
+    r"|^\s*(?:_\s+|[A-Za-z_][\w.]*\s+)?[\"'][^\"']+[\"'],?\s*$",
+)
+
+
+def _norm_path(s: str) -> str:
+    """Strip separators and case so path forms compare equal.
+
+    pkg/security/podsecuritypolicy  ==  pkg.security.podsecuritypolicy
+                                    ==  PkgSecurityPodSecurityPolicy
+    """
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def find_package_consumers(
+    file_content: str,
+    file_path: str,
+    package_path: str,
+    language: str,
+    min_confidence: float = 0.5,
+) -> list[SmartMatch]:
+    """Find a file's relationship to a DELETED PACKAGE.
+
+    Three signals, strongest first:
+
+      package_member    the file lives inside the deleted package. It does not
+                        "reference" anything -- it IS part of what was removed,
+                        which is why a symbol search cannot see it.
+      package_import    a line imports the package path.
+      package_path_ref  the package path or its tail segment appears in content
+                        that is not an import (YAML manifests, build files,
+                        scripts referencing a directory).
+
+    Returns [] when none fire, so a caller can distinguish "not a consumer" from
+    "consumer by path".
+    """
+    pkg = package_path.rstrip("/")
+    if not pkg:
+        return []
+
+    matches: list[SmartMatch] = []
+
+    # 1. Membership -- a whole-file relationship, so line_number 0.
+    if file_path.startswith(pkg + "/") or file_path == pkg:
+        matches.append(SmartMatch(
+            file_path=file_path,
+            line_number=0,
+            line_content=f"(file is inside deleted package {pkg}/)",
+            match_type="package_member",
+            confidence=0.99,
+            variant_matched=pkg,
+        ))
+        # Membership is decisive; no need to also scan for imports of itself.
+        return matches
+
+    needle = _norm_path(pkg)
+    tail = _norm_path(pkg.rsplit("/", 1)[-1])
+    # A one- or two-segment tail is too generic to carry a path reference on its
+    # own -- 'utils', 'api', 'core' would match half a repo.
+    tail_usable = len(tail) >= 8
+
+    for i, line in enumerate(file_content.split("\n"), 1):
+        if _is_comment(line.strip(), language):
+            continue
+        norm = _norm_path(line)
+        if needle and needle in norm:
+            is_import = bool(_IMPORT_LINE.search(line))
+            matches.append(SmartMatch(
+                file_path=file_path,
+                line_number=i,
+                line_content=line.strip(),
+                match_type="package_import" if is_import else "package_path_ref",
+                confidence=0.95 if is_import else 0.80,
+                variant_matched=pkg,
+            ))
+        elif tail_usable and tail in norm:
+            matches.append(SmartMatch(
+                file_path=file_path,
+                line_number=i,
+                line_content=line.strip(),
+                match_type="package_path_ref",
+                confidence=0.70,
+                variant_matched=pkg.rsplit("/", 1)[-1],
+            ))
+
+    matches = [m for m in matches if m.confidence >= min_confidence]
+    matches.sort(key=lambda m: m.confidence, reverse=True)
+    return matches
+
+
+def find_consumers(
+    file_content: str,
+    file_path: str,
+    target: str,
+    language: str,
+    vector: str = "symbol",
+    min_confidence: float = 0.5,
+) -> list[SmartMatch]:
+    """Dispatch on propagation vector.
+
+    Querying the wrong vector under-reports badly: on kubernetes#109798 a symbol
+    query scored 38.5% while the correct package query scores 90.9% on the same
+    PR, with no change to the matchers themselves.
+    """
+    if vector == "package":
+        return find_package_consumers(
+            file_content, file_path, target, language, min_confidence
+        )
+    return find_field_consumers(
+        file_content, file_path, target, language, min_confidence
+    )
+
+
 def file_is_consumer(
     file_content: str,
     file_path: str,

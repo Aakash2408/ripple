@@ -70,3 +70,28 @@ jobs:
         # so the number is visible in every build and can be ratcheted down.
         continue-on-error: true
         run: python tools/audit_fail_silent.py
+
+      - name: Consumer-matcher vectors
+        # The PropBench replay harness (judgment-engine/tools/replay.py) measures
+        # this matcher against real merged PRs, but it CANNOT gate CI here: it
+        # needs network access, a GitHub token, and a dataset that lives in a
+        # different repository. Pretending otherwise would be a gate that never
+        # actually runs.
+        #
+        # What IS gateable is the behaviour the replay exercised. Both vectors
+        # must stay live: a symbol query on a package deletion scored 38.5% where
+        # the package query scored 90.9% on the same PR, and path locality flags
+        # 41/41 package members where symbol search flags 10/41.
+        run: |
+          python -c "
+          from app.smart_consumer_finder import (
+              find_field_consumers, find_package_consumers, find_consumers)
+          PKG = 'pkg/security/podsecuritypolicy/'
+          member = 'pkg/security/podsecuritypolicy/group/mustrunas.go'
+          src = 'package group\nfunc mustRunAs() error { return nil }\n'
+          assert find_field_consumers(src, member, 'podsecuritypolicy', 'go') == []
+          m = find_package_consumers(src, member, PKG, 'go')
+          assert len(m) == 1 and m[0].match_type == 'package_member', m
+          assert find_consumers(src, member, PKG, 'go', vector='package')
+          print('consumer-matcher vectors OK')
+          "

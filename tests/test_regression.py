@@ -856,6 +856,78 @@ def test_apply_fix_template_called_with_the_real_signature():
     assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
 
 
+def test_package_vector_finds_what_symbol_search_cannot():
+    """A deleted PACKAGE propagates by path, not by name.
+
+    Measured on kubernetes#109798 ("Remove PodSecurityPolicy admission plugin"):
+    31 of the 32 files Ripple failed to flag lived under
+    pkg/security/podsecuritypolicy/ and named no shared identifier. They had to
+    change because their PACKAGE was deleted. A symbol matcher is structurally
+    blind to that, however good its variant generation is.
+    """
+    from app.smart_consumer_finder import (
+        find_package_consumers, find_field_consumers, find_consumers,
+    )
+    PKG = "pkg/security/podsecuritypolicy/"
+
+    # A package member naming nothing in common with the package.
+    member_path = "pkg/security/podsecuritypolicy/group/mustrunas.go"
+    member_src = "package group\n\nfunc mustRunAs(x int) error { return nil }\n"
+
+    assert find_field_consumers(member_src, member_path, "podsecuritypolicy", "go") == [], \
+        "symbol search should find nothing here -- that is the gap being closed"
+
+    ms = find_package_consumers(member_src, member_path, PKG, "go")
+    assert len(ms) == 1 and ms[0].match_type == "package_member", \
+        f"membership not detected: {ms}"
+    assert ms[0].confidence >= 0.95
+
+    # An importer outside the package. Go puts the path on its own line with no
+    # keyword, which an import regex anchored on 'import' would miss.
+    imp_src = 'import (\n\t"k8s.io/kubernetes/pkg/security/podsecuritypolicy"\n)\n'
+    ims = find_package_consumers(imp_src, "plugin/pkg/admission/a.go", PKG, "go")
+    assert any(m.match_type == "package_import" for m in ims), \
+        f"bare quoted import path not classified as an import: " \
+        f"{[(m.match_type, m.confidence) for m in ims]}"
+
+    # A file with no relationship must return nothing, so callers can tell
+    # "not a consumer" from "consumer by path".
+    assert find_package_consumers(
+        "package other\nfunc Validate() {}\n", "pkg/other/t.go", PKG, "go") == []
+
+    # Comments must not count -- same rule the symbol matcher follows.
+    assert find_package_consumers(
+        "// see pkg/security/podsecuritypolicy for history\n",
+        "x.go", PKG, "go") == []
+
+    # Signals stay distinguishable: package matches are prefixed, symbol ones
+    # are not, so mixed output remains attributable.
+    assert all(m.match_type.startswith("package_") for m in ms + ims)
+
+
+def test_symbol_matcher_behaviour_is_unchanged_by_path_signal():
+    """The path signal is additive. The symbol path feeds the live webhook and
+    must stay bit-identical, so it is a separate function, not a new branch
+    inside find_field_consumers."""
+    from app.smart_consumer_finder import find_field_consumers, find_consumers
+
+    src = (
+        "func send(u User) error {\n"
+        "\tto := u.PhoneNumber\n"
+        "\treturn notify(to)\n"
+        "}\n"
+    )
+    direct = find_field_consumers(src, "h.go", "phone_number", "go")
+    assert direct, "symbol matcher regressed -- PhoneNumber no longer found"
+    assert all(not m.match_type.startswith("package_") for m in direct)
+
+    # The dispatcher must delegate identically, not re-implement.
+    viad = find_consumers(src, "h.go", "phone_number", "go", vector="symbol")
+    assert [(m.line_number, m.match_type, m.confidence) for m in viad] == \
+           [(m.line_number, m.match_type, m.confidence) for m in direct], \
+        "find_consumers(vector='symbol') diverged from find_field_consumers"
+
+
 def test_propbench_indexer_reads_the_real_schema():
     """PropBench entries use `files:` (a LIST); the indexer read `file` (a str).
 
