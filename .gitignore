@@ -13,3 +13,5 @@ dist/
 *.key
 *private-key*
 data/tokens.json
+data/activity.json
+data/*.json
