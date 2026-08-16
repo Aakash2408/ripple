@@ -8,6 +8,41 @@ from typing import Optional
 from app.rag_store import rag_store, FixPattern, StructuredPattern
 
 
+_EXT_LANG = {
+    ".go": "go", ".ts": "typescript", ".tsx": "typescript",
+    ".js": "javascript", ".jsx": "javascript", ".py": "python",
+    ".java": "java", ".rs": "rust", ".rb": "ruby",
+    ".kt": "kotlin", ".cs": "csharp",
+}
+
+
+def _language_from_path(file_path: str) -> str:
+    for ext, lang in _EXT_LANG.items():
+        if file_path.endswith(ext):
+            return lang
+    return "generic"
+
+
+def _resolve_store(store=None):
+    """Use the caller's store when it exposes the pattern API.
+
+    webhook.py passes a rag_engine.RagStore (a store of raw FixExamples).
+    That is a different type with no .patterns, so its examples are folded
+    into the pattern store first -- this is what finally connects indexing
+    to retrieval.
+    """
+    if store is None:
+        return rag_store
+    if hasattr(store, "patterns") and hasattr(store, "structured_patterns"):
+        return store
+    if hasattr(store, "all_examples"):
+        try:
+            rag_store.ingest_examples(store.all_examples())
+        except Exception:
+            pass
+    return rag_store
+
+
 @dataclass
 class RagFixResult:
     """Result of a RAG-based fix generation."""
@@ -67,11 +102,13 @@ def retrieve_fix_pattern(
     language: str,
     field_name: str,
     repo: Optional[str] = None,
+    store=None,
 ) -> Optional[tuple[FixPattern, float]]:
     """Retrieve best fix pattern using multi-signal scoring. Returns top candidate."""
+    active = store if store is not None else rag_store
     candidates: list[tuple[FixPattern, float]] = []
 
-    for pattern in rag_store.patterns:
+    for pattern in active.patterns:
         score = _multi_signal_score(pattern, change_type, language, repo)
 
         # Boost if field name appears in pattern context
@@ -95,12 +132,14 @@ def retrieve_fix_pattern(
 def retrieve_cluster_archetype(
     change_type: str,
     language: str,
+    store=None,
 ) -> Optional[tuple[StructuredPattern, float]]:
     """Fall back to cluster archetypes when no exact match found."""
+    active = store if store is not None else rag_store
     best: Optional[tuple[StructuredPattern, float]] = None
     best_score = 0.0
 
-    for sp in rag_store.structured_patterns:
+    for sp in active.structured_patterns:
         score = 0.0
         if sp.change_type == change_type:
             score += 0.5
@@ -151,18 +190,24 @@ def _apply_pattern_fix(
     field_name: str,
 ) -> str:
     """Apply a pattern's fix strategy to consumer code."""
-    # Delegate to fix_templates for actual code transformation
+    # Delegate to fix_templates for actual code transformation.
+    # NOTE: the real signature is
+    #   apply_fix_template(code, language, change_type, field_name,
+    #                      new_name='', old_type='', new_type='')
+    # and it returns a (fixed_code, explanation) TUPLE. This used to pass
+    # source_code= / new_field_name= and treat the result as a string, so it
+    # would have raised TypeError the first time RAG actually ran.
     from app.fix_templates import apply_fix_template
 
-    result = apply_fix_template(
-        change_type=pattern.change_type,
-        language=pattern.language,
-        field_name=field_name,
-        source_code=consumer_code,
-        new_field_name=pattern.new_field_name,
+    fixed, _explanation = apply_fix_template(
+        consumer_code,
+        pattern.language,
+        pattern.change_type,
+        field_name,
+        new_name=pattern.new_field_name,
         new_type=pattern.new_type,
     )
-    return result if result else consumer_code
+    return fixed if fixed else consumer_code
 
 
 def _apply_cluster_fix(
@@ -174,29 +219,53 @@ def _apply_cluster_fix(
     """Apply cluster archetype strategy via fix_templates."""
     from app.fix_templates import apply_fix_template
 
-    result = apply_fix_template(
-        change_type=cluster.change_type,
-        language=language,
-        field_name=field_name,
-        source_code=consumer_code,
+    fixed, _explanation = apply_fix_template(
+        consumer_code,
+        language,
+        cluster.change_type,
+        field_name,
     )
-    return result if result else consumer_code
+    return fixed if fixed else consumer_code
 
 
 def generate_fix_rag(
-    change_type: str,
-    language: str,
-    field_name: str,
-    consumer_code: str,
+    change_type: str = "",
+    language: str = "",
+    field_name: str = "",
+    consumer_code: str = "",
     repo: Optional[str] = None,
+    *,
+    code: Optional[str] = None,
+    file_path: str = "",
+    change_description: str = "",
+    store=None,
 ) -> RagFixResult:
     """
     Main entry point. Tries RAG retrieval first (threshold 0.7),
     then cluster archetype (threshold 0.5), then fix_templates as final fallback.
     NEVER calls LLM.
+
+    Accepts BOTH call shapes. webhook.py calls this as
+        generate_fix_rag(code=..., file_path=..., field_name=...,
+                         change_type=..., change_description=..., store=...)
+    which did not match the positional signature at all -- so even once the
+    missing rag_store module existed, this would have raised TypeError on the
+    first real invocation. The keyword-only aliases below accept the caller's
+    shape rather than forcing every caller to change.
     """
+    # Reconcile the two shapes
+    if code is not None:
+        consumer_code = code
+    if not language and file_path:
+        language = _language_from_path(file_path)
+
+    # Retrieval reads from the passed store when given (per-org isolation),
+    # otherwise the module singleton.
+    active_store = _resolve_store(store)
+
     # 1. Try exact RAG pattern match
-    rag_result = retrieve_fix_pattern(change_type, language, field_name, repo)
+    rag_result = retrieve_fix_pattern(change_type, language, field_name, repo,
+                                      store=active_store)
     if rag_result:
         pattern, confidence = rag_result
         fixed = _apply_pattern_fix(pattern, consumer_code, field_name)
@@ -210,7 +279,7 @@ def generate_fix_rag(
         )
 
     # 2. Try cluster archetype
-    cluster_result = retrieve_cluster_archetype(change_type, language)
+    cluster_result = retrieve_cluster_archetype(change_type, language, store=active_store)
     if cluster_result:
         cluster, confidence = cluster_result
         fixed = _apply_cluster_fix(cluster, consumer_code, field_name, language)
@@ -231,11 +300,11 @@ def generate_fix_rag(
     # 3. Final fallback: fix_templates (deterministic, no LLM)
     from app.fix_templates import apply_fix_template
 
-    fixed = apply_fix_template(
-        change_type=change_type,
-        language=language,
-        field_name=field_name,
-        source_code=consumer_code,
+    fixed, _explanation = apply_fix_template(
+        consumer_code,
+        language,
+        change_type,
+        field_name,
     )
     if fixed and fixed != consumer_code:
         return RagFixResult(

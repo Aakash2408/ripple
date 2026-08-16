@@ -1137,10 +1137,17 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                     file_confidence = detector_confidence
                     # Record how the fix was actually produced, so the PR body
                     # does not mislabel a deterministic template fix as
-                    # LLM-generated.
-                    fix_source = "template" if "[template]" in explanation else (
-                        "rag" if "[RAG" in explanation else "llm"
-                    )
+                    # LLM-generated. Order matters: RAG's own fallback chain
+                    # returns "[RAG/template]" when it found no learned
+                    # pattern, and that is a TEMPLATE fix -- checking for
+                    # "[RAG" first would claim learned-pattern provenance for
+                    # a purely deterministic transform.
+                    if "template" in explanation.lower():
+                        fix_source = "template"
+                    elif "[RAG" in explanation:
+                        fix_source = "rag"
+                    else:
+                        fix_source = "llm"
                     file_sources = ["grep", fix_source]
                     file_reasons = [
                         f"Field reference detected in {_detect_lang(consumer_file)} "

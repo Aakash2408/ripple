@@ -765,6 +765,111 @@ def test_fix_generated_is_logged_exactly_once():
 
 
 # ===================================================================
+# CLASS 9: RAG -- the subsystem that had never once executed
+# ===================================================================
+
+def test_rag_retriever_imports():
+    """rag_retriever imported `from app.rag_store import ...` and that module
+    was NEVER WRITTEN, so ~1000 lines of retrieval could not load at all.
+    Every fix silently fell through to templates, hidden by
+    `except Exception: pass` around the RAG call."""
+    from app.rag_retriever import generate_fix_rag, retrieve_fix_pattern
+    from app.rag_store import rag_store, FixPattern, StructuredPattern
+    assert callable(generate_fix_rag)
+    assert hasattr(rag_store, "patterns")
+    assert hasattr(rag_store, "structured_patterns")
+    assert hasattr(rag_store, "save")
+
+
+def test_generate_fix_rag_accepts_the_webhook_call_shape():
+    """webhook.py calls generate_fix_rag(code=, file_path=, change_type=,
+    change_description=, store=) but the signature was
+    (change_type, language, field_name, consumer_code, repo) -- a TypeError
+    on the first real invocation even once the module existed."""
+    from app.rag_retriever import generate_fix_rag
+    go = "type R struct {\n\tName string\n\tPhoneNumber string\n}"
+    result = generate_fix_rag(
+        code=go, file_path="handler.go", field_name="phone_number",
+        change_type="field_removed", change_description="removed phone_number",
+    )
+    assert result.fixed_code != go, "no fix produced"
+    assert "PhoneNumber" not in result.fixed_code
+
+
+def test_rag_exact_match_used_when_a_pattern_exists():
+    import tempfile
+    import time as _t
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        import importlib
+        from app import rag_store as rs
+        importlib.reload(rs)
+        from app import rag_retriever as rr
+        importlib.reload(rr)
+
+        pid = rs.PatternStore.make_pattern_id("field_removed", "go", "phone_number")
+        rs.rag_store.add_pattern(rs.FixPattern(
+            pattern_id=pid, change_type="field_removed", language="go",
+            field_name="phone_number", strategy="drop struct field",
+            source_file="handler.go", merge_count=7, reject_count=1,
+            last_used=_t.time(),
+        ))
+        rs.rag_store._rebuild_clusters()
+
+        go = "type R struct {\n\tName string\n\tPhoneNumber string\n}"
+        result = rr.generate_fix_rag(
+            code=go, file_path="handler.go",
+            field_name="phone_number", change_type="field_removed",
+        )
+        assert result.source_type == "rag_exact", \
+            f"expected rag_exact, got {result.source_type}"
+        assert result.pattern_id == pid
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+
+
+def test_apply_fix_template_called_with_the_real_signature():
+    """rag_retriever passed source_code=/new_field_name= (actual params are
+    code=/new_name=) and treated the (code, explanation) tuple as a string.
+
+    Inspects the AST rather than the raw text: a substring check flagged the
+    comment that documents the old kwargs as a violation.
+    """
+    import ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tree = ast.parse(open(os.path.join(root, "app", "rag_retriever.py")).read())
+
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
+        if name != "apply_fix_template":
+            continue
+        for kw in node.keywords:
+            if kw.arg in ("source_code", "new_field_name"):
+                bad.append(f"line {node.lineno}: {kw.arg}=")
+    assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
+
+
+def test_rag_fallback_to_template_is_not_labelled_as_rag():
+    """RAG's own chain returns '[RAG/template]' when it finds no learned
+    pattern. Checking for '[RAG' before 'template' would claim
+    learned-pattern provenance for a purely deterministic transform -- the
+    same false-provenance bug as the earlier 'LLM-generated' mislabel."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "app", "webhook.py")).read()
+    idx_tmpl = src.find('if "template" in explanation.lower()')
+    idx_rag = src.find('elif "[RAG" in explanation')
+    assert idx_tmpl != -1 and idx_rag != -1, "provenance detection not found"
+    assert idx_tmpl < idx_rag, "template must be checked before [RAG"
+
+
+# ===================================================================
 # runner (works without pytest)
 # ===================================================================
 
