@@ -364,6 +364,17 @@ Get the template: `GET /config/template`
 
 ## Supported Change Types
 
+All 47 change types emitted by the 10 diff engines reach a fix handler, in one of
+four categories. Not every category produces a finished fix, and the PR says
+which one it got:
+
+| Category | Count | What the PR contains |
+|---|---|---|
+| **Mechanical** | 27 | a complete deterministic fix |
+| **Judgment** | 21 | the safe part applied, the rest marked `RIPPLE-ACTION-REQUIRED` — a value is never invented and logic is never silently deleted |
+| **Wire-only** | 2 | no code change, because none is correct — a changed proto field number breaks serialization, not source |
+| **Non-breaking** | 1 | nothing, correctly (an added optional field breaks no consumer) |
+
 **OpenAPI:**
 - [x] Added required field
 - [x] Removed field
@@ -581,6 +592,56 @@ GET /health           — server health
 - **Not a linter** — Linters find style issues. Ripple finds breaking contract violations across repos.
 - **Not AI code review** — Code review finds bugs in what you wrote. Ripple fixes what you forgot to update.
 - **Not SDK generation** — SDK generators rebuild from scratch. Ripple patches your EXISTING code.
+
+## Contributing — traps worth knowing
+
+Every one of these was a real defect that shipped and had to be found. They are
+listed because each has recurred, and because the failures are quiet rather than
+loud. Agent-facing detail lives in `.kiro/steering/ripple-invariants.md`.
+
+**The core failure mode is silence, not an error.** If a fix template returns the
+code unchanged, `fixed_code == content`, so no PR opens. An unhandled change type
+therefore produces *nothing* — Ripple detects a breaking change and stays quiet,
+which is worse than not detecting it, because the user believes they are covered.
+This is why `tools/coverage_matrix.py` gates CI: it asserts no change type any
+engine can emit can reach the fix layer and fall through.
+
+**Underscore is a word character.** `\bLEGACY\b` does not match Go's
+`Status_LEGACY`, so protobuf-generated enums slip past a matcher that looks
+correct. This has bitten four separate call sites. Use
+`(?<![A-Za-z0-9])NAME(?![A-Za-z0-9])`.
+
+**Removing a line orphans what follows it.** Deleting `case X:` leaves that arm's
+statements dangling inside the switch, and the file no longer compiles. Removal
+has to span to the next `case`, `default`, or closing brace. Same class as
+leaving a trailing comma behind in a Go struct literal.
+
+**Declarations come in more than one shape.** `enum Status { LEGACY, ACTIVE }`
+inline and the multiline form are different parse problems. Handling one and
+missing the other looks identical to full coverage from the outside.
+
+**Never claim the output compiles.** Commenting out `r, err := c.svc.Delete(ctx)`
+leaves `return err` referencing an undefined variable. A PR that overstates what
+it fixed costs more trust than one that admits a partial fix, so the explanations
+carry the caveat and a regression test asserts the false claim is absent.
+
+**Audit the green cells.** The coverage matrix can report zero failures while a
+transform quietly matches nothing. Six real defects here were found by
+investigating cells that reported "no change" — none by the passing total.
+
+Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7):
+
+```bash
+python tools/check_names.py app/*.py       # NameError before deploy
+python tests/test_regression.py            # 70 tests
+python tools/audit_diff_engines.py         # 0 false negatives / positives
+python tools/audit_change_types.py         # all 47 emitted types classified
+python tools/coverage_matrix.py            # 459 combos, 0 escapes
+python tools/audit_fail_silent.py          # report-only: 51 sites, ratchet down
+```
+
+The first five gate CI. The last is printed but non-blocking, so the count stays
+visible in every build.
 
 ## License
 
