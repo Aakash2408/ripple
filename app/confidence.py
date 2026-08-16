@@ -164,13 +164,26 @@ def format_pr_body(change_description: str, source_repo: str,
     # Confidence breakdown
     obs_score = min(0.99, confidence + 0.02)
     lang_score = 0.95
-    fix_score = 0.92 if "template" in " ".join(sources).lower() else 0.78
+    # Label the fix by how it was ACTUALLY produced. This previously guessed
+    # from `sources` and fell through to "LLM-generated (semantic)", so a
+    # deterministic template fix was reported as LLM output -- misrepresenting
+    # provenance on every PR (and Anthropic had zero credits, so it could not
+    # have been LLM-generated at all).
+    joined_sources = " ".join(sources).lower()
+    if "template" in joined_sources:
+        fix_score, fix_label = 0.92, "Template-based (deterministic)"
+    elif "rag" in joined_sources:
+        fix_score, fix_label = 0.88, "RAG (learned from merged PRs)"
+    elif "llm" in joined_sources or "claude" in joined_sources:
+        fix_score, fix_label = 0.78, "LLM-generated (semantic)"
+    else:
+        fix_score, fix_label = 0.80, "Pattern-based"
     hist_score = min(0.95, confidence - 0.03)
     
     obs_reason = reasons[0] if reasons else "Co-change pattern detected in git history"
     body_parts.append(f"| Observation history | {obs_score:.2f} | {obs_reason} |")
     body_parts.append(f"| Language confidence | {lang_score:.2f} | Native template engine |")
-    body_parts.append(f"| Fix type | {fix_score:.2f} | {'Template-based (deterministic)' if fix_score > 0.9 else 'LLM-generated (semantic)'} |")
+    body_parts.append(f"| Fix type | {fix_score:.2f} | {fix_label} |")
     body_parts.append(f"| Historical accuracy | {hist_score:.2f} | Similar fixes merged without revert |")
     
     body_parts.append("")

@@ -58,7 +58,7 @@ def main() -> int:
     verdicts = []
     for repo in repos:
         files = wh._search_repo_for_consumers(repo, change, token, exclude_path="user.proto")
-        for path, content in files:
+        for path, content, _detect_conf in files:
             consumer = wh.ConsumerMatch(
                 file_path=path, line_number=0, code_snippet="",
                 confidence="high", match_reason="inspect",

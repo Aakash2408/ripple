@@ -945,7 +945,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         for consumer_repo in consumer_repos:
             consumer_files = _search_repo_for_consumers(consumer_repo, change, token, exclude_path=spec_path)
             consumer_files_by_repo[consumer_repo] = consumer_files
-            for file_path, content in consumer_files:
+            for file_path, content, _detect_conf in consumer_files:
                 grep_results.append(file_path)
         
         _log_activity("consumer_search_complete", {
@@ -996,7 +996,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         for consumer_repo in consumer_repos:
             consumer_files = consumer_files_by_repo.get(consumer_repo, [])
             
-            for consumer_file, consumer_content in consumer_files:
+            for consumer_file, consumer_content, detector_confidence in consumer_files:
                 # Check ignore patterns
                 if config.should_ignore(consumer_file):
                     continue
@@ -1027,14 +1027,30 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                 
                 if fixed_code != consumer_content:
                     # Find this file's confidence from ensemble predictions
-                    file_confidence = 0.7  # default grep confidence
-                    file_sources = ["grep"]
-                    file_reasons = ["Direct API endpoint reference found"]
+                    # Start from the confidence the consumer detector actually
+                    # computed for THIS file (0.95 for a struct-field match,
+                    # 0.70 for a weaker reference). This used to be a hardcoded
+                    # 0.7 because the detector's score was discarded, so every
+                    # PR claimed the same number regardless of match strength.
+                    file_confidence = detector_confidence
+                    # Record how the fix was actually produced, so the PR body
+                    # does not mislabel a deterministic template fix as
+                    # LLM-generated.
+                    fix_source = "template" if "[template]" in explanation else (
+                        "rag" if "[RAG" in explanation else "llm"
+                    )
+                    file_sources = ["grep", fix_source]
+                    file_reasons = [
+                        f"Field reference detected in {_detect_lang(consumer_file)} "
+                        f"source (detector confidence {detector_confidence:.2f})"
+                    ]
                     for pred in ensemble_predictions:
                         if pred.get("file") == consumer_file or consumer_file.endswith(pred.get("file", "")):
-                            file_confidence = pred["confidence"]
-                            file_sources = pred.get("sources", ["grep"])
-                            file_reasons = pred.get("reasons", ["Pattern match"])
+                            # Ensemble carries co-change history, which is a
+                            # stronger signal than a static match -- prefer it.
+                            file_confidence = max(pred["confidence"], detector_confidence)
+                            file_sources = pred.get("sources", ["grep"]) + [fix_source]
+                            file_reasons = pred.get("reasons", file_reasons)
                             break
                     
                     # Only create PR if confidence is high enough
@@ -1781,7 +1797,10 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str, ex
             )
             
             if is_consumer:
-                results.append((file_path, content))
+                # Propagate the COMPUTED confidence. This used to be
+                # discarded, so every PR fell back to a hardcoded 0.7 even
+                # when the detector had scored a struct-field match at 0.95.
+                results.append((file_path, content, confidence))
     
     # Code search depends on GitHub's search INDEX, which lags for newly
     # created or recently pushed repos -- it returns total_count=0 even
@@ -1842,14 +1861,14 @@ def _scan_repo_tree_for_consumers(
             content, file_path, field_name, _detect_lang(file_path), min_confidence=0.5
         )
         if is_consumer:
-            results.append((file_path, content))
+            results.append((file_path, content, confidence))
     
     if results:
         _log_activity("tree_scan_found", {
             "repo": repo,
             "scanned": len(candidates),
             "found": len(results),
-            "files": [f for f, _ in results][:5],
+            "files": [f for f, _, _ in results][:5],
         })
     return results
 

@@ -250,7 +250,8 @@ message User {
     for repo in targets:
         files = wh._search_repo_for_consumers(repo, change, token, exclude_path=SPEC)
         found[repo] = files
-        print(f"  {repo}: {len(files)} file(s) -> {[f for f, _ in files]}")
+        print(f"  {repo}: {len(files)} file(s) -> "
+              f"{[(f, round(c, 2)) for f, _, c in files]}")
     total_files = sum(len(v) for v in found.values())
     if total_files == 0:
         print("\n❌ BLOCKER: search found 0 consumer files. Fix/PR cannot proceed.")
@@ -261,7 +262,7 @@ message User {
     hr("4. FIX GENERATION (LLM-free template/RAG)")
     fixes = []
     for repo, files in found.items():
-        for path, content in files:
+        for path, content, detect_conf in files:
             consumer = wh.ConsumerMatch(
                 file_path=path, line_number=0, code_snippet="",
                 confidence="high", match_reason="local harness",
