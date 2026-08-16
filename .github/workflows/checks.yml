@@ -51,6 +51,20 @@ jobs:
         # comment stripping.
         run: python tools/audit_diff_engines.py
 
+      - name: Change-type coverage audit
+        # Fails if any engine can emit a change_type with no canonical
+        # operation. An unclassified type reaches fix_templates as "Unknown
+        # change_type", leaves the code unchanged, and therefore opens NO PR --
+        # a detected breaking change would produce silence.
+        run: python tools/audit_change_types.py
+
+      - name: Coverage matrix
+        # Every change_type x every language. Also enforces the per-category
+        # contracts: judgment types must produce a marked non-empty diff (an
+        # empty diff opens no PR), and wire-only types must leave the code
+        # unchanged while saying so explicitly.
+        run: python tools/coverage_matrix.py
+
       - name: Fail-silent audit (report only)
         # Not gating yet: 51 sites remain, many legitimately silent. Printed
         # so the number is visible in every build and can be ratcheted down.

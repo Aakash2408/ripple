@@ -499,10 +499,41 @@ def _remove_case_block(code: str, names: set, lang: str) -> str:
     return '\n'.join(out)
 
 
+def _remove_inline_enum_member(code: str, names: set) -> str:
+    """Remove a member from a single-line enum declaration.
+
+    Found by the coverage matrix: the multiline form worked but the inline one
+    did not, and inline enums are common in Java and C#:
+
+        enum Status { LEGACY, ACTIVE }   ->   enum Status { ACTIVE }
+
+    The line-wise patterns cannot express this because the member is not on
+    its own line.
+    """
+    def _strip(match):
+        head, body, tail = match.group(1), match.group(2), match.group(3)
+        members = [m.strip() for m in body.split(',')]
+        kept = [
+            m for m in members
+            if m and not any(
+                re.fullmatch(rf'{re.escape(n)}(\s*=.*)?', m) for n in names
+            )
+        ]
+        return f"{head}{', '.join(kept)}{tail}"
+
+    # enum Name { A, B }  /  enum class Name { A, B }
+    return re.sub(
+        r'(\benum\s+(?:class\s+)?\w+\s*\{\s*)([^{}\n]*?)(\s*\})',
+        _strip, code
+    )
+
+
 def _remove_enum_value(code: str, variants: dict, lang: str) -> str:
     names = _symbol_names(variants)
     # Whole-arm removal first, so bodies are not orphaned.
     code = _remove_case_block(code, names, lang)
+    # Inline single-line enum declarations, which line patterns cannot reach.
+    code = _remove_inline_enum_member(code, names)
     patterns = _ENUM_VALUE_PATTERNS.get(lang)
     if patterns is None:
         return _generic_remove(code, variants)
