@@ -1534,7 +1534,6 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
         )
         
         if result and result.fixed_code != content:
-            _log_activity("fix_generated", {"source": result.source_type, "file": getattr(consumer, 'file_path', ''), "confidence": getattr(result, 'confidence', 0)})
             return result.fixed_code, f"[RAG/{result.source_type}] {result.explanation}"
     except Exception:
         pass  # RAG unavailable or failed — fall through to templates
@@ -1542,7 +1541,10 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     # Fallback to template engine
     fixed_code, explanation = _generate_with_template(content, consumer, change)
     if fixed_code != content:
-        _log_activity("fix_generated", {"source": "template", "file": getattr(consumer, 'file_path', '')})
+        # NOTE: deliberately NOT logged here. The caller logs fix_generated
+        # with repo + changed context; logging in both places double-counted
+        # every fix (handler.go x2, UserClient.ts x2, ...) and inflated the
+        # dashboard's fixes_generated counter.
         return fixed_code, f"[template] {explanation}"
     
     return content, ""

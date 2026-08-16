@@ -55,7 +55,10 @@ async def dashboard():
     # 'pr_created', which nothing ever produced, so every row fell through
     # to the generic branch even when the store had data.
     activity_html = ""
-    for event in reversed(events[-20:]):
+    # One full pipeline run emits ~40 events, so a 20-row window pushed the
+    # most important one (breaking_changes_detected) off the page while the
+    # noisier per-file rows stayed visible.
+    for event in reversed(events[-45:]):
         ts = event.get("ts", "")
         action = event.get("action", "")
 

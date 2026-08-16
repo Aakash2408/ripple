@@ -752,6 +752,18 @@ def test_dashboard_has_no_duplicate_activity_store():
         "dashboard.py declared its own repo list again"
 
 
+def test_fix_generated_is_logged_exactly_once():
+    """fix_generated was emitted both in the fix loop AND inside
+    _generate_fix_with_rag_fallback, so every fix logged twice
+    (handler.go x2, UserClient.ts x2, ...) and the dashboard's
+    fixes_generated counter read double the real number."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "app", "webhook.py")).read()
+    count = src.count('_log_activity("fix_generated"')
+    assert count == 1, f"fix_generated logged from {count} sites, expected 1"
+
+
 # ===================================================================
 # runner (works without pytest)
 # ===================================================================
