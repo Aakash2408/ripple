@@ -168,19 +168,45 @@ async def root():
     return {"status": "ok", "service": "ripple", "version": "0.1.0"}
 
 
-# --- Activity log (ring buffer, last 50 events) ---
+# --- Activity log ---
+# Delegates to app/activity.py, the single shared store. There used to be a
+# second, disconnected _activity_log in dashboard.py that nothing wrote to,
+# which is why the dashboard always showed zeros.
 import time as _time
-_activity_log: list[dict] = []
+from . import activity as _activity
+
 
 def _log_activity(action: str, details: dict = None):
-    """Log an activity event to the ring buffer."""
-    _activity_log.append({
-        "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
-        "action": action,
-        **(details or {}),
-    })
-    if len(_activity_log) > 50:
-        _activity_log.pop(0)
+    """Record an activity event in the shared, persisted store."""
+    try:
+        _activity.record(action, details)
+    except Exception:
+        # Telemetry must never break the pipeline it is observing.
+        pass
+
+
+class _ActivityLogProxy:
+    """Backwards-compatible read-only view over the shared store.
+
+    Existing code (and tests) treat _activity_log as a list. Keeping that
+    interface avoids touching ~40 call sites while removing the duplicate
+    state underneath.
+    """
+
+    def __iter__(self):
+        return iter(_activity.all_events())
+
+    def __len__(self):
+        return len(_activity.all_events())
+
+    def __getitem__(self, item):
+        return _activity.all_events()[item]
+
+    def __bool__(self):
+        return bool(_activity.all_events())
+
+
+_activity_log = _ActivityLogProxy()
 
 
 @app.get("/health")

@@ -659,6 +659,100 @@ def test_no_engine_uses_the_non_nesting_regex():
 
 
 # ===================================================================
+# CLASS 8: SHARED STATE -- dashboard must reflect real pipeline work
+# ===================================================================
+
+def test_dashboard_counters_reflect_pipeline_events():
+    """dashboard.py kept its OWN _activity_log plus log_activity() and
+    register_repo() that NOTHING ever called, so it could only render zeros
+    while the pipeline opened real PRs. It also counted action names
+    ('pr_created', 'breaking_change') the pipeline never emits."""
+    import tempfile
+    old_dir = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        import importlib
+        from app import activity
+        importlib.reload(activity)
+        activity.reset()
+
+        activity.record("breaking_changes_detected",
+                        {"spec": "user.proto", "count": 1})
+        activity.record("pr_result", {"repo": "o/auth-service",
+                                      "url": "https://github.com/o/auth-service/pull/3"})
+        activity.record("pr_result", {"repo": "o/billing-api",
+                                      "url": "https://github.com/o/billing-api/pull/3"})
+        activity.record("residual_refs_flagged", {"repo": "o/notifications", "count": 2})
+
+        c = activity.counters()
+        assert c["breaks_detected"] == 1, c
+        assert c["prs_created"] == 2, c
+        assert c["partial_fixes"] == 1, c
+        assert c["repos_monitored"] >= 3, c
+    finally:
+        if old_dir is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old_dir
+
+
+def test_failed_prs_are_not_counted_as_created():
+    import tempfile
+    old_dir = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        import importlib
+        from app import activity
+        importlib.reload(activity)
+        activity.reset()
+        activity.record("pr_result", {"repo": "o/x", "url": "FAILED"})
+        activity.record("pr_result", {"repo": "o/y", "url": ""})
+        assert activity.counters()["prs_created"] == 0, "FAILED counted as created"
+    finally:
+        if old_dir is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old_dir
+
+
+def test_activity_survives_process_restart():
+    """An in-memory-only log resets on every Railway redeploy -- which is
+    what erased the successful 08:49 run before it could be inspected."""
+    import tempfile
+    import importlib
+    old_dir = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        from app import activity
+        importlib.reload(activity)
+        activity.reset()
+        activity.record("pr_result", {"repo": "o/x",
+                                      "url": "https://github.com/o/x/pull/1"})
+
+        # Simulate a restart: reload the module, same data dir
+        importlib.reload(activity)
+        assert activity.counters()["prs_created"] == 1, \
+            "activity did not survive a restart"
+    finally:
+        if old_dir is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old_dir
+
+
+def test_dashboard_has_no_duplicate_activity_store():
+    """Two independent _activity_log lists were the root cause. Guard
+    against a second one reappearing."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "app", "dashboard.py")).read()
+    assert "_activity_log: list" not in src, \
+        "dashboard.py declared its own activity store again"
+    assert "_installed_repos: list" not in src, \
+        "dashboard.py declared its own repo list again"
+
+
+# ===================================================================
 # runner (works without pytest)
 # ===================================================================
 

@@ -18,68 +18,98 @@ from fastapi.responses import HTMLResponse
 
 router = APIRouter()
 
-# In-memory activity log (in production, this would be a database)
-_activity_log: list[dict] = []
-_installed_repos: list[str] = []
+# State lives in app/activity.py -- the same store the webhook writes to.
+#
+# This module used to keep its OWN _activity_log and _installed_repos, plus
+# log_activity() and register_repo() to populate them. Nothing in the
+# codebase ever called either function, so the dashboard could only ever
+# render zeros while the pipeline was opening real PRs. The duplicated state
+# is gone; these wrappers remain only so any external caller keeps working.
+from . import activity as _activity
 
 
 def log_activity(action: str, details: dict):
-    """Log an activity event."""
-    import time
-    _activity_log.append({
-        "timestamp": time.time(),
-        "action": action,
-        "details": details,
-    })
-    # Keep last 100 events
-    if len(_activity_log) > 100:
-        _activity_log.pop(0)
+    """Deprecated: record via the shared store."""
+    _activity.record(action, details)
 
 
 def register_repo(repo: str):
-    """Register a monitored repo."""
-    if repo not in _installed_repos:
-        _installed_repos.append(repo)
+    """Deprecated no-op.
+
+    Monitored repos are now DERIVED from observed events and the App
+    installation scope, rather than depending on a registration call that
+    was never wired up.
+    """
+    return None
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Serve the dashboard HTML page."""
-    import time
-    
-    # Build activity rows
+    events = _activity.all_events()
+    stats = _activity.counters()
+    repos = _activity.monitored_repos()
+
+    # Build activity rows. Action names below are the ones the pipeline
+    # ACTUALLY emits -- the previous version matched 'breaking_change' and
+    # 'pr_created', which nothing ever produced, so every row fell through
+    # to the generic branch even when the store had data.
     activity_html = ""
-    for event in reversed(_activity_log[-20:]):
-        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(event["timestamp"]))
-        action = event["action"]
-        details = event["details"]
-        
-        if action == "breaking_change":
+    for event in reversed(events[-20:]):
+        ts = event.get("ts", "")
+        action = event.get("action", "")
+
+        if action == "breaking_changes_detected":
             icon = "⚠️"
-            desc = f"Breaking change in <b>{details.get('spec', '?')}</b>: {details.get('change', '?')}"
-        elif action == "pr_created":
-            icon = "✅"
-            desc = f"PR opened in <b>{details.get('repo', '?')}</b>: {details.get('title', '?')}"
-        elif action == "learning_complete":
-            icon = "🧠"
-            desc = f"Learned from <b>{details.get('repo', '?')}</b>: {details.get('stats', '?')}"
-        elif action == "install":
-            icon = "📦"
-            desc = f"Installed on <b>{details.get('repo', '?')}</b>"
+            changes = event.get("changes") or []
+            what = ", ".join(
+                f"{c.get('type')} {c.get('field')}" for c in changes[:3]
+            ) or f"{event.get('count', '?')} change(s)"
+            desc = f"Breaking change in <b>{event.get('spec', '?')}</b>: {what}"
+        elif action in ("pr_result", "pr_updated_existing"):
+            url = event.get("url", "")
+            if url and url != "FAILED":
+                icon = "✅"
+                desc = (f"PR opened in <b>{event.get('repo', '?')}</b>: "
+                        f'<a href="{url}" target="_blank">{url.rsplit("/", 2)[-2]}/'
+                        f'{url.rsplit("/", 1)[-1]}</a>')
+            else:
+                icon = "❌"
+                desc = f"PR failed in <b>{event.get('repo', '?')}</b>"
+        elif action == "residual_refs_flagged":
+            icon = "⚠️"
+            desc = (f"Partial fix in <b>{event.get('repo', '?')}</b>: "
+                    f"{event.get('count', '?')} call site(s) need review")
+        elif action == "fix_generated":
+            icon = "🔧"
+            desc = (f"Fix generated for <b>{event.get('file', '?')}</b> "
+                    f"({event.get('source', '')[:40]})")
+        elif action == "consumer_scope":
+            icon = "🔍"
+            desc = (f"Consumer scope: {event.get('count', '?')} repo(s) "
+                    f"via {event.get('mode', '?')}")
+        elif action == "webhook_received":
+            icon = "📨"
+            desc = f"Webhook from <b>{event.get('repo', '?')}</b>"
+        elif action in ("pr_error", "process_spec_error", "app_auth_failed"):
+            icon = "❌"
+            desc = f"{action}: {str(event.get('err') or event.get('error', ''))[:90]}"
         else:
             icon = "📋"
-            desc = str(details)
-        
+            detail = {k: v for k, v in event.items()
+                      if k not in ("ts", "epoch", "action")}
+            desc = f"{action} {detail}" if detail else action
+
         activity_html += f'<tr><td>{ts}</td><td>{icon}</td><td>{desc}</td></tr>\n'
-    
+
     if not activity_html:
         activity_html = '<tr><td colspan="3" class="empty">No activity yet. Install on a repo and push a spec change to see Ripple in action.</td></tr>'
-    
+
     # Build repos list
     repos_html = ""
-    for repo in _installed_repos:
+    for repo in repos:
         repos_html += f'<li><a href="https://github.com/{repo}" target="_blank">{repo}</a></li>\n'
-    
+
     if not repos_html:
         repos_html = '<li class="empty">No repos monitored yet. Install the GitHub App to get started.</li>'
     
@@ -139,15 +169,15 @@ async def dashboard():
     <div class="container">
         <div class="stats-row">
             <div class="stat">
-                <div class="stat-value">{len(_installed_repos)}</div>
+                <div class="stat-value">{stats['repos_monitored']}</div>
                 <div class="stat-label">Repos Monitored</div>
             </div>
             <div class="stat">
-                <div class="stat-value">{len([e for e in _activity_log if e['action'] == 'pr_created'])}</div>
+                <div class="stat-value">{stats['prs_created']}</div>
                 <div class="stat-label">PRs Created</div>
             </div>
             <div class="stat">
-                <div class="stat-value">{len([e for e in _activity_log if e['action'] == 'breaking_change'])}</div>
+                <div class="stat-value">{stats['breaks_detected']}</div>
                 <div class="stat-label">Breaks Detected</div>
             </div>
             <div class="stat">
