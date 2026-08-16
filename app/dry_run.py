@@ -61,6 +61,9 @@ async def dry_run_analysis(request: Request):
     spec_after = body.get("spec_after", "")
     contract_type = body.get("contract_type", "openapi")
     repo = body.get("repo", "")
+    # Optional: the real path of the spec that changed. Without it, results name
+    # a placeholder instead of the user's file.
+    spec_path = body.get("spec_path") or body.get("file_path") or ""
     
     if not spec_before or not spec_after:
         return JSONResponse(
@@ -69,7 +72,9 @@ async def dry_run_analysis(request: Request):
         )
     
     # Step 1: Detect breaking changes
-    breaking_changes = _detect_changes(spec_before, spec_after, contract_type)
+    breaking_changes, detect_meta = _detect_changes(
+        spec_before, spec_after, contract_type, spec_path
+    )
     
     if not breaking_changes:
         return JSONResponse(content={
@@ -79,6 +84,7 @@ async def dry_run_analysis(request: Request):
             "would_open_prs": 0,
             "summary": "✅ No breaking changes detected. Safe to push.",
             "impact_report": "",
+            **detect_meta,
         })
     
     # Step 2: Build summary (consumer finding requires repo access — not available in dry-run)
@@ -111,6 +117,7 @@ async def dry_run_analysis(request: Request):
         "would_open_prs": 0,
         "summary": f"⚠️ {len(breaking_changes)} breaking change(s) detected. Install Ripple to auto-find consumers and open fix PRs.",
         "impact_report": impact_md,
+        **detect_meta,
     })
 
 
@@ -120,39 +127,63 @@ async def dry_run_ui():
     return HTMLResponse(content=DRY_RUN_HTML)
 
 
-def _detect_changes(before: str, after: str, contract_type: str) -> list[BreakingChange]:
-    """Detect breaking changes between two spec versions."""
+def _detect_changes(before: str, after: str, contract_type: str,
+                    spec_path: str = "") -> tuple[list[BreakingChange], dict]:
+    """Detect breaking changes between two spec versions.
+
+    Returns (changes, meta). `meta` names the engine that ran and, when the
+    specialised engine failed, why we fell back -- this used to be a bare
+    `except Exception: return _basic_diff(...)`, so a crashing engine silently
+    downgraded to a generic text comparison and the caller could not tell the
+    difference between "no breaking changes" and "the real engine died".
+
+    `spec_path` is threaded into every engine so results name the FILE THE USER
+    CHANGED. Each engine defaults it to a plausible-looking placeholder
+    ('schema.proto', 'schema.graphql', ...), and dry-run never passed it -- so
+    a real change in
+    temporal/api/workflowservice/v1/request_response.proto was reported as
+    occurring in 'schema.proto'. A fabricated filename in user-facing output is
+    the same defect class as an overstated fix claim, just smaller.
+    """
+    path = spec_path or f"<{contract_type} spec>"
+    meta = {"engine": contract_type, "spec_path": path}
     try:
         if contract_type == "proto":
             from .proto_diff import diff_proto
-            return diff_proto(before, after)
+            return diff_proto(before, after, file_path=path), meta
         elif contract_type == "graphql":
             from .graphql_diff import diff_graphql
-            return diff_graphql(before, after)
+            return diff_graphql(before, after, file_path=path), meta
         elif contract_type == "asyncapi":
             from .asyncapi_diff import diff_asyncapi
-            return diff_asyncapi(before, after)
+            return diff_asyncapi(before, after, file_path=path), meta
         elif contract_type == "avro":
             from .avro_diff import diff_avro
-            return diff_avro(before, after)
+            return diff_avro(before, after, file_path=path), meta
         elif contract_type == "trpc":
             from .trpc_diff import diff_trpc
-            return diff_trpc(before, after)
+            return diff_trpc(before, after, file_path=path), meta
         elif contract_type == "thrift":
             from .thrift_diff import diff_thrift
-            return diff_thrift(before, after)
+            return diff_thrift(before, after, file_path=path), meta
         elif contract_type == "jsonschema":
             from .jsonschema_diff import diff_jsonschema
-            return diff_jsonschema(before, after)
+            return diff_jsonschema(before, after, file_path=path), meta
         elif contract_type == "smithy":
             from .smithy_diff import diff_smithy
-            return diff_smithy(before, after)
+            return diff_smithy(before, after, file_path=path), meta
         else:
             # OpenAPI / database / default
-            return _basic_diff(before, after, contract_type)
-    except Exception:
-        # Fallback to basic diff on any error
-        return _basic_diff(before, after, contract_type)
+            meta["engine"] = f"{contract_type} (basic)"
+            return _basic_diff(before, after, contract_type), meta
+    except Exception as e:
+        meta["engine"] = f"{contract_type} -> basic (degraded)"
+        meta["engine_degraded"] = (
+            f"{type(e).__name__}: {str(e)[:160]} -- the {contract_type} engine "
+            f"failed, so these results come from a generic text comparison and "
+            f"may be incomplete."
+        )
+        return _basic_diff(before, after, contract_type), meta
 
 
 def _basic_diff(before: str, after: str, contract_type: str) -> list[BreakingChange]:
