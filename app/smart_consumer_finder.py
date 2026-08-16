@@ -354,3 +354,41 @@ def search_content_for_field(
                         return True
     
     return False
+
+
+def find_residual_references(
+    code: str, field_name: str, language: str
+) -> list:
+    """Find references to `field_name` that SURVIVED a fix.
+
+    Removing a field's declaration and its pass-through plumbing is
+    mechanical and safe to automate. Deciding what a *usage* should become
+    is not. After `phone_number` is deleted from the contract:
+
+        results["sms"] = send_sms(
+            to=user.phone_number,     <-- still here; now invalid
+            message=msg,
+        )
+
+    Dropping that argument leaves `send_sms()` missing a required
+    parameter; dropping the whole call silently disables the customer's
+    SMS. Both are product decisions, so Ripple surfaces them for a human
+    rather than guessing -- and must not present the fix as complete while
+    references remain.
+
+    Comment-only mentions are ignored: they do not break at runtime.
+
+    Returns a list of (line_number, line_text, variant_matched).
+    """
+    variants = sorted(set(generate_variants(field_name)), key=len, reverse=True)
+
+    residual = []
+    for idx, line in enumerate(code.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or _is_comment(stripped, language):
+            continue
+        for variant in variants:
+            if variant in line:
+                residual.append((idx, stripped, variant))
+                break
+    return residual

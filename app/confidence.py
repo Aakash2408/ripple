@@ -90,14 +90,25 @@ def format_confidence_table(predictions: list[dict]) -> str:
 def format_pr_body(change_description: str, source_repo: str,
                    confidence: float, sources: list[str],
                    reasons: list[str], all_predictions: list[dict] = None,
-                   breaking_change: dict = None, fix_summary: str = "") -> str:
+                   breaking_change: dict = None, fix_summary: str = "",
+                   residual_refs: list = None,
+                   consumer_file: str = "") -> str:
     """
     Generate a complete PR body with confidence, impact report, and learning context.
+
+    residual_refs: list of (line_no, line_text, variant) references to the
+    changed field that survived the automated fix. These require a human
+    decision, so they are called out prominently instead of being silently
+    left in the diff.
     """
     level = classify_confidence(confidence)
     
+    # Don't claim a complete fix when references survive.
+    heading = ("## Ripple — Partial Fix (review required)" if residual_refs
+               else "## Ripple — Automated Fix")
+    
     body_parts = [
-        f"## Ripple — Automated Fix",
+        heading,
         "",
         "### Breaking Change",
         "",
@@ -111,6 +122,36 @@ def format_pr_body(change_description: str, source_repo: str,
         body_parts.append(f"| **Change** | {change_description} |")
     else:
         body_parts.append(f"| **Change** | {change_description} |")
+    
+    # Call sites that need a HUMAN decision. Shown high in the body because
+    # merging without addressing them leaves the code referencing a field
+    # that no longer exists.
+    if residual_refs:
+        target = f"`{consumer_file}`" if consumer_file else "this file"
+        body_parts.extend([
+            "",
+            f"### ⚠️ Action required — {len(residual_refs)} call site(s) need your decision",
+            "",
+            f"Ripple removed the declaration and pass-through plumbing, but "
+            f"{target} still references this field at the following line(s). "
+            f"**This PR is not safe to merge as-is.**",
+            "",
+            "| Line | Code | Symbol |",
+            "|---|---|---|",
+        ])
+        for line_no, text, variant in residual_refs[:10]:
+            safe = text.replace("|", "\\|")[:70]
+            body_parts.append(f"| {line_no} | `{safe}` | `{variant}` |")
+        body_parts.extend([
+            "",
+            "Ripple deliberately did **not** auto-resolve these. Each option "
+            "changes behaviour in a way only you can choose:",
+            "",
+            "- **Remove the argument** — the enclosing call may then be missing a required parameter.",
+            "- **Remove the whole call** — silently disables that code path (e.g. a customer notification).",
+            "- **Substitute another field** — a product decision Ripple cannot infer.",
+            "",
+        ])
     
     body_parts.extend([
         "",

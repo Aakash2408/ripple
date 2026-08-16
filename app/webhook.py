@@ -1227,7 +1227,15 @@ def _github_api(method: str, path: str, token: str, data: dict = None) -> dict:
     
     try:
         with urlopen(req, timeout=15, context=SSL_CTX) as resp:
-            return json.loads(resp.read().decode())
+            raw = resp.read().decode()
+            # DELETE and some PUT/PATCH endpoints return 204 No Content with
+            # an empty body -- json.loads("") raises JSONDecodeError.
+            if not raw.strip():
+                return {"status": getattr(resp, "status", 204)}
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return {"status": getattr(resp, "status", 200), "raw": raw[:200]}
     except HTTPError as e:
         error_body = e.read().decode() if hasattr(e, 'read') else ""
         return {"error": e.code, "message": error_body[:200]}
@@ -1875,6 +1883,22 @@ def _create_fix_pr(
     else:
         commit_msg = f"fix: Adapt to breaking change in '{change.field_name}'"
     
+    # Detect references to the field that survived the automated fix.
+    # These need a human decision, so the PR must say so rather than
+    # presenting itself as a finished fix.
+    from .smart_consumer_finder import find_residual_references
+    residual_refs = find_residual_references(
+        fixed_content, change.field_name, _detect_lang(file_path)
+    )
+    if residual_refs:
+        commit_msg = f"{commit_msg} (partial — {len(residual_refs)} call site(s) need review)"
+        _log_activity("residual_refs_flagged", {
+            "repo": repo,
+            "file": file_path,
+            "count": len(residual_refs),
+            "lines": [r[0] for r in residual_refs[:5]],
+        })
+    
     put_result = _github_api("PUT", f"/repos/{repo}/contents/{file_path}", token, {
         "message": commit_msg,
         "content": base64.b64encode(fixed_content.encode()).decode(),
@@ -1894,6 +1918,8 @@ def _create_fix_pr(
         sources=sources or ["grep"],
         reasons=reasons or ["Direct API endpoint reference found"],
         all_predictions=all_predictions,
+        residual_refs=residual_refs,
+        consumer_file=file_path,
     )
     
     # Create PR
