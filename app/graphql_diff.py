@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from .schema_parse import strip_comments, extract_blocks
+
 from .diff_engine import BreakingChange
 
 
@@ -42,62 +44,61 @@ class GraphQLType:
 
 
 def parse_graphql(content: str) -> dict[str, GraphQLType]:
-    """Parse a .graphql schema file into type definitions."""
+    """Parse a .graphql schema file into type definitions.
+
+    Uses schema_parse for brace-aware block extraction and comment
+    stripping. The previous r'\\{([^}]*)\\}' could not cross a nested brace,
+    so a field default like `arg: Input = {x: 1}` truncated the body and hid
+    every field after it. Comments were also parsed as live fields, so
+    deleting a `# commented: String` line looked like a breaking change.
+    """
+    # GraphQL uses '#' line comments; '"""' descriptions are left alone
+    # because they cannot contain a bare '}' that would unbalance a block.
+    clean = strip_comments(content, hash_comments=True)
+
     types = {}
-    
-    # Match type/input/interface definitions
-    type_pattern = re.compile(
-        r'(type|input|interface)\s+(\w+)(?:\s+implements\s+\w+)?\s*\{([^}]*)\}',
-        re.DOTALL
-    )
-    
-    for match in type_pattern.finditer(content):
-        kind = match.group(1)
-        name = match.group(2)
-        body = match.group(3)
-        
-        fields = {}
-        # Parse fields: name(args): Type or name: Type
-        field_pattern = re.compile(
-            r'(\w+)(?:\(([^)]*)\))?\s*:\s*([^\n]+)'
-        )
-        
-        for field_match in field_pattern.finditer(body):
-            field_name = field_match.group(1)
-            args_str = field_match.group(2) or ""
-            field_type = field_match.group(3).strip().rstrip('!').strip()
-            nullable = not field_match.group(3).strip().endswith('!')
-            
-            # Parse arguments
-            arguments = []
-            if args_str:
-                arg_pattern = re.compile(r'(\w+)\s*:\s*(\S+)')
-                for arg_match in arg_pattern.finditer(args_str):
-                    arg_name = arg_match.group(1)
-                    arg_type = arg_match.group(2)
-                    required = arg_type.endswith('!')
-                    arguments.append({
-                        "name": arg_name,
-                        "type": arg_type.rstrip('!'),
-                        "required": required,
-                    })
-            
-            fields[field_name] = GraphQLField(
-                name=field_name, type=field_type,
-                nullable=nullable, arguments=arguments,
+
+    for kind in ("type", "input", "interface"):
+        for name, body in extract_blocks(clean, kind):
+            fields = {}
+            # Parse fields: name(args): Type or name: Type
+            field_pattern = re.compile(r'(\w+)(?:\(([^)]*)\))?\s*:\s*([^\n]+)')
+
+            for field_match in field_pattern.finditer(body):
+                field_name = field_match.group(1)
+                args_str = field_match.group(2) or ""
+                raw_type = field_match.group(3).strip()
+                # Drop an inline default so it is not treated as the type
+                raw_type = raw_type.split('=')[0].strip()
+                field_type = raw_type.rstrip('!').strip()
+                nullable = not raw_type.endswith('!')
+
+                arguments = []
+                if args_str:
+                    arg_pattern = re.compile(r'(\w+)\s*:\s*(\S+)')
+                    for arg_match in arg_pattern.finditer(args_str):
+                        arg_name = arg_match.group(1)
+                        arg_type = arg_match.group(2)
+                        required = arg_type.endswith('!')
+                        arguments.append({
+                            "name": arg_name,
+                            "type": arg_type.rstrip('!'),
+                            "required": required,
+                        })
+
+                fields[field_name] = GraphQLField(
+                    name=field_name, type=field_type,
+                    nullable=nullable, arguments=arguments,
+                )
+
+            types[name] = GraphQLType(
+                name=name, kind=kind, fields=fields,
+                enum_values=[], union_members=[],
             )
-        
-        types[name] = GraphQLType(
-            name=name, kind=kind, fields=fields,
-            enum_values=[], union_members=[],
-        )
-    
+
     # Parse enums
-    enum_pattern = re.compile(r'enum\s+(\w+)\s*\{([^}]*)\}', re.DOTALL)
-    for match in enum_pattern.finditer(content):
-        name = match.group(1)
-        body = match.group(2)
-        values = [v.strip() for v in body.strip().split('\n') if v.strip() and not v.strip().startswith('#')]
+    for name, body in extract_blocks(clean, "enum"):
+        values = [v.strip() for v in body.strip().split('\n') if v.strip()]
         types[name] = GraphQLType(
             name=name, kind="enum", fields={},
             enum_values=values, union_members=[],
@@ -105,7 +106,7 @@ def parse_graphql(content: str) -> dict[str, GraphQLType]:
     
     # Parse unions
     union_pattern = re.compile(r'union\s+(\w+)\s*=\s*([^\n]+)')
-    for match in union_pattern.finditer(content):
+    for match in union_pattern.finditer(clean):
         name = match.group(1)
         members = [m.strip() for m in match.group(2).split('|')]
         types[name] = GraphQLType(

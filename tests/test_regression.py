@@ -548,6 +548,91 @@ def test_case_mismatched_variant_does_not_lower_score():
 
 
 # ===================================================================
+# CLASS 7: CROSS-ENGINE -- graphql / smithy / thrift on schema_parse
+# ===================================================================
+
+def test_graphql_brace_default_does_not_hide_later_fields():
+    """r'\\{([^}]*)\\}' truncated a GraphQL type body at the first nested
+    brace, so a field default like `= {x: 1}` hid every field after it."""
+    from app.graphql_diff import diff_graphql
+    old = """type Q {
+  a(f: I = {x: 1}): String
+  keep: String
+  gone: String
+}"""
+    new = """type Q {
+  a(f: I = {x: 1}): String
+  keep: String
+}"""
+    assert any(c.field_name == "gone" for c in diff_graphql(old, new)), \
+        "field after a brace default was not detected"
+
+
+def test_thrift_container_default_does_not_hide_later_fields():
+    from app.thrift_diff import diff_thrift
+    old = """struct U {
+  1: map<string,string> m = {},
+  2: string keep,
+  3: string gone,
+}"""
+    new = """struct U {
+  1: map<string,string> m = {},
+  2: string keep,
+}"""
+    assert any(c.field_name == "gone" for c in diff_thrift(old, new)), \
+        "field after a container default was not detected"
+
+
+def test_graphql_comment_only_change_is_not_breaking():
+    from app.graphql_diff import diff_graphql
+    old = "type U {\n  keep: String\n  # gone: String\n}"
+    new = "type U {\n  keep: String\n}"
+    assert diff_graphql(old, new) == [], "comment-only edit reported as breaking"
+
+
+def test_thrift_comment_only_change_is_not_breaking():
+    from app.thrift_diff import diff_thrift
+    old = "struct U {\n  1: string keep,\n  // 2: string gone,\n}"
+    new = "struct U {\n  1: string keep,\n}"
+    assert diff_thrift(old, new) == [], "comment-only edit reported as breaking"
+
+
+def test_smithy_comment_only_change_is_not_breaking():
+    from app.smithy_diff import diff_smithy
+    old = "structure U {\n  keep: String\n  // gone: String\n}"
+    new = "structure U {\n  keep: String\n}"
+    assert diff_smithy(old, new) == [], "comment-only edit reported as breaking"
+
+
+def test_ported_engines_still_detect_real_removals():
+    """Comment stripping must not suppress genuine breaking changes."""
+    from app.graphql_diff import diff_graphql
+    from app.thrift_diff import diff_thrift
+    from app.smithy_diff import diff_smithy
+
+    assert diff_graphql("type U {\n keep: String\n gone: String\n}",
+                        "type U {\n keep: String\n}"), "graphql regression"
+    assert diff_thrift("struct U {\n 1: string keep,\n 2: string gone,\n}",
+                       "struct U {\n 1: string keep,\n}"), "thrift regression"
+    assert diff_smithy("structure U {\n keep: String\n gone: String\n}",
+                       "structure U {\n keep: String\n}"), "smithy regression"
+
+
+def test_no_engine_uses_the_non_nesting_regex():
+    """The [^}]* pattern must not come back in any diff engine."""
+    import glob
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for path in glob.glob(os.path.join(root, "app", "*diff*.py")):
+        for i, line in enumerate(open(path).read().splitlines(), 1):
+            stripped = line.strip()
+            if "[^}]" in line and not stripped.startswith("#"):
+                offenders.append(f"{os.path.basename(path)}:{i}")
+    assert not offenders, f"non-nesting block regex reintroduced: {offenders}"
+
+
+# ===================================================================
 # runner (works without pytest)
 # ===================================================================
 

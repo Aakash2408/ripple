@@ -20,20 +20,20 @@ File format: .smithy (custom IDL) or .json (AST JSON)
 import re
 from typing import Optional
 from .diff_engine import BreakingChange
+from .schema_parse import strip_comments, extract_blocks
 
 
 def parse_smithy_structures(content: str) -> dict:
     """Parse Smithy structure definitions."""
     structures = {}
     
-    # Match: structure Name { members... }
-    struct_pattern = re.compile(r'structure\s+(\w+)\s*\{([^}]*)\}', re.DOTALL)
+    # Brace-aware + comment-stripped via schema_parse: r'\{([^}]*)\}' could
+    # not cross a nested brace, and comments parsed as live members.
+    clean = strip_comments(content)
     member_pattern = re.compile(r'(?:@required\s+)?(\w+)\s*:\s*(\w+)')
     required_pattern = re.compile(r'@required\s+(\w+)\s*:', re.MULTILINE)
     
-    for match in struct_pattern.finditer(content):
-        name = match.group(1)
-        body = match.group(2)
+    for name, body in extract_blocks(clean, 'structure'):
         members = {}
         required_members = set(m.group(1) for m in required_pattern.finditer(body))
         
@@ -54,12 +54,9 @@ def parse_smithy_operations(content: str) -> dict:
     """Parse Smithy service operations."""
     operations = {}
     
-    # Match: operation Name { input: X, output: Y }
-    op_pattern = re.compile(r'operation\s+(\w+)\s*\{([^}]*)\}', re.DOTALL)
+    clean = strip_comments(content)
     
-    for match in op_pattern.finditer(content):
-        name = match.group(1)
-        body = match.group(2)
+    for name, body in extract_blocks(clean, 'operation'):
         input_match = re.search(r'input\s*:\s*(\w+)', body)
         output_match = re.search(r'output\s*:\s*(\w+)', body)
         operations[name] = {
@@ -74,12 +71,9 @@ def parse_smithy_enums(content: str) -> dict:
     """Parse Smithy enum definitions."""
     enums = {}
     
-    # Match: enum Name { VALUE1, VALUE2 } or @enum with string values
-    enum_pattern = re.compile(r'enum\s+(\w+)\s*\{([^}]*)\}', re.DOTALL)
+    clean = strip_comments(content)
     
-    for match in enum_pattern.finditer(content):
-        name = match.group(1)
-        body = match.group(2)
+    for name, body in extract_blocks(clean, 'enum'):
         values = re.findall(r'(\w+)', body)
         enums[name] = [v for v in values if v and not v[0].islower()]  # Filter out annotations
     

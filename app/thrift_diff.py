@@ -18,18 +18,20 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 from .diff_engine import BreakingChange
+from .schema_parse import strip_comments, extract_blocks
 
 
 def parse_thrift_structs(content: str) -> dict:
     """Parse Thrift struct definitions."""
     structs = {}
     
-    struct_pattern = re.compile(r'struct\s+(\w+)\s*\{([^}]*)\}', re.DOTALL)
+    # schema_parse: brace-aware so a container default like `= {}` cannot
+    # truncate the body, and '#'/'//' comments are stripped so a commented
+    # field is not parsed as live.
+    clean = strip_comments(content, hash_comments=True)
     field_pattern = re.compile(r'(\d+)\s*:\s*(required|optional)?\s*(\w+)\s+(\w+)')
     
-    for struct_match in struct_pattern.finditer(content):
-        name = struct_match.group(1)
-        body = struct_match.group(2)
+    for name, body in extract_blocks(clean, 'struct'):
         fields = {}
         
         for field_match in field_pattern.finditer(body):
@@ -48,12 +50,10 @@ def parse_thrift_services(content: str) -> dict:
     """Parse Thrift service definitions."""
     services = {}
     
-    service_pattern = re.compile(r'service\s+(\w+)\s*(?:extends\s+\w+\s*)?\{([^}]*)\}', re.DOTALL)
+    clean = strip_comments(content, hash_comments=True)
     method_pattern = re.compile(r'(\w+)\s+(\w+)\s*\(([^)]*)\)')
     
-    for svc_match in service_pattern.finditer(content):
-        name = svc_match.group(1)
-        body = svc_match.group(2)
+    for name, body in extract_blocks(clean, 'service'):
         methods = {}
         
         for method_match in method_pattern.finditer(body):
@@ -70,12 +70,10 @@ def parse_thrift_services(content: str) -> dict:
 def parse_thrift_enums(content: str) -> dict:
     """Parse Thrift enum definitions."""
     enums = {}
-    enum_pattern = re.compile(r'enum\s+(\w+)\s*\{([^}]*)\}', re.DOTALL)
+    clean = strip_comments(content, hash_comments=True)
     value_pattern = re.compile(r'(\w+)')
     
-    for enum_match in enum_pattern.finditer(content):
-        name = enum_match.group(1)
-        body = enum_match.group(2)
+    for name, body in extract_blocks(clean, 'enum'):
         values = [v.group(1) for v in value_pattern.finditer(body) if not v.group(1).isdigit()]
         enums[name] = values
     
