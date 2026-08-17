@@ -15,3 +15,4 @@ dist/
 data/tokens.json
 data/activity.json
 data/*.json
+tests/.last_run.json

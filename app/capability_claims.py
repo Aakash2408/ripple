@@ -141,35 +141,69 @@ def e2e_tested(language: str, contract: str, op: str) -> bool:
 # production -- a pure function, never a declaration
 # --------------------------------------------------------------------------
 
-def production_ready(language: str, contract: str, op: str) -> bool:
-    """All five must hold. There is no way to assert this directly.
+def required_facts(op: str) -> tuple:
+    """Which facts must hold for this operation to be production-ready.
 
-    Ordered cheapest-first so the reason a cell fails is the first False.
+    ONE definition, consumed by production_ready(), blocking_reasons() and
+    tools/audit_capabilities.py. The first version encoded the rule separately in
+    the predicate and in the audit; making the predicate category-aware left the
+    audit asserting the old rule, and it reported 98 violations against correct
+    behaviour. Two copies of a rule is the defect this registry exists to remove,
+    so it is not repeated -- not even here.
     """
-    return (cap.detect(contract, op)
-            and cap.find_consumer(language)
-            and cap.generate_fix(language, op)
-            and validates(language)
-            and e2e_tested(language, contract, op))
+    category = _category_of(op)
+    if category in ("wire_only", "non_breaking"):
+        # Changing code would be WRONG: source never references proto field
+        # numbers, and a non-breaking change is filtered before any fix path.
+        # Requiring generate_fix would demand a transformation the category
+        # forbids; requiring validation would demand validating code that was
+        # never generated.
+        return ("detect",)
+    return ("detect", "find_consumer", "generate_fix", "validate", "e2e_tested")
+
+
+def _fact_value(fact: str, language: str, contract: str, op: str):
+    return {
+        "detect": lambda: cap.detect(contract, op),
+        "find_consumer": lambda: cap.find_consumer(language),
+        "generate_fix": lambda: cap.generate_fix(language, op),
+        "validate": lambda: validates(language),
+        "e2e_tested": lambda: e2e_tested(language, contract, op),
+    }[fact]()
+
+
+def production_ready(language: str, contract: str, op: str) -> bool:
+    """Every fact that APPLIES must hold. There is no way to assert this."""
+    return all(_fact_value(f, language, contract, op)
+               for f in required_facts(op))
+
+
+def _category_of(op: str) -> str:
+    from app.change_types import CANONICAL_OPS
+    entry = CANONICAL_OPS.get(op)
+    return entry[0] if entry else "unknown"
 
 
 def blocking_reasons(language: str, contract: str, op: str) -> list:
     """Why a cell is not production-ready. Empty list means it is."""
     reasons = []
-    if not cap.detect(contract, op):
-        reasons.append(f"no engine detects {op} in {contract}")
-    if not cap.find_consumer(language):
-        reasons.append(f"{language} has no specific consumer matcher "
-                       f"(generic fallback only)")
-    if not cap.generate_fix(language, op):
-        reasons.append(f"no {language} transformation for {op}")
-    state = validation_state(language)
-    if state is not ValidationState.VALID:
-        spec = VALIDATORS.get(language)
-        want = f" (needs {spec.toolchain})" if spec else ""
-        reasons.append(f"validation is {state.value}{want}")
-    if not e2e_tested(language, contract, op):
-        reasons.append("no end-to-end fixture")
+    for fact in required_facts(op):
+        if _fact_value(fact, language, contract, op):
+            continue
+        if fact == "detect":
+            reasons.append(f"no engine detects {op} in {contract}")
+        elif fact == "find_consumer":
+            reasons.append(f"{language} has no specific consumer matcher "
+                           f"(generic fallback only)")
+        elif fact == "generate_fix":
+            reasons.append(f"no {language} transformation for {op}")
+        elif fact == "validate":
+            spec = VALIDATORS.get(language)
+            want = f" (needs {spec.toolchain})" if spec else ""
+            reasons.append(f"validation is "
+                           f"{validation_state(language).value}{want}")
+        elif fact == "e2e_tested":
+            reasons.append("no end-to-end fixture")
     return reasons
 
 

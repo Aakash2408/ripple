@@ -65,6 +65,21 @@ jobs:
         # unchanged while saying so explicitly.
         run: python tools/coverage_matrix.py
 
+      - name: Capability registry
+        # Fails on any capability claim that has not been earned:
+        #   production=true       must satisfy every fact its CATEGORY requires
+        #   e2e_tested=true       must name a test that EXISTS and actually RAN
+        #
+        # Existence alone is too weak -- a test can exist and never execute, or be
+        # renamed while the claim points at a stale name. The regression suite
+        # writes tests/.last_run.json, and this reads it, so the evidence is the
+        # run rather than the reference. Runs AFTER the suite for that reason.
+        #
+        # Missing evidence is a FAILURE, not a skip: the same rule the registry
+        # applies to validation. A gate that passes when it cannot check is the
+        # defect the registry exists to remove.
+        run: python tools/audit_capabilities.py
+
       - name: Fail-silent audit (report only)
         # Not gating yet: 51 sites remain, many legitimately silent. Printed
         # so the number is visible in every build and can be ratcheted down.

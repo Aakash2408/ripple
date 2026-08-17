@@ -1602,6 +1602,9 @@ def test_is_fixable_separates_all_four_categories():
 # runner (works without pytest)
 # ===================================================================
 
+import os.path as _os_path  # for the run-evidence file
+
+
 def _main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
@@ -1623,6 +1626,32 @@ def _main() -> int:
         print("\n  failures:")
         for name, msg in failed:
             print(f"    - {name}: {msg}")
+
+    # Machine-readable RUN EVIDENCE for tools/audit_capabilities.py.
+    #
+    # The capability registry lets a cell claim e2e_tested by naming a test.
+    # Checking that the name EXISTS is weak -- a test can exist and never run, or
+    # be renamed while the claim keeps pointing at a stale name. This records
+    # which tests actually executed and passed, so the audit can verify the
+    # evidence rather than the reference.
+    #
+    # Written on failure too: the audit must be able to tell "the fixture failed"
+    # apart from "the suite never ran", which are different states.
+    try:
+        import json as _json
+        import time as _t
+        _here = _os_path.dirname(_os_path.abspath(__file__))
+        with open(_os_path.join(_here, ".last_run.json"), "w") as fh:
+            _json.dump({
+                "ran_at": _t.time(),
+                "total": len(tests),
+                "passed": sorted(n for n, _ in tests
+                                 if n not in {f for f, _ in failed}),
+                "failed": sorted(f for f, _ in failed),
+            }, fh, indent=2)
+    except OSError:
+        pass    # never let bookkeeping fail the suite
+
     return 1 if failed else 0
 
 
@@ -2448,10 +2477,20 @@ def test_production_readiness_cannot_be_declared():
     assert not offenders, (
         f"production must be COMPUTED, not declared: {offenders}")
 
-    # Today: nothing is production-ready, and the blocker is validation.
+    # Today: nothing FIXABLE is production-ready, and the blocker is validation.
+    # wire_only and non_breaking ARE ready on detection alone -- changing code
+    # would be wrong for them, so requiring a transformation would demand
+    # something the category forbids.
     s = cc.summary()
-    assert s["production_ready"] == 0, s["production_ready"]
     assert s["validate_ok"] == 0 and s["e2e_ok"] == 0
+    fixable = [r for r in cc.claim_matrix()
+               if "generate_fix" in cc.required_facts(r["operation"])]
+    assert not any(r["production"] for r in fixable), (
+        "a fixable cell claims production with 0 validated and 0 e2e-tested")
+    wire = [r for r in cc.claim_matrix()
+            if cc.required_facts(r["operation"]) == ("detect",)]
+    assert wire and all(r["production"] for r in wire), (
+        "wire_only/non_breaking must be ready on detection alone")
     # Detection and fix generation are NOT the blockers -- both are mostly true.
     assert s["generate_fix_ok"] > s["cells"] // 2, s["generate_fix_ok"]
 
