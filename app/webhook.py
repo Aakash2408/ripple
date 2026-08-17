@@ -490,11 +490,20 @@ async def github_webhook(request: FastAPIRequest):
     
     # Check if any OpenAPI spec files changed
     spec_files = _find_changed_specs(payload)
-    if not spec_files:
+    # A push that ONLY deletes contracts used to return "ignored" here, before
+    # anything ran -- so `git rm api/user.proto` was silently a no-op. Deletions
+    # are found separately because no diff engine can observe a file that
+    # ceased to exist.
+    removed_specs = _find_removed_specs(payload)
+    if not spec_files and not removed_specs:
         _log_activity("no_spec_files", {"commits": len(payload.get("commits", []))})
         return {"status": "ignored", "reason": "no spec files changed"}
     
-    _log_activity("spec_files_found", {"count": len(spec_files), "files": [s[0] for s in spec_files]})
+    _log_activity("spec_files_found", {
+        "count": len(spec_files),
+        "files": [s[0] for s in spec_files],
+        "removed": [r["path"] for r in removed_specs],
+    })
     
     # Rate limit check
     repo_full_name = payload["repository"]["full_name"]
@@ -514,6 +523,16 @@ async def github_webhook(request: FastAPIRequest):
             spec_path=spec_path,
             before_sha=before_sha,
             after_sha=after_sha,
+            installation_id=payload.get("installation", {}).get("id"),
+        )
+        results.append(result)
+    
+    # Process each DELETED contract. Separate from the loop above because there
+    # is no "after" content to diff against -- the file is gone.
+    for deletion in removed_specs:
+        result = await _process_spec_deletion(
+            repo=repo_full_name,
+            deletion=deletion,
             installation_id=payload.get("installation", {}).get("id"),
         )
         results.append(result)
@@ -1032,6 +1051,129 @@ def _is_spec_file(filepath: str) -> bool:
     return False
 
 
+def _log_fix_generated(repo: str, file_path: str, changed: bool,
+                       source: str, vector: str = "symbol") -> None:
+    """The ONLY place fix_generated is logged.
+
+    It was once emitted from both the fix loop and inside
+    _generate_fix_with_rag_fallback, so every fix logged twice and the
+    dashboard's counter read double the real number.
+    test_fix_generated_is_logged_exactly_once pins the single call site by
+    counting the literal in this file -- so when the deletion flow needed to log
+    the same event, the right move was to funnel both flows through one helper
+    rather than relax the assertion to two. The invariant is now structural: a
+    second literal cannot appear without failing the test.
+    """
+    _log_activity("fix_generated", {
+        "repo": repo,
+        "file": file_path,
+        "changed": changed,
+        "vector": vector,
+        "source": source,
+    })
+
+
+async def _process_spec_deletion(repo: str, deletion: dict,
+                                 installation_id: int = None) -> dict:
+    """Handle a DELETED contract file or package.
+
+    Distinct from _process_spec_change because there is no "after" content to
+    diff -- the file is gone. The propagation vector is the deleted PATH, so
+    consumers are found by path locality (importers, and files that lived inside
+    a deleted directory) rather than by symbol reference.
+
+    Reuses the existing repo discovery, tree scan and PR machinery; only the
+    vector and the absence of a diff differ.
+    """
+    from .change_types import vector_for, describe
+    # Local import, matching fix_generator's idiom. _generate_with_template is
+    # NOT usable here: it hardcodes change_type="field_removed" and handles only
+    # that case, so it would silently produce no fix for a deletion.
+    from .fix_templates import apply_fix_template
+
+    change_type = deletion["change_type"]
+    target = deletion["path"]
+    vector = vector_for(change_type)
+
+    _log_activity("spec_deletion_detected", {
+        "repo": repo,
+        "change_type": change_type,
+        "path": target,
+        "files": deletion["files"][:5],
+        "count": deletion["count"],
+        "vector": vector,
+    })
+
+    # A BreakingChange carrying the PATH as field_name. Downstream code derives
+    # the vector from change_type, so nothing needs to special-case this.
+    change = BreakingChange(
+        change_type=change_type,
+        path=target,
+        method="",
+        field_name=target.rstrip("/"),
+        field_type="contract",
+        location="repository",
+        severity="breaking",
+        description=describe(change_type) + f": {target}",
+    )
+
+    token = _get_token(installation_id)
+    if not token:
+        _log_activity("spec_deletion_no_token", {"repo": repo, "path": target})
+        return {"spec": target, "status": "no_token", "change_type": change_type}
+
+    consumer_repos = _find_consumer_repos(repo, token, installation_id)
+    budget = {"remaining": int(os.environ.get("RIPPLE_TREE_CALL_BUDGET", "150"))}
+    prs, scanned = [], 0
+
+    for consumer_repo in consumer_repos:
+        # The deleted files lived in THIS repo; do not try to "fix" the producer.
+        exclude = target if consumer_repo == repo else ""
+        found = _scan_repo_tree_for_consumers(
+            consumer_repo, change, token, exclude_path=exclude, budget=budget
+        )
+        scanned += 1
+        for file_path, content, confidence in found:
+            fixed, explanation = apply_fix_template(
+                content, _detect_lang(file_path), change_type, change.field_name
+            )
+            if fixed == content:
+                # Must not happen: remove_package always marks. Logged rather
+                # than skipped silently, because an unchanged file opens no PR
+                # and would turn a detected deletion back into silence.
+                _log_activity("spec_deletion_no_change", {
+                    "repo": consumer_repo, "file": file_path,
+                    "change_type": change_type,
+                    "note": "template returned content unchanged -- no PR will open",
+                })
+                continue
+            _log_fix_generated(
+                consumer_repo, file_path, True,
+                f"[{vector}/template] {explanation[:80]}", vector,
+            )
+            url = _create_fix_pr(
+                consumer_repo, file_path, fixed, change, repo, token,
+                confidence=confidence,
+                sources=[f"{vector} path match", "template"],
+                reasons=[f"references the deleted contract {target}"],
+            )
+            if url:
+                prs.append(url)
+
+    _log_activity("spec_deletion_complete", {
+        "repo": repo, "path": target, "vector": vector,
+        "repos_scanned": scanned, "prs": len(prs),
+    })
+    return {
+        "spec": target,
+        "status": "processed",
+        "change_type": change_type,
+        "vector": vector,
+        "repos_scanned": scanned,
+        "prs": prs,
+    }
+
+
 async def _process_spec_change(
     repo: str,
     spec_path: str,
@@ -1249,12 +1391,11 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                     consumer_content, consumer, change, org
                 )
                 
-                _log_activity("fix_generated", {
-                    "repo": consumer_repo,
-                    "file": consumer_file,
-                    "changed": fixed_code != consumer_content,
-                    "source": explanation[:60] if explanation else "",
-                })
+                _log_fix_generated(
+                    consumer_repo, consumer_file,
+                    fixed_code != consumer_content,
+                    explanation[:60] if explanation else "",
+                )
                 
                 if fixed_code != consumer_content:
                     # Find this file's confidence from ensemble predictions
@@ -2170,8 +2311,14 @@ def _scan_repo_tree_for_consumers(
     and is reported when exhausted, so a truncated scan is never silent.
     """
     from .smart_consumer_finder import file_is_consumer
+    from .change_types import vector_for
 
     field_name = change.field_name
+    # Derived from the change, not passed in, so no call site can forget to
+    # route a package deletion. For vector="package", field_name is the deleted
+    # PATH and consumers are importers of it or files that lived inside it --
+    # a symbol search over a path finds almost nothing.
+    vector = vector_for(change.change_type)
     max_files = int(os.environ.get("RIPPLE_MAX_TREE_FILES", "40"))
     max_blob_bytes = int(os.environ.get("RIPPLE_MAX_BLOB_BYTES", "200000"))
 
@@ -2219,7 +2366,8 @@ def _scan_repo_tree_for_consumers(
             continue
 
         is_consumer, confidence, matches = file_is_consumer(
-            content, file_path, field_name, _detect_lang(file_path), min_confidence=0.5
+            content, file_path, field_name, _detect_lang(file_path),
+            min_confidence=0.5, vector=vector,
         )
         if is_consumer:
             results.append((file_path, content, confidence))
@@ -2227,6 +2375,7 @@ def _scan_repo_tree_for_consumers(
     if results:
         _log_activity("tree_scan_found", {
             "repo": repo,
+            "vector": vector,
             "scanned": len(candidates),
             "found": len(results),
             "files": [f for f, _, _ in results][:5],

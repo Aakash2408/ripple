@@ -262,6 +262,22 @@ def is_judgment(change_type: str) -> bool:
     return category(change_type) == JUDGMENT
 
 
+def vector_for(change_type: str) -> str:
+    """Which propagation vector this change travels along.
+
+    Returned from the change type rather than passed by callers, so a caller
+    cannot forget to route a package deletion correctly. Querying the wrong
+    vector under-reports badly -- measured on kubernetes#109798, a symbol query
+    scored 38.5% where the package query scored 90.9% on the same PR.
+
+        "symbol"   a declared identifier was removed; consumers name it
+        "package"  a file or directory was deleted; consumers reference its
+                   PATH (imports) or lived inside it, and mostly name no single
+                   identifier at all
+    """
+    return "package" if canonical_op(change_type) == "remove_package" else "symbol"
+
+
 def is_fixable(change_type: str) -> bool:
     """True when a fix pattern for this type could ever produce a change.
 

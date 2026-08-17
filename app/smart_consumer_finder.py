@@ -580,6 +580,7 @@ def file_is_consumer(
     field_name: str,
     language: str,
     min_confidence: float = 0.5,
+    vector: str = "symbol",
 ) -> tuple[bool, float, list[SmartMatch]]:
     """
     Determine if a file is a consumer of the given field.
@@ -587,8 +588,14 @@ def file_is_consumer(
     Returns (is_consumer, overall_confidence, matches).
     A file is a consumer if it has at least one high-confidence match
     that isn't just a comment or string.
+
+    `vector` selects the matcher. For a deleted file or directory, `field_name`
+    is the PATH rather than an identifier, and a symbol search over a path finds
+    almost nothing -- so the vector must be routed, not assumed.
     """
-    matches = find_field_consumers(file_content, file_path, field_name, language, min_confidence)
+    matches = find_matches_in_file(
+        file_content, file_path, field_name, language, vector, min_confidence
+    )
     
     if not matches:
         return (False, 0.0, [])

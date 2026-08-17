@@ -497,6 +497,10 @@ def test_tree_scan_respects_call_budget():
 
     class _Change:
         field_name = "phone_number"
+        # The real BreakingChange always carries change_type, and the tree scan
+        # now derives the propagation vector from it. A stub missing it was
+        # silently diverging from the real shape.
+        change_type = "field_removed"
 
     result = wh._scan_repo_tree_for_consumers(
         "Aakash2408/user-proto", _Change(), "invalid", "", budget
@@ -854,6 +858,65 @@ def test_apply_fix_template_called_with_the_real_signature():
             if kw.arg in ("source_code", "new_field_name"):
                 bad.append(f"line {node.lineno}: {kw.arg}=")
     assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
+
+
+def test_package_vector_is_reachable_from_a_real_push():
+    """The package vector must be REACHABLE, not merely implemented.
+
+    It was previously built, unit-tested and CI-gated while being unreachable
+    from production: no change_type emitted a package deletion, and the webhook
+    never called the dispatcher. A capability that cannot fire is worse than an
+    absent one, because the tests say it works.
+
+    This test walks the real path -- push payload -> _find_removed_specs ->
+    _process_spec_deletion -> package vector -> template -> PR -- stubbing only
+    the two IO boundaries (token, network). If anyone unwires the routing, the
+    unit tests will still pass and THIS one will fail.
+    """
+    import asyncio
+    import app.webhook as w
+    from app.change_types import vector_for
+
+    assert vector_for("package_removed") == "package"
+    assert vector_for("field_removed") == "symbol", \
+        "symbol routing must be unaffected"
+
+    orig_token, orig_repos = w._get_token, w._find_consumer_repos
+    orig_scan, orig_pr = w._scan_repo_tree_for_consumers, w._create_fix_pr
+    consumer_src = 'import "api/v1/user.proto"\n\nfunc main(){ c := userpb.New() }\n'
+    seen = []
+    try:
+        w._get_token = lambda iid=None: "stub"
+        w._find_consumer_repos = lambda src, tok, iid=None: ["acme/consumer"]
+        w._scan_repo_tree_for_consumers = (
+            lambda repo, change, token, exclude_path="", budget=None:
+            [("svc/handler.go", consumer_src, 0.9)])
+        w._create_fix_pr = lambda repo, fp, fixed, change, src, tok, **kw: (
+            seen.append((repo, fp, fixed, kw.get("sources"))) or "https://x/pull/1")
+
+        payload = {
+            "repository": {"full_name": "acme/contracts"},
+            "installation": {"id": 1},
+            "commits": [{"removed": ["api/v1/user.proto", "api/v1/order.proto"],
+                         "modified": [], "added": []}],
+        }
+        dels = w._find_removed_specs(payload)
+        assert len(dels) == 1 and dels[0]["change_type"] == "package_removed"
+
+        res = asyncio.new_event_loop().run_until_complete(
+            w._process_spec_deletion("acme/contracts", dels[0], installation_id=1))
+    finally:
+        w._get_token, w._find_consumer_repos = orig_token, orig_repos
+        w._scan_repo_tree_for_consumers, w._create_fix_pr = orig_scan, orig_pr
+
+    assert res["vector"] == "package", res
+    assert res["prs"], "no PR opened -- the vector is not reachable"
+    assert len(seen) == 1, seen
+    _, _, fixed, sources = seen[0]
+    assert "RIPPLE-ACTION-REQUIRED" in fixed, "fix was not marked"
+    assert 'import "api/v1/user.proto"' in fixed, \
+        "the import must survive -- removing it leaves every usage undefined"
+    assert any("package" in str(x) for x in (sources or [])), sources
 
 
 def test_deleted_specs_are_detected_at_the_event_layer():
