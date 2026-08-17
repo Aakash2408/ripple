@@ -327,6 +327,119 @@ TYPE_CHANGE_HANDLERS: dict[str, Callable[[str, str, str], str]] = {
 
 
 # ---------------------------------------------------------------------------
+# CONTRACT type name -> LANGUAGE type name
+#
+# WHY THIS EXISTS
+# The handlers above do a word-boundary replacement of whatever type strings
+# they are given -- but diff engines emit the CONTRACT's vocabulary, not the
+# consumer language's. proto says `int32`, JSON Schema says `integer`, Thrift
+# says `i64`. No Java source contains the token `string`; it contains `String`.
+#
+# Without translation the operation was wrong in all nine languages, in three
+# different ways, and none of them reported a problem:
+#
+#   java, kotlin, rust, python, ruby, javascript  silent no-op -- 0 replacements,
+#       code unchanged, so no PR opens and a detected break produced silence.
+#   typescript, csharp  WROTE THE CONTRACT NAME INTO SOURCE, producing
+#       `phoneNumber: int32;` and `public int32 PhoneNumber` -- neither
+#       compiles -- while reporting "1 type annotations updated".
+#   go  correct BY COINCIDENCE: proto's int32 happens to be spelled int32 in Go.
+#
+# Writing an unmapped name into source is the worst of the three, because a
+# reviewer sees a confident diff that cannot build. So an unmapped type now
+# annotates instead of editing -- see the change_field_type branch.
+#
+# Keys are lowercased contract types drawn from the engines actually in the
+# repo: proto, JSON Schema / OpenAPI, Avro, Thrift, GraphQL and SQL.
+CONTRACT_TYPE_TO_NATIVE: dict[str, dict[str, str]] = {
+    'string': {
+        'go': 'string', 'typescript': 'string', 'python': 'str',
+        'java': 'String', 'rust': 'String', 'kotlin': 'String',
+        'csharp': 'string', 'swift': 'String', 'php': 'string',
+        'scala': 'String', 'dart': 'String',
+    },
+    'int32': {
+        'go': 'int32', 'typescript': 'number', 'python': 'int',
+        'java': 'int', 'rust': 'i32', 'kotlin': 'Int',
+        'csharp': 'int', 'swift': 'Int32', 'php': 'int',
+        'scala': 'Int', 'dart': 'int',
+    },
+    'int64': {
+        'go': 'int64', 'typescript': 'number', 'python': 'int',
+        'java': 'long', 'rust': 'i64', 'kotlin': 'Long',
+        'csharp': 'long', 'swift': 'Int64', 'php': 'int',
+        'scala': 'Long', 'dart': 'int',
+    },
+    'bool': {
+        'go': 'bool', 'typescript': 'boolean', 'python': 'bool',
+        'java': 'boolean', 'rust': 'bool', 'kotlin': 'Boolean',
+        'csharp': 'bool', 'swift': 'Bool', 'php': 'bool',
+        'scala': 'Boolean', 'dart': 'bool',
+    },
+    'float': {
+        'go': 'float32', 'typescript': 'number', 'python': 'float',
+        'java': 'float', 'rust': 'f32', 'kotlin': 'Float',
+        'csharp': 'float', 'swift': 'Float', 'php': 'float',
+        'scala': 'Float', 'dart': 'double',
+    },
+    'double': {
+        'go': 'float64', 'typescript': 'number', 'python': 'float',
+        'java': 'double', 'rust': 'f64', 'kotlin': 'Double',
+        'csharp': 'double', 'swift': 'Double', 'php': 'float',
+        'scala': 'Double', 'dart': 'double',
+    },
+    'bytes': {
+        'go': '[]byte', 'typescript': 'Uint8Array', 'python': 'bytes',
+        'java': 'byte[]', 'rust': 'Vec<u8>', 'kotlin': 'ByteArray',
+        'csharp': 'byte[]', 'swift': 'Data', 'php': 'string',
+        'scala': 'Array[Byte]', 'dart': 'List<int>',
+    },
+    'timestamp': {
+        'go': 'time.Time', 'typescript': 'Date', 'python': 'datetime',
+        'java': 'Instant', 'rust': 'DateTime', 'kotlin': 'Instant',
+        'csharp': 'DateTime', 'swift': 'Date', 'php': 'DateTime',
+        'scala': 'Instant', 'dart': 'DateTime',
+    },
+}
+
+# Dialect spellings that mean the same contract type. Engines disagree:
+# JSON Schema says `integer`/`number`/`boolean`, Thrift says `i32`/`i64`/
+# `binary`, Avro says `int`/`long`, GraphQL says `Int`/`Float`/`Boolean`, SQL
+# says `VARCHAR`/`BIGINT`. Normalising here keeps one table instead of five.
+_CONTRACT_TYPE_ALIASES = {
+    'integer': 'int32', 'int': 'int32', 'i32': 'int32', 'int16': 'int32',
+    'i16': 'int32', 'short': 'int32', 'uint32': 'int32', 'sint32': 'int32',
+    'fixed32': 'int32', 'sfixed32': 'int32', 'smallint': 'int32',
+    'long': 'int64', 'i64': 'int64', 'bigint': 'int64', 'uint64': 'int64',
+    'sint64': 'int64', 'fixed64': 'int64', 'sfixed64': 'int64',
+    'boolean': 'bool',
+    'number': 'double', 'decimal': 'double', 'numeric': 'double',
+    'real': 'float', 'float32': 'float', 'float64': 'double',
+    'binary': 'bytes', 'blob': 'bytes', 'bytea': 'bytes',
+    'varchar': 'string', 'text': 'string', 'char': 'string', 'uuid': 'string',
+    'id': 'string', 'nvarchar': 'string',
+    'datetime': 'timestamp', 'date': 'timestamp', 'time': 'timestamp',
+    'instant': 'timestamp', 'timestamptz': 'timestamp',
+}
+
+# Languages with no type annotations to rewrite. A contract type change is real
+# for them -- the VALUE shape changes at runtime -- but there is no declaration
+# to edit, so editing would be theatre. These annotate instead.
+UNTYPED_LANGUAGES = frozenset({'javascript', 'ruby', 'yaml', 'shell'})
+
+
+def native_type(language: str, contract_type: str) -> str:
+    """The language's spelling of a contract type, or "" if unknown.
+
+    Returns "" rather than falling back to the contract name: writing `int32`
+    into TypeScript or C# produced source that does not compile.
+    """
+    key = (contract_type or "").strip().lower().rstrip('?').strip()
+    key = _CONTRACT_TYPE_ALIASES.get(key, key)
+    return CONTRACT_TYPE_TO_NATIVE.get(key, {}).get(language.lower().strip(), "")
+
+
+# ---------------------------------------------------------------------------
 # remove_type / remove_enum_value / rename_type
 #
 # Driven by per-language pattern tables rather than 16 hand-written functions
@@ -772,16 +885,59 @@ def apply_fix_template(
     elif op == 'change_field_type':
         if not old_type or not new_type:
             return code, "Error: old_type and new_type required for type change operations."
+
+        # Translate CONTRACT vocabulary into the consumer language's. Engines
+        # emit proto/JSON-Schema/Thrift type names; source code contains none of
+        # them. See CONTRACT_TYPE_TO_NATIVE for what this was doing wrong in all
+        # nine languages before.
+        native_old = native_type(lang, old_type)
+        native_new = native_type(lang, new_type)
+
+        if lang in UNTYPED_LANGUAGES:
+            # No declaration to edit. The change is still real -- the value's
+            # shape changes at runtime -- so flag the references instead of
+            # pretending a type annotation was updated.
+            return annotate_references(
+                code, lang, field_name,
+                f"type of '{field_name}' changed from {old_type} to {new_type} "
+                f"in the contract; {lang} has no type annotation to update -- "
+                f"check the code that reads this value.")
+
+        if not (native_old and native_new):
+            # Refuse to write an unmapped contract name into source. Doing that
+            # is what produced `phoneNumber: int32;` in TypeScript and
+            # `public int32 PhoneNumber` in C# -- confident diffs that do not
+            # compile, reported as success.
+            unknown = old_type if not native_old else new_type
+            return annotate_references(
+                code, lang, field_name,
+                f"type of '{field_name}' changed from {old_type} to {new_type}, "
+                f"and Ripple has no {lang} equivalent for '{unknown}' -- update "
+                f"the declaration by hand.")
+
         handler = TYPE_CHANGE_HANDLERS.get(lang)
         if handler is None:
-            # Generic: simple word-boundary replacement
-            result = re.sub(rf'\b{re.escape(old_type)}\b', new_type, code)
+            result = re.sub(rf'\b{re.escape(native_old)}\b', native_new, code)
         else:
-            result = handler(code, old_type, new_type)
-        replacements = code.count(old_type) - result.count(old_type)
+            result = handler(code, native_old, native_new)
+
+        if result == code:
+            # The type is mapped but no declaration matched -- annotate rather
+            # than return unchanged code, because unchanged code opens no PR and
+            # a detected break would produce silence.
+            return annotate_references(
+                code, lang, field_name,
+                f"type of '{field_name}' changed from {native_old} to "
+                f"{native_new} -- no declaration matched automatically, verify "
+                f"these references.")
+
+        # Count the NATIVE token: counting the contract name reported 0 even
+        # when replacements happened, and vice versa.
+        replacements = code.count(native_old) - result.count(native_old)
         explanation = (
-            f"Changed type '{old_type}' -> '{new_type}' in {lang} code. "
-            f"{replacements} type annotations updated."
+            f"Changed type '{native_old}' -> '{native_new}' in {lang} code "
+            f"(contract: {old_type} -> {new_type}). "
+            f"{replacements} type annotation(s) updated."
         )
         return result, explanation
 

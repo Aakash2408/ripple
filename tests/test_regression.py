@@ -2092,7 +2092,11 @@ def test_type_change_reads_the_fields_not_the_display_string():
     from app.consumer_finder import ConsumerMatch
     from app.fix_generator import _generate_with_template
 
-    src = "class W:\n    phone_number: str\n"
+    # TypeScript source for the TypeScript handler. An earlier version of this
+    # test handed PYTHON source to it, so no declaration matched and it took the
+    # annotate path -- passing on a note that happened to contain the strings
+    # being asserted rather than on a real edit.
+    src = "interface W {\n  phoneNumber: string;\n}\n"
     cm = ConsumerMatch("c", 1, "x", "high", "r", "typescript")
 
     # field_type carries NO arrow; the declared fields must still be used.
@@ -2100,14 +2104,16 @@ def test_type_change_reads_the_fields_not_the_display_string():
                         "int32", "b", "breaking", "d",
                         old_type="string", new_type="int32")
     _, note = _generate_with_template(src, cm, bc)
-    assert "string" in note and "int32" in note, note
+    # TypeScript's native spelling of int32 is `number`; the contract pair is
+    # reported alongside it so the PR body still names what the engine emitted.
+    assert "number" in note and "int32" in note, note
 
     # Both arrow spellings still parse, for engines that only set field_type.
     for arrow in (" \u2192 ", " -> "):
         bc = BreakingChange("field_type_changed", "/u", "get", "phone_number",
                             f"string{arrow}int32", "b", "breaking", "d")
         _, note = _generate_with_template(src, cm, bc)
-        assert "string" in note and "int32" in note, (arrow, note)
+        assert "number" in note and "int32" in note, (arrow, note)
 
 
 def test_type_change_engines_populate_the_structured_fields():
@@ -2249,6 +2255,89 @@ def test_proto_rename_reaches_a_real_fix_end_to_end():
     assert "String literals and comments preserved" in note, note
     residual = find_residual_references(fixed, "phone_number", "python")
     assert residual, "a surviving reference must be flagged, not left silent"
+
+
+def test_type_change_never_writes_a_contract_type_into_source():
+    """change_field_type was wrong in all NINE languages, in three ways, and
+    none of them reported a problem:
+
+      java kotlin rust python ruby javascript  SILENT no-op -- 0 replacements, so
+          no PR opened and a detected break produced silence.
+      typescript csharp  WROTE THE CONTRACT NAME INTO SOURCE, producing
+          `phoneNumber: int32;` and `public int32 PhoneNumber` -- neither
+          compiles -- while reporting "1 type annotations updated".
+      go  correct BY COINCIDENCE: proto's int32 is spelled int32 in Go too.
+
+    Root cause was one thing, not nine: engines emit the CONTRACT's vocabulary
+    (proto int32, JSON Schema integer, Thrift i64) and the handlers replaced
+    those tokens literally in source, where they never appear.
+
+    The confident-but-broken case is the worst of the three, because a reviewer
+    trusts a diff that cannot build. So this pins BOTH directions: a contract
+    name must never reach source, and the operation must never go silent."""
+    from app.fix_templates import apply_fix_template, MARKER, native_type
+
+    sources = {
+        "go": "type W struct {\n\tPhoneNumber string\n}\n",
+        "typescript": "interface W {\n  phoneNumber: string;\n}\n",
+        "csharp": "class W {\n  public string PhoneNumber { get; set; }\n}\n",
+        "java": "class W {\n  private String phoneNumber;\n}\n",
+        "kotlin": "data class W(\n    val phoneNumber: String,\n)\n",
+        "rust": "struct W {\n    phone_number: String,\n}\n",
+        "python": "class W:\n    phone_number: str\n",
+        "javascript": 'const w = {\n  phoneNumber: "x",\n};\n',
+        "ruby": "class W\n  attr_accessor :phone_number\nend\n",
+    }
+    # Contract spellings that appear in NO language's type system.
+    contract_only = ("int32", "int64", "sint64", "fixed32", "integer")
+
+    for lang, src in sources.items():
+        out, note = apply_fix_template(src, lang, "type_changed", "phone_number",
+                                       old_type="string", new_type="int32")
+        # 1. Never silent: unchanged code opens no PR.
+        assert out != src, f"[{lang}] type change produced no diff -> silence"
+
+        # 2. Either a real edit, or an honest marked partial -- never both absent.
+        marked = MARKER in out
+        assert marked or out != src, f"[{lang}] neither edited nor marked"
+
+        # 3. A contract-only spelling must never land in a CODE line. It may
+        #    appear in a RIPPLE-ACTION-REQUIRED comment, which is the point.
+        code_lines = [l for l in out.split("\n") if MARKER not in l]
+        for token in contract_only:
+            if lang == "go" and token == "int32":
+                continue        # genuinely Go's own spelling
+            assert not any(token in l for l in code_lines), (
+                f"[{lang}] wrote contract type {token!r} into source -- this "
+                f"does not compile:\n{out}")
+
+    # 4. Type MAPS but no declaration matches. Every fixture above declares the
+    #    field, so the annotate fallback was never the deciding factor -- the
+    #    same fixture artifact that made the `reserved` proto test pass for the
+    #    wrong reason. This Java file only READS the field, so the mapped
+    #    replacement finds nothing and silence is the only other outcome.
+    reader_only = "class W {\n  int f(Other u) { return u.phoneNumber; }\n}\n"
+    out, note = apply_fix_template(reader_only, "java", "type_changed",
+                                   "phone_number", old_type="string",
+                                   new_type="int32")
+    assert out != reader_only, (
+        "type mapped but no declaration matched -> returned unchanged code, "
+        "which opens no PR and turns detection into silence")
+    assert MARKER in out, f"must be marked when it cannot transform: {note}"
+
+    # 5. The mapping itself: refuse rather than guess.
+    assert native_type("typescript", "int32") == "number"
+    assert native_type("csharp", "int32") == "int"
+    assert native_type("java", "int64") == "long"
+    assert native_type("rust", "int32") == "i32"
+    assert native_type("python", "string") == "str"
+    assert native_type("typescript", "SomeCustomMessage") == "", (
+        "an unmapped type must return '' so the caller annotates instead of "
+        "writing a name that does not compile")
+    # Dialect spellings normalise onto one table.
+    assert native_type("java", "integer") == native_type("java", "int32")
+    assert native_type("kotlin", "i64") == native_type("kotlin", "int64")
+    assert native_type("go", "boolean") == native_type("go", "bool")
 
 
 if __name__ == "__main__":
