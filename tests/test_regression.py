@@ -2911,5 +2911,58 @@ def test_registry_governs_routing_and_auto_is_never_unearned():
         assert not os.path.exists(os.path.join(app_dir, dead)), dead
 
 
+def test_governance_scope_is_exactly_what_was_verified():
+    """The registry governs ONE of five PR-creating entry points.
+
+    Stages 3 and 6 were both verified by importing the new module and by tests, and
+    neither check asked the question that mattered: how many ways are there into a
+    PR? Five. `pr_level` is reachable from `github_webhook` and nothing else:
+
+      gitlab_webhook      154 lines of pipeline inlined in the route handler
+      bitbucket_webhook   154 lines, same shape
+      app/cli.py:main     pr_engine, with its OWN _format_pr_body
+      agent/core.py:main  separate package, imports nothing from app.routing
+
+    So on GitLab and Bitbucket a breaking change CAN still produce silence, because
+    _log_fix_generated is never reached. This test exists so that sentence cannot
+    quietly become false in either direction: a new ungoverned entry point fails,
+    and an exemption left behind after a fix fails too.
+
+    It also records why three earlier audits missed this. The duplication is INLINE
+    IN ROUTE HANDLERS and in a second package, so filename pairs and module-level
+    call graphs -- the two things used to size P0.1 as "~1 day" -- cannot see it.
+    That estimate was wrong in the unusual direction: under-scoped.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_pipeline_governance as G
+
+    graph = G._call_graph()
+    entries = G._entry_points(graph)
+
+    governed = [e for e in entries
+                if not [k for k in G.REQUIRED if k not in G._reachable(graph, e)]]
+    assert governed == ["app/webhook.py:github_webhook"], governed
+
+    # Every ungoverned entry point is named with a reason, and every named
+    # exemption is still real.
+    ungoverned = sorted(set(entries) - set(governed))
+    assert ungoverned == sorted(G.EXEMPT), (ungoverned, sorted(G.EXEMPT))
+    for fn, reason in G.EXEMPT.items():
+        assert len(reason) > 40, fn
+
+    # The gate is green on the real tree, and is not vacuous.
+    assert G.main([]) == 0
+    G.EXEMPT.pop("app/webhook.py:gitlab_webhook")
+    try:
+        assert G.main([]) == 1, "an unlisted ungoverned entry point must fail"
+    finally:
+        G.EXEMPT["app/webhook.py:gitlab_webhook"] = (
+            "154 lines of pipeline inlined in the route handler: its own engine "
+            "dispatch, its own fix generation, its own MR creation. A breaking "
+            "change on GitLab can still produce silence.")
+    assert G.main([]) == 0
+
+
 if __name__ == "__main__":
     sys.exit(_main())

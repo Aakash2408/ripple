@@ -1394,10 +1394,32 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
             for consumer_file, consumer_content, detector_confidence in consumer_files:
                 # Check ignore patterns
                 if config.should_ignore(consumer_file):
+                    # Previously a bare `continue`. A consumer dropped by the
+                    # CUSTOMER'S OWN .ripple.yaml produced no signal at all, so an
+                    # over-broad glob looked identical to "no consumers found" --
+                    # and parse_ripple_config already falls back to defaults on a
+                    # malformed file without saying so, so their config could both
+                    # fail to load and silently drop work.
+                    _log_activity("consumer_ignored", {
+                        "repo": consumer_repo,
+                        "file": consumer_file,
+                        "reason": "matched an ignore pattern in .ripple.yaml",
+                    })
                     continue
-                
+
                 # Check PR limit
                 if len(prs_created) >= config.max_prs_per_push:
+                    # Previously a bare `break`. Hitting the cap abandoned every
+                    # remaining consumer with no record, so a partially-propagated
+                    # change was indistinguishable from a fully-propagated one.
+                    _log_activity("pr_cap_reached", {
+                        "repo": consumer_repo,
+                        "cap": config.max_prs_per_push,
+                        "prs_created": len(prs_created),
+                        "stopped_at": consumer_file,
+                        "reason": "max_prs_per_push reached -- remaining consumers "
+                                  "in this repo were not processed",
+                    })
                     break
                 
                 consumer = ConsumerMatch(

@@ -311,6 +311,15 @@ reports 0 of 48 fixable cells production-ready. Ripple therefore never claims a 
 is automatic. `app/routing.py` derives the level by asking
 `app/capability_claims.py`; it keeps no list of its own, and CI fails if it grows one.
 
+**Scope, stated honestly: safety levels currently apply to the GitHub path only.**
+`pr_level()` is reachable from `github_webhook` and not from the other four
+PR-creating entry points — the GitLab and Bitbucket webhooks each inline their own
+pipeline in the route handler, the CLI goes through `pr_engine`, and the self-hosted
+agent is a separate package. On those paths a fix can still be opened without a
+stated safety level or a recorded outcome. `python tools/audit_pipeline_governance.py`
+gates CI on that set never growing, and fails if an exemption is left behind after a
+path is fixed. Unifying them is P0.1 and is not done.
+
 ## Research: PropBench
 
 Ripple is backed by **PropBench** — a research benchmark for measuring
@@ -676,14 +685,15 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 107 tests
+python tests/test_regression.py            # 108 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
 python tools/audit_fail_silent.py --check  # 42 sites, every one classified
+python tools/audit_pipeline_governance.py  # 1 of 5 entry points governed
 ```
 
-All six gate CI. The fail-silent gate does not demand zero silent paths — 25 are
+All seven gate CI. The fail-silent gate does not demand zero silent paths — 25 are
 correct-but-invisible and making them visible is P0.4/P0.5 work. It demands that
 none is *unexplained*: classified in `tools/fail_silent_triage.py`, no `REAL_BUG`
 left standing, and no function that was fixed allowed to go silent again.

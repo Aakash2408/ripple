@@ -93,6 +93,20 @@ jobs:
         # corrected to a number, because there is no single right one.
         run: python tools/audit_public_claims.py
 
+      - name: Pipeline governance (blocking)
+        # Stage 7 found that pr_level was reachable from ONE of five PR-creating
+        # entry points. gitlab_webhook and bitbucket_webhook each inline ~154 lines
+        # of pipeline in the route handler, the CLI goes through pr_engine with its
+        # own PR body, and agent/core.py is a separate package. So "no breaking
+        # change can produce silence" and "the registry governs routing" hold for
+        # GitHub and nothing else.
+        #
+        # This does not demand they all be governed today -- that is a real
+        # refactor. It demands the ungoverned set NEVER GROWS: each is named with a
+        # reason, an unlisted one fails, and a STALE exemption fails too, so
+        # removing an entry is the unit of progress.
+        run: python tools/audit_pipeline_governance.py
+
       - name: Fail-silent audit (blocking)
         # BLOCKING since Stage 5. What it enforces is not "zero silent paths" --
         # 25 sites are correct-but-invisible and making them visible is P0.4/P0.5

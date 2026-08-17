@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Which entry points are GOVERNED by the registry and the outcome funnel.
+
+WHY THIS EXISTS
+Stage 6 wired app/routing.py into the pipeline and Stage 3 wired the outcome
+funnel, and both were verified by importing them and by tests. Neither check asked
+the only question that matters: *how many ways are there into a PR?*
+
+Five. Stage 7 found that `pr_level` is reachable from exactly one of them.
+
+    github_webhook       -> _create_fix_pr        GOVERNED
+    gitlab_webhook       -> create_fix_mr         154 lines inline, bypasses all
+    bitbucket_webhook    -> bb_create_fix_pr      154 lines inline, bypasses all
+    app/cli.py           -> pr_engine.create_prs  own PR body, no routing
+    agent/core.py        -> adapter.create_fix_review  separate package
+
+So the two headline claims of this plan -- "no breaking change can produce
+silence" and "the registry governs routing" -- are true for GitHub and false for
+everything else. On GitLab and Bitbucket a breaking change can still produce
+silence, because `_log_fix_generated` is never reached.
+
+This is the duplicated-implementation defect at the largest scale in the codebase,
+and it hid from three separate audits because it is INLINE IN ROUTE HANDLERS and in
+a second package. Module-level call graphs and filename pairs -- the two things
+earlier stages used to size P0.1 -- cannot see it. That assessment ("~1 day: delete
+dead code, align two CLI call sites") was wrong, in the opposite direction from the
+usual: under-scoped, not over-scoped.
+
+WHAT THIS GATE DOES
+It does not demand that everything be governed today -- that is a real refactor of
+~310 inline lines plus a separate agent package, and doing it blind, without
+per-platform fixtures, would trade a known gap for an unknown one. It demands that
+the set of ungoverned entry points NEVER GROWS: each is named here with a reason,
+an unlisted ungoverned entry point fails the build, and removing an entry from
+EXEMPT is the unit of progress.
+
+Usage:
+    python3.12 tools/audit_pipeline_governance.py
+"""
+from __future__ import annotations
+
+import ast
+import glob
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# The functions that actually open a pull request / merge request / review.
+PR_CREATORS = {
+    "_create_fix_pr":     "GitHub PR (webhook)",
+    "create_fix_mr":      "GitLab MR",
+    "bb_create_fix_pr":   "Bitbucket PR",
+    "create_pr":          "pr_engine (CLI)",
+    "create_prs":         "pr_engine (CLI, batch)",
+    "create_fix_review":  "self-hosted agent adapters",
+}
+
+# What it means to be governed.
+REQUIRED = {
+    "pr_level":           "the registry decides the safety level (Stage 6)",
+    "_log_fix_generated": "every attempt ends in a stated outcome (Stage 3)",
+}
+
+# Entry points known to be ungoverned, each with the reason. An ungoverned entry
+# point NOT listed here fails the build. Deleting a line here is progress.
+EXEMPT = {
+    "app/webhook.py:gitlab_webhook":
+        "154 lines of pipeline inlined in the route handler: its own engine "
+        "dispatch, its own fix generation, its own MR creation. A breaking change "
+        "on GitLab can still produce silence.",
+    "app/webhook.py:bitbucket_webhook":
+        "154 lines inlined, same shape as gitlab_webhook.",
+    "app/cli.py:main":
+        "app/cli.py calls pr_engine.create_prs, which has its OWN _format_pr_body "
+        "and no routing decision. The CLI states no safety level.",
+    "agent/core.py:main":
+        "drives the self-hosted adapters (Phabricator, Gerrit, CRUX, "
+        "generic git). Separate package; imports nothing from app.routing.",
+}
+
+
+def _call_graph() -> dict:
+    """'module.py:function' -> callee BARE names, across app/ and agent/.
+
+    Two-level on purpose. Keys are module-qualified so distinct entry points stay
+    distinct -- the first version keyed on the bare name and merged app/cli.py:main
+    with the agent's main(), reporting one entry point where there are two and
+    producing a misleading exemption. Callees stay bare because resolving imports
+    properly is a bigger job than this gate needs, and a bare name still CROSSES
+    MODULE BOUNDARIES -- which a per-file walk does not. A per-file walk reported
+    should_create_pr as unreachable from github_webhook because pr_level imports it
+    lazily inside app/routing.py.
+    """
+    graph: dict = {}
+    files = (sorted(glob.glob(os.path.join(ROOT, "app", "*.py")))
+             + sorted(glob.glob(os.path.join(ROOT, "agent", "*.py"))))
+    for path in files:
+        rel = os.path.relpath(path, ROOT)
+        try:
+            tree = ast.parse(open(path).read())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            callees = graph.setdefault(f"{rel}:{node.name}", set())
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    if isinstance(f, ast.Name):
+                        callees.add(f.id)
+                    elif isinstance(f, ast.Attribute):
+                        callees.add(f.attr)
+    return graph
+
+
+def _keys_named(graph: dict, name: str) -> list:
+    return [k for k in graph if k.rsplit(":", 1)[1] == name]
+
+
+def _reachable(graph: dict, start: str) -> set:
+    """Bare callee names transitively reachable from a module-qualified key."""
+    seen, frontier, out = set(), [start], set()
+    while frontier:
+        key = frontier.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        for callee in graph.get(key, set()):
+            out.add(callee)
+            frontier.extend(_keys_named(graph, callee))
+    return out
+
+
+def _entry_points(graph: dict) -> list:
+    """Module-qualified functions that reach a PR creator and are not themselves
+    called by another such function: the outermost callers."""
+    candidates = {k for k in graph
+                  if _reachable(graph, k) & set(PR_CREATORS)}
+    inner = set()
+    for k in candidates:
+        for callee in graph.get(k, set()):
+            inner |= {c for c in _keys_named(graph, callee) if c in candidates}
+    return sorted(candidates - inner
+                  - {k for k in candidates
+                     if k.rsplit(":", 1)[1] in PR_CREATORS})
+
+
+# Terminal exits inside the governed pipeline that are allowed to emit no signal,
+# by the line's controlling intent. Anything else is a decision nobody records.
+#
+# Stage 7 found two that were NOT legitimate, both in the consumer loop:
+#   `if config.should_ignore(f): continue`   a consumer dropped by the CUSTOMER'S
+#       own .ripple.yaml, with no record -- so an over-broad glob was
+#       indistinguishable from "no consumers found", and parse_ripple_config
+#       already falls back to defaults on a malformed file without saying so.
+#   `if len(prs_created) >= cap: break`      the PR cap abandoned every remaining
+#       consumer silently, so a partially-propagated change looked complete.
+PIPELINE_FN = "_process_spec_change_inner"
+SILENT_EXIT_OK = {
+    "ensemble_prediction_match":
+        "breaking out of the prediction SEARCH once the matching prediction is "
+        "found. A loop-control break, not a terminal outcome for the change.",
+}
+
+
+def _unsignalled_exits(path: str) -> list:
+    """return/continue/break in PIPELINE_FN with no diagnostic before it."""
+    src = open(path).read()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as exc:
+        # A crash still fails the build, but a traceback is not a finding. Say what
+        # is wrong -- the same reason verify_durability.py reports UNREACHABLE
+        # rather than raising.
+        return [f"{os.path.basename(path)} does not parse ({exc}), so terminal "
+                f"exits cannot be checked"]
+    fns = {n.name: n for n in ast.walk(tree)
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    if PIPELINE_FN not in fns:
+        return [f"{PIPELINE_FN} is gone -- this check no longer checks anything"]
+
+    markers = ("_log_activity", "record", "_log_fix_generated", "logger", "print")
+
+    def signalled(block, idx):
+        for stmt in block[:idx + 1]:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    nm = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
+                    if any(m in nm for m in markers):
+                        return True
+                if isinstance(sub, ast.Raise):
+                    return True
+        return False
+
+    lines = src.split("\n")
+    found = []
+    for node in ast.walk(fns[PIPELINE_FN]):
+        for attr in ("body", "orelse", "finalbody"):
+            block = getattr(node, attr, None)
+            if not isinstance(block, list):
+                continue
+            for i, stmt in enumerate(block):
+                if not isinstance(stmt, (ast.Return, ast.Continue, ast.Break)):
+                    continue
+                if signalled(block, i):
+                    continue
+                # The prediction-search break is identified by the assignment
+                # immediately above it, not by its line number.
+                context = " ".join(l.strip() for l in lines[max(0, stmt.lineno - 4):stmt.lineno])
+                if "pred.get(" in context or "pred[" in context:
+                    continue
+                found.append(
+                    f"{PIPELINE_FN} line {stmt.lineno}: "
+                    f"{type(stmt).__name__} with no signal -- "
+                    f"{lines[stmt.lineno - 1].strip()}")
+    return found
+
+
+def main(argv: list) -> int:
+    graph = _call_graph()
+    entries = _entry_points(graph)
+
+    print("=" * 74)
+    print("PIPELINE GOVERNANCE")
+    print("=" * 74)
+    print("\n  entry points that can open a PR, and whether the registry and the")
+    print("  outcome funnel are on their path:\n")
+
+    governed, ungoverned, problems = [], [], []
+    for fn in entries:
+        reach = _reachable(graph, fn)
+        missing = [k for k in REQUIRED if k not in reach]
+        creators = sorted(reach & set(PR_CREATORS))
+        via = ", ".join(PR_CREATORS[c] for c in creators) or "?"
+        if missing:
+            ungoverned.append(fn)
+            mark = "EXEMPT " if fn in EXEMPT else "FAIL   "
+            print(f"  {mark}{fn:22} via {via}")
+            for k in missing:
+                print(f"             missing {k} -- {REQUIRED[k]}")
+            if fn not in EXEMPT:
+                problems.append(
+                    f"{fn} opens PRs ({via}) without {', '.join(missing)}. Route it "
+                    f"through app/routing.py, or add it to EXEMPT with a reason.")
+        else:
+            governed.append(fn)
+            print(f"  OK     {fn:22} via {via}")
+
+    # An exemption for something that is no longer an ungoverned entry point is
+    # stale, and a stale exemption is how a gate quietly stops gating.
+    for fn in sorted(EXEMPT):
+        if fn not in ungoverned:
+            problems.append(
+                f"{fn} is listed in EXEMPT but is no longer an ungoverned entry "
+                f"point. Remove the exemption -- it is now claiming a gap that "
+                f"does not exist.")
+
+    print(f"\n  {len(governed)} governed, {len(ungoverned)} exempt, "
+          f"{len(entries)} total")
+
+    # Second half: within the governed pipeline, no decision may exit unrecorded.
+    unsignalled = _unsignalled_exits(os.path.join(ROOT, "app", "webhook.py"))
+    print(f"\n  unsignalled terminal exits in {PIPELINE_FN}: {len(unsignalled)}")
+    for u in unsignalled:
+        print(f"      FAIL  {u}")
+    problems.extend(unsignalled)
+
+    if problems:
+        print(f"\n  {len(problems)} PROBLEM(S):")
+        for p in problems:
+            print(f"      {p}")
+        return 1
+
+    print("\n  no UNLISTED ungoverned entry point. The exempt set is the honest")
+    print("  scope of 'the registry governs routing': it holds for GitHub only.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
