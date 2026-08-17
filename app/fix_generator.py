@@ -50,7 +50,13 @@ def generate_fix(
     except IOError:
         return None
     
-    if use_llm and os.environ.get("ANTHROPIC_API_KEY"):
+    # Gate on the SAME resolution the call site uses. Reading
+    # ANTHROPIC_API_KEY here while _generate_with_llm builds its client from
+    # llm_config.api_key() meant an ANTHROPIC_AUTH_TOKEN setup fell through to
+    # the template silently -- the gate and the call disagreed about whether a
+    # key existed.
+    from .llm_config import api_key as _llm_key
+    if use_llm and _llm_key():
         fixed_code, explanation = _generate_with_llm(
             original_code, consumer, breaking_change
         )
@@ -247,40 +253,74 @@ def _generate_with_template(
         explanation = f"Added '{field_name}' to interface and API call payload"
     
     elif consumer.language == "python":
-        # Add parameter to function
-        func_pattern = re.compile(
-            r'(def\s+create_\w+\([^)]*?)(,\s*age)',
-            re.DOTALL
+        # The previous version of this branch was written against the demo
+        # fixture: it matched a parameter literally named `age` and a payload
+        # variable literally named `payload`. On ordinary code the signature
+        # fallback matched while the payload regex missed, producing a function
+        # that ACCEPTS the new field and never sends it -- and the explanation
+        # was assigned unconditionally, so the PR body claimed the payload had
+        # been updated. That compiles, so the syntax-only validator passes it.
+        sig_ok = False
+        payload_ok = False
+
+        # 1. Signature. Any function whose body contains the call, not just
+        #    `create_*`: the demo happened to use that prefix.
+        func_pattern = re.compile(r'(def\s+\w+\s*\([^)]*?)(\)\s*(?:->[^:]+)?:)')
+        if func_pattern.search(fixed_code) and f"{field_name}:" not in fixed_code:
+            fixed_code, n = func_pattern.subn(
+                rf'\1, {field_name}: str\2', fixed_code, count=1
+            )
+            sig_ok = bool(n)
+
+        # 2. Payload. Cover the shapes that actually occur: an inline
+        #    `json={...}` / `data={...}` / `body={...}` kwarg, and a named
+        #    dict assigned beforehand.
+        payload_patterns = (
+            re.compile(r'((?:json|data|body)\s*=\s*\{)([^{}]*?)(\})', re.DOTALL),
+            re.compile(r'((?:payload|body|data)\s*=\s*\{)([^{}]*?)(\})', re.DOTALL),
         )
-        match = func_pattern.search(fixed_code)
-        if match:
-            # Insert before the last optional param
-            fixed_code = func_pattern.sub(
-                rf'\1, {field_name}: str\2',
-                fixed_code
+        for pat in payload_patterns:
+            m = pat.search(fixed_code)
+            if not m:
+                continue
+            inner = m.group(2)
+            if f'"{field_name}"' in inner or f"'{field_name}'" in inner:
+                payload_ok = True  # already present, nothing to do
+                break
+            sep = "" if not inner.strip() else ", "
+            fixed_code = (
+                fixed_code[:m.start(2)] + inner.rstrip().rstrip(",")
+                + sep + f'"{field_name}": {field_name}'
+                + fixed_code[m.end(2):]
+            )
+            payload_ok = True
+            break
+
+        if sig_ok and payload_ok:
+            explanation = (
+                f"Added '{field_name}' parameter and included in request payload"
+            )
+        elif sig_ok:
+            # Honest partial. Ripple's own contract for an incomplete fix is to
+            # apply the safe part and flag the rest, never to overstate it.
+            explanation = (
+                f"Added '{field_name}' parameter to the signature but could NOT "
+                f"locate the request payload -- RIPPLE-ACTION-REQUIRED: send "
+                f"'{field_name}' in the request body yourself"
+            )
+        elif payload_ok:
+            explanation = (
+                f"Added '{field_name}' to the request payload but could NOT "
+                f"locate the enclosing function signature -- "
+                f"RIPPLE-ACTION-REQUIRED: thread '{field_name}' through callers"
             )
         else:
-            # Fallback: add before closing paren
-            func_pattern2 = re.compile(r'(def\s+create_\w+\([^)]*?)(\)\s*[-:])')
-            fixed_code = func_pattern2.sub(
-                rf'\1, {field_name}: str\2',
-                fixed_code
+            # Nothing changed, so no PR opens -- silence is correct here.
+            explanation = (
+                f"No template fix applied for '{field_name}' (python): neither "
+                f"a function signature nor a request payload matched"
             )
-        
-        # Add to payload dict — insert before closing brace
-        payload_pattern = re.compile(
-            r'(payload\s*=\s*\{[^}]*?)(,?\n\s*\})',
-            re.DOTALL
-        )
-        match = payload_pattern.search(fixed_code)
-        if match:
-            fixed_code = payload_pattern.sub(
-                rf'\1,\n        "{field_name}": {field_name}\2',
-                fixed_code
-            )
-        
-        explanation = f"Added '{field_name}' parameter and included in request payload"
-    
+
     elif consumer.language == "java":
         # Add parameter to method
         method_pattern = re.compile(

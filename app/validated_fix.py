@@ -71,8 +71,14 @@ def _generate_with_llm(
     previous_error: str = None,
     previous_attempt: str = None,
 ) -> Tuple[Optional[str], str]:
-    """Generate fix using Claude API."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    """Generate fix using the configured LLM backend."""
+    # Resolve the key through llm_config, NOT os.environ directly. An
+    # LLM-gateway setup sets ANTHROPIC_AUTH_TOKEN and deliberately leaves
+    # ANTHROPIC_API_KEY unset (setting both triggers an auth conflict), so
+    # reading ANTHROPIC_API_KEY here made this gate fail closed and fall back
+    # to the template while the caller believed the LLM had answered.
+    from .llm_config import api_key as _llm_key
+    api_key = _llm_key()
     if not api_key:
         # Fallback to template
         from .fix_generator import _generate_with_template

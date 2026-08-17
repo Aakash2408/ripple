@@ -25,16 +25,38 @@ PY="$TB/python3.12/bin/python3.12"
 CONFIG="$(dirname "$0")/litellm_config.yaml"
 PORT="${LITELLM_PORT:-4000}"
 
+# Key resolution, in order: the environment, then a mode-0600 file. The file
+# exists so the key never has to be typed into a shell (an interactive `read`
+# gives no prompt and looks like a hang) nor pasted into a chat transcript.
+KEY_FILE="${GEMINI_API_KEY_FILE:-$HOME/.gemini_key}"
+
+if [[ -z "${GEMINI_API_KEY:-}" && -r "$KEY_FILE" ]]; then
+  # Strip any trailing newline a text editor may have appended: Gemini rejects
+  # a key with stray whitespace as API_KEY_INVALID, which reads like a bad key.
+  GEMINI_API_KEY="$(tr -d '\r\n' < "$KEY_FILE")"
+  export GEMINI_API_KEY
+  echo "key source: $KEY_FILE ($(printf '%s' "$GEMINI_API_KEY" | wc -c | tr -d ' ') chars)"
+
+  perms="$(stat -c '%a' "$KEY_FILE")"
+  if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+    echo "warning: $KEY_FILE is mode $perms -- run: chmod 600 $KEY_FILE" >&2
+  fi
+fi
+
 if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-  cat <<'MSG'
-GEMINI_API_KEY is not set.
+  cat <<MSG
+No Gemini key found.
 
-Get a free key at https://aistudio.google.com (no credit card), then:
+Get a free key at https://aistudio.google.com (no credit card), then write it to
+a file this script will pick up automatically:
 
-    read -rs GEMINI_API_KEY && export GEMINI_API_KEY
+    umask 077 && cat > $KEY_FILE      # paste, then press Ctrl-D
 
-`read -rs` keeps it off the screen and out of shell history. Do not paste a key
-into a chat -- a GitHub token was revoked by secret scanning that way already.
+Or set it in the environment instead:
+
+    export GEMINI_API_KEY=...
+
+Do not paste a key into a chat -- it lands in a transcript on disk.
 MSG
   exit 1
 fi
@@ -53,7 +75,12 @@ echo
 echo "then point Ripple at it, in another shell:"
 echo "  export ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT"
 echo "  export ANTHROPIC_AUTH_TOKEN=DUMMY      # do NOT also set ANTHROPIC_API_KEY"
-echo "  export ANTHROPIC_MODEL=gemini-2.5-flash"
+echo "  export ANTHROPIC_MODEL=gemini-3.5-flash-lite"
+echo
+echo "  -lite is the default because the larger flash models are reasoning"
+echo "  models: they spend the output budget on thinking, so Ripple's small"
+echo "  max_tokens call sites (20 and 256) come back with EMPTY content on"
+echo "  them while -lite returns usable text at the same budget."
 echo
 
 exec "$PY" -m litellm.proxy.proxy_cli --config "$CONFIG" --port "$PORT" --host 127.0.0.1

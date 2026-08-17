@@ -1626,5 +1626,76 @@ def _main() -> int:
     return 1 if failed else 0
 
 
+def test_llm_key_is_resolved_only_through_llm_config():
+    """Two sites GATED on os.environ["ANTHROPIC_API_KEY"] while the call they
+    guarded built its client from llm_config.api_key(). An LLM-gateway setup
+    sets ANTHROPIC_AUTH_TOKEN and deliberately leaves ANTHROPIC_API_KEY unset,
+    so both gates failed closed and fell back to the template -- while the
+    caller believed the LLM had answered. Verified against a live LiteLLM
+    proxy: 0 requests arrived until the gates were fixed.
+
+    Pins the STRUCTURE, not the behaviour: any new direct read reintroduces the
+    same silent divergence, and no unit test of either function would fail."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    app = _os.path.join(root, "app")
+    offenders = []
+    for name in sorted(_os.listdir(app)):
+        if not name.endswith(".py") or name == "llm_config.py":
+            continue
+        src = open(_os.path.join(app, name)).read()
+        for pat in ('environ.get("ANTHROPIC_API_KEY")',
+                    'environ["ANTHROPIC_API_KEY"]',
+                    'getenv("ANTHROPIC_API_KEY")'):
+            if pat in src:
+                offenders.append(f"{name}: {pat}")
+    assert not offenders, (
+        "ANTHROPIC_API_KEY read outside llm_config -- use llm_config.api_key() "
+        f"so ANTHROPIC_AUTH_TOKEN is honoured: {offenders}"
+    )
+
+
+def test_added_required_field_template_does_not_claim_more_than_it_did():
+    """The added_required_field template is written against the demo fixture:
+    the Python branch only matches a payload variable literally named
+    `payload`, and carries a hardcoded `age` parameter from that fixture. On
+    ordinary code (`json={...}` inline) the payload regex misses while the
+    signature fallback matches -- producing a function that ACCEPTS the new
+    field and never sends it.
+
+    The explanation was assigned unconditionally, outside both `if match:`
+    blocks, so the PR body claimed "included in request payload" for code that
+    does not include it. The syntax-only validator cannot catch this: the
+    half-fix compiles.
+
+    A wrong fix that compiles and is described as complete is worse than no
+    fix, because a reviewer trusts the note."""
+    from app.diff_engine import BreakingChange
+    from app.consumer_finder import ConsumerMatch
+    from app.fix_generator import _generate_with_template
+
+    original = (
+        "import requests\n\n"
+        "def create_user(name: str, email: str):\n"
+        "    resp = requests.post(\n"
+        '        "https://api.example.com/users",\n'
+        '        json={"name": name, "email": email},\n'
+        "    )\n"
+        "    return resp.json()\n"
+    )
+    bc = BreakingChange("added_required_field", "/users", "post", "country",
+                        "string", "request_body", "breaking", "country added")
+    cm = ConsumerMatch("c.py", 5, 'json={...}', "high", "calls POST /users",
+                       "python")
+
+    code, note = _generate_with_template(original, cm, bc)
+    claims_payload = "request payload" in note or "included in" in note
+    actually_sends = '"country"' in code
+    assert not (claims_payload and not actually_sends), (
+        "template claims the field reached the payload but it did not:\n"
+        f"  note: {note}\n  code: {code}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(_main())

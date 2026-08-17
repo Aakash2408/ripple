@@ -19,21 +19,42 @@
 
 model_list:
   # The name on the left is what Ripple sends as ANTHROPIC_MODEL.
-  - model_name: gemini-2.5-flash
+  #
+  # NOTE ON MODEL CHOICE: gemini-2.5-flash and gemini-2.0-flash were the
+  # article's examples and are NOT usable here -- a project created in Aug 2026
+  # gets HTTP 404 "no longer available to new users" on invocation, even though
+  # both still appear in GET /v1beta/models. The list endpoint reports what
+  # exists, not what this key may call, so it cannot be used to check
+  # entitlement. Pin a current model, and keep the moving alias as a fallback
+  # so this config does not rot the next time a generation is retired.
+  - model_name: gemini-flash-latest
     litellm_params:
-      model: gemini/gemini-2.5-flash
+      model: gemini/gemini-flash-latest
       # Read from the environment. Never commit a key to this file.
       api_key: os.environ/GEMINI_API_KEY
 
-  - model_name: gemini-2.0-flash
+  - model_name: gemini-3.5-flash
     litellm_params:
-      model: gemini/gemini-2.0-flash
+      model: gemini/gemini-3.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: gemini-3.5-flash-lite
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
       api_key: os.environ/GEMINI_API_KEY
 
 litellm_settings:
   # Fail fast in local testing rather than retrying into a rate limit.
   num_retries: 0
   request_timeout: 60
+
+  # The free tier returns HTTP 503 "experiencing high demand" unpredictably --
+  # observed on gemini-flash-latest while -lite served the same prompt fine.
+  # Without fallbacks a single 503 fails the whole run, which looks like a
+  # wiring bug rather than congestion.
+  fallbacks:
+    - gemini-flash-latest: ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
+    - gemini-3.5-flash: ["gemini-3.5-flash-lite"]
 
 general_settings:
   # No master key: this listens on localhost only and is for local testing.
