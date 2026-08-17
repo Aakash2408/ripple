@@ -2340,5 +2340,56 @@ def test_type_change_never_writes_a_contract_type_into_source():
     assert native_type("go", "boolean") == native_type("go", "bool")
 
 
+def test_capability_registry_derives_rather_than_declares():
+    """The registry must COMPUTE the three derivable facts, not restate them.
+
+    A hand-maintained capability table would become the ninth place capability
+    information lives, and it would drift exactly as the eight language
+    detectors did. So this pins two things:
+
+      1. detect() is derived from the AST of each engine, not from text. The
+         first version grepped for quoted change-type names and reported that
+         OpenAPI could detect rename_field -- because diff_engine.py has the
+         comment `change_type: str  # "added_required_field", "removed_field",
+         "renamed_field"`. A registry that infers capability from prose
+         OVER-claims, which is the dangerous direction.
+      2. The matrix is sparse. 53 of 120 naive (contract, operation) pairs come
+         from engines; remove_package adds one per contract because it is
+         detected at the push-event layer, not by any differ."""
+    from app import capabilities as cap
+
+    # 1. Prose must not create a capability.
+    assert not cap.detect("openapi", "rename_field"), (
+        "openapi claims rename_field -- derived from a comment, not from code")
+    assert cap.detect("proto", "rename_field"), (
+        "proto genuinely infers field renames by field number")
+
+    # 2. Sparse, and event-layer ops counted for every contract.
+    s = cap.summary()
+    assert s["naive_cross_product"] == 120
+    assert 50 < s["detectable_pairs"] < 80, s["detectable_pairs"]
+    assert "remove_package" in cap.event_layer_ops()
+    for contract in cap.CONTRACT_ENGINES:
+        assert cap.detect(contract, "remove_package"), contract
+
+    # 3. tRPC is the sparsity proof: it emits two operations, not twelve.
+    trpc = {op for c, op in cap.detectable_pairs() if c == "trpc"}
+    assert "remove_operation" in trpc and "remove_field" not in trpc, trpc
+
+    # 4. Nothing claims a fix for a non-breaking or wire-only operation.
+    from app.languages import languages
+    for op in ("add_optional", "wire_incompatible"):
+        assert not any(cap.generate_fix(l, op) for l in languages()), (
+            f"{op} must not claim a code transformation")
+
+    # 5. The judgment/mechanical inversion is real and worth pinning: annotating
+    #    needs only a comment token, so JUDGMENT reaches every language, while
+    #    MECHANICAL needs language-specific patterns and reaches fewer.
+    judgment = sum(1 for l in languages() if cap.generate_fix(l, "add_required"))
+    mechanical = sum(1 for l in languages() if cap.generate_fix(l, "remove_field"))
+    assert judgment == len(languages()), judgment
+    assert mechanical < judgment, (mechanical, judgment)
+
+
 if __name__ == "__main__":
     sys.exit(_main())
