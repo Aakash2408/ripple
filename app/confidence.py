@@ -175,7 +175,13 @@ def format_pr_body(change_description: str, source_repo: str,
     elif "rag" in joined_sources:
         fix_score, fix_label = 0.88, "RAG (learned from merged PRs)"
     elif "llm" in joined_sources or "claude" in joined_sources:
-        fix_score, fix_label = 0.78, "LLM-generated (semantic)"
+        # Name the backend that ACTUALLY answered. ANTHROPIC_BASE_URL can point
+        # at a LiteLLM proxy fronting Gemini, or at Ollama, in which case
+        # "LLM-generated" is true but implies Claude when the code no longer
+        # guarantees it. A PR that misreports its own provenance is the same
+        # defect as the "Learning: enabled" footer that shipped on every live PR.
+        from .llm_config import backend_label
+        fix_score, fix_label = 0.78, f"LLM-generated ({backend_label()})"
     else:
         fix_score, fix_label = 0.80, "Pattern-based"
     hist_score = min(0.95, confidence - 0.03)

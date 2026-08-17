@@ -71,7 +71,7 @@ export function Terminal() {
           rel="noreferrer"
           className="rounded-md border border-[var(--warning)]/40 bg-[var(--warning)]/5 px-2.5 py-1.5 font-mono text-[11px] text-[var(--warning)] transition-colors hover:border-[var(--warning)]/60 hover:text-foreground"
         >
-          Python PR (2 sites flagged) →
+          Python PR →
         </a>
         <a
           href="https://ripple-production-be7f.up.railway.app/dry-run"

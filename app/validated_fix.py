@@ -84,7 +84,8 @@ def _generate_with_llm(
         from .fix_generator import _generate_with_template
         return _generate_with_template(original_code, consumer, breaking_change)
     
-    client = anthropic.Anthropic(api_key=api_key)
+    from .llm_config import base_url as _llm_base, model as _llm_model
+    client = anthropic.Anthropic(api_key=api_key, base_url=_llm_base())
     
     prompt = f"""You are a precise code assistant. An API has a breaking change. Fix the consumer code.
 
@@ -127,7 +128,7 @@ FIXED CODE:"""
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=_llm_model(),
             max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )

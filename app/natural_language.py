@@ -22,8 +22,10 @@ from app.consumer_finder import find_consumers
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+# Read through llm_config so an ANTHROPIC_BASE_URL override reaches this caller
+# too. The URL used to be a module-level constant pinned to api.anthropic.com,
+# which meant this site silently ignored the override every other site honoured.
+from app.llm_config import api_key as _llm_api_key, messages_url as _llm_messages_url, model as _llm_model
 
 VALID_ACTIONS = {"add", "remove", "rename", "deprecate"}
 VALID_TARGETS = {"field", "endpoint", "type", "parameter", "header", "schema"}
@@ -85,7 +87,7 @@ def _regex_parse(text: str) -> Optional[ChangeIntent]:
 
 def _claude_parse(text: str) -> Optional[ChangeIntent]:
     """Parse intent using Claude API."""
-    if not ANTHROPIC_API_KEY:
+    if not _llm_api_key():
         return None
 
     prompt = f"""Parse this developer intent into structured fields.
@@ -103,14 +105,14 @@ JSON:"""
 
     try:
         resp = requests.post(
-            ANTHROPIC_URL,
+            _llm_messages_url(),
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
+                "x-api-key": _llm_api_key(),
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": _llm_model(),
                 "max_tokens": 256,
                 "messages": [{"role": "user", "content": prompt}],
             },

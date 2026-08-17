@@ -1,0 +1,103 @@
+"""Single source of truth for which LLM backend Ripple is talking to.
+
+WHY THIS MODULE EXISTS
+----------------------
+Three call sites talked to an LLM and each made its own decisions:
+
+    fix_generator.py     anthropic.Anthropic()          model hardcoded
+    validated_fix.py     anthropic.Anthropic(api_key=)  model hardcoded
+    natural_language.py  requests.post(ANTHROPIC_URL)   URL AND model hardcoded
+
+That is the codebase's dominant failure pattern -- one concept implemented
+several times, drifting apart. It has already produced six language detectors of
+which production reaches one, two consumer finders, two pattern stores and two
+PR-body builders. Adding a fourth variant of "how do we reach the model" would
+have repeated it.
+
+THE FORMAT TRAP
+---------------
+Setting ANTHROPIC_BASE_URL is not sufficient on its own: whatever answers at that
+URL must speak the ANTHROPIC wire format (POST /v1/messages with Anthropic
+fields). Pointing it at a provider's OpenAI-compatible endpoint fails, and the
+error surfaces as a confusing "model may not exist" rather than a format error.
+
+    Anthropic API            speaks Anthropic  -> works
+    LiteLLM proxy            translates        -> works
+    Ollama                   implements /v1/messages natively -> works
+    Gemini /v1beta/openai/   OpenAI format     -> FAILS (looks like a bad model)
+
+HONEST LABELLING
+----------------
+Ripple's PR body reports how a fix was produced. Before this, a fix was labelled
+"LLM-generated (semantic)" with the code naming claude-sonnet-4 -- so pointing the
+base URL at a Gemini or Llama backend would have made every PR misreport its own
+provenance. That is the same defect class as the "Learning: enabled" footer that
+shipped on every live PR until it was removed. backend_label() names what actually
+answered.
+"""
+from __future__ import annotations
+
+import os
+from urllib.parse import urlparse
+
+ANTHROPIC_DEFAULT_BASE = "https://api.anthropic.com"
+ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-20250514"
+
+
+def api_key() -> str:
+    """Auth token. ANTHROPIC_AUTH_TOKEN wins, as proxies commonly use it.
+
+    Do NOT set both this and ANTHROPIC_API_KEY when talking to a proxy -- some
+    clients treat that as an auth conflict.
+    """
+    return (os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            or os.environ.get("ANTHROPIC_API_KEY", ""))
+
+
+def base_url() -> str:
+    return os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") or ANTHROPIC_DEFAULT_BASE
+
+
+def messages_url() -> str:
+    """Full endpoint for a raw HTTP caller (natural_language.py)."""
+    return f"{base_url()}/v1/messages"
+
+
+def model() -> str:
+    return os.environ.get("ANTHROPIC_MODEL", "").strip() or ANTHROPIC_DEFAULT_MODEL
+
+
+def is_anthropic() -> bool:
+    """True only when the real Anthropic API is answering."""
+    return urlparse(base_url()).netloc.endswith("anthropic.com")
+
+
+def is_configured() -> bool:
+    return bool(api_key())
+
+
+def backend_label() -> str:
+    """Human-readable provenance, e.g. for a PR body.
+
+    Names the model AND the host, because the whole point of the override is that
+    the model answering may not be the one the code was written for.
+    """
+    if is_anthropic():
+        return f"{model()} (Anthropic)"
+    host = urlparse(base_url()).netloc or base_url()
+    return f"{model()} via {host}"
+
+
+def describe() -> dict:
+    """Diagnostics for /test-llm and the local harness."""
+    return {
+        "base_url": base_url(),
+        "model": model(),
+        "is_anthropic": is_anthropic(),
+        "configured": is_configured(),
+        "backend_label": backend_label(),
+        "note": (
+            "endpoint must speak the ANTHROPIC wire format; an OpenAI-compatible "
+            "endpoint will fail with a misleading 'model may not exist' error"
+        ),
+    }

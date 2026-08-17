@@ -1,0 +1,41 @@
+# LiteLLM translation layer for Ripple's LLM path.
+#
+# WHY A PROXY IS NEEDED AT ALL
+# Ripple talks the ANTHROPIC wire format (POST /v1/messages). Gemini speaks its
+# own native format and an OpenAI-compatible one. Neither understands Anthropic
+# requests, and pointing ANTHROPIC_BASE_URL straight at Gemini's
+# /v1beta/openai/ endpoint fails with a misleading "model may not exist" error
+# rather than a format error. LiteLLM accepts Anthropic-format requests,
+# translates to OpenAI format, forwards to Gemini, and translates back.
+#
+#   Ripple -> Anthropic format -> LiteLLM -> OpenAI format -> Gemini
+#
+# Ollama would need no proxy: it implements /v1/messages natively.
+#
+# TEST USE ONLY. Google AI Studio's FREE tier may use prompt content to improve
+# their products, and Ripple's prompts contain the customer's private source
+# code. Do not point production traffic at a free tier -- verify the current
+# terms and use a zero-retention/paid tier before any customer data flows.
+
+model_list:
+  # The name on the left is what Ripple sends as ANTHROPIC_MODEL.
+  - model_name: gemini-2.5-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      # Read from the environment. Never commit a key to this file.
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+litellm_settings:
+  # Fail fast in local testing rather than retrying into a rate limit.
+  num_retries: 0
+  request_timeout: 60
+
+general_settings:
+  # No master key: this listens on localhost only and is for local testing.
+  # If you ever expose it, set one.
+  master_key: null

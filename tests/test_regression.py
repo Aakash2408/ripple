@@ -991,6 +991,71 @@ def test_package_deletion_opens_a_marked_pr_not_silence():
     assert out2 != member and "RIPPLE-ACTION-REQUIRED" in out2
 
 
+def test_llm_backend_is_overridable_and_labelled_honestly():
+    """One place decides which LLM answers, and the PR says which one did.
+
+    Three call sites each had their own idea of how to reach a model:
+    fix_generator and validated_fix pinned the model, and natural_language pinned
+    the URL too -- so an ANTHROPIC_BASE_URL override reached two of three sites
+    and the third silently kept calling api.anthropic.com.
+
+    The labelling half matters as much. ANTHROPIC_BASE_URL can front Gemini via a
+    LiteLLM proxy, or Ollama. "LLM-generated (semantic)" would then be true but
+    imply Claude, which is the same defect as the "Learning: enabled" footer that
+    shipped on every live PR.
+    """
+    import importlib
+    import os
+    import app.llm_config as L
+
+    saved = {k: os.environ.get(k) for k in
+             ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+              "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+
+        # Default: the real Anthropic API.
+        importlib.reload(L)
+        assert L.base_url() == "https://api.anthropic.com"
+        assert L.is_anthropic() is True
+        assert "Anthropic" in L.backend_label()
+
+        # Overridden: a proxy fronting something else.
+        os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:4000"
+        os.environ["ANTHROPIC_MODEL"] = "gemini-2.5-flash"
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = "DUMMY"
+        importlib.reload(L)
+        assert L.base_url() == "http://localhost:4000"
+        assert L.model() == "gemini-2.5-flash"
+        assert L.is_anthropic() is False, "must not claim Anthropic when proxied"
+        assert L.messages_url() == "http://localhost:4000/v1/messages"
+        assert L.api_key() == "DUMMY", "AUTH_TOKEN must be honoured"
+
+        label = L.backend_label()
+        assert "gemini-2.5-flash" in label and "localhost:4000" in label, label
+        assert "Anthropic" not in label, \
+            f"label claims Anthropic while proxied to something else: {label}"
+
+        # And the PR body must carry it, not a generic '(semantic)'.
+        import app.confidence as C
+        importlib.reload(C)
+        body = C.format_pr_body(
+            change_description="removed field x", source_repo="acme/spec",
+            confidence=0.8, sources=["llm"], reasons=[], consumer_file="a.go")
+        assert "gemini-2.5-flash" in body, "PR body hides the real backend"
+        assert "LLM-generated (semantic)" not in body
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        importlib.reload(L)
+        import app.confidence as C
+        importlib.reload(C)
+
+
 def test_config_languages_are_matched_not_skipped():
     """YAML and shell files were skipped entirely for having no matcher.
 

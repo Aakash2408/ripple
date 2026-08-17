@@ -106,7 +106,10 @@ def _generate_with_llm(
         print("  ⚠️  anthropic package not installed. Using template fix.")
         return _generate_with_template(original_code, consumer, breaking_change)
     
-    client = anthropic.Anthropic()
+    from .llm_config import api_key as _llm_key, base_url as _llm_base, model as _llm_model
+    # base_url passed explicitly rather than relying on the SDK reading the env,
+    # so the configured backend is visible at the call site.
+    client = anthropic.Anthropic(api_key=_llm_key(), base_url=_llm_base())
     
     prompt = f"""You are a code assistant. An API has a breaking change. Fix the consumer code.
 
@@ -132,7 +135,7 @@ FIXED CODE:"""
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=_llm_model(),
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
