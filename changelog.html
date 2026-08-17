@@ -60,6 +60,47 @@
     </div>
 
     <div class="changelog-entry">
+        <h3>August 17, 2026</h3>
+        <ul>
+            <li>Deleted contracts are now detected — <code>git rm api/user.proto</code> previously produced nothing at all</li>
+            <li>Field renames are detected in proto by field number, so a rename is no longer reported as a removal (which told consumers to delete a field that still exists)</li>
+            <li>Type changes now use each language's own type names — a proto <code>int32</code> becomes <code>number</code> in TypeScript and <code>int</code> in C#, instead of writing <code>int32</code> into source that could not compile</li>
+            <li>Language detection unified into one module; eight separate implementations disagreed with each other, and production recognised 5 languages while the benchmark measured 15</li>
+            <li>YAML, shell, Kotlin and C# files are now scanned for consumers</li>
+            <li>Fixes that cannot be completed safely are marked <code>RIPPLE-ACTION-REQUIRED</code> at the exact call site rather than described as complete</li>
+            <li>Removed a duplicate fix implementation that treated a required-field addition as mechanical — it appended a required parameter and broke every existing caller</li>
+            <li>96 regression tests, 7 CI gates</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 16, 2026</h3>
+        <ul>
+            <li>Real GitHub App installation tokens — repository scope is now authoritative instead of guessed, and three discovery heuristics were deleted</li>
+            <li>Proto parser rewritten to be brace-aware; nested messages, <code>oneof</code>, services, rpcs and enums are diffed correctly</li>
+            <li>TLS verification re-enabled (certificate checking had been disabled)</li>
+            <li>Canonical change-type taxonomy: 55 engine dialects map onto 12 operations in 4 categories, with a coverage matrix gating every combination</li>
+            <li>Wire-only changes (proto field-number edits) now report "no source change required" explicitly, instead of looking like a failure</li>
+            <li>PR bodies flag surviving references instead of claiming a complete fix; reused PRs have their title and body refreshed</li>
+            <li>Corrected claims about learning that had never run, and surfaced why</li>
+            <li>Continuous integration added</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
+        <h3>August 15, 2026</h3>
+        <ul>
+            <li>Fix generation without an LLM — deterministic templates for removed, renamed and retyped fields</li>
+            <li>Consumer finding is language-aware, with confidence scoring and false-positive filtering</li>
+            <li>Consumer search covers every naming variant, so Go <code>PascalCase</code> and TypeScript <code>camelCase</code> references are found (previously snake_case only)</li>
+            <li>Rich PR bodies: confidence table, impact report, and what was left for a human</li>
+            <li><code>/logs/recent</code> endpoint for remote debugging</li>
+            <li>Dry-run accepts YAML as well as JSON</li>
+            <li>Honest pricing — Free plan featured, Team marked coming soon</li>
+        </ul>
+    </div>
+
+    <div class="changelog-entry">
         <h3>August 13, 2026</h3>
         <ul>
             <li>Docs site launched</li>
