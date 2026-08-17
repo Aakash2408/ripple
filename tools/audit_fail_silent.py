@@ -117,6 +117,7 @@ def audit_file(path: str) -> list:
                     "kind": "swallowed_except",
                     "line": node.lineno,
                     "func": fn,
+                    "exc": exc,
                     "detail": f"except {exc}: {'/'.join(type(s).__name__ for s in node.body)}",
                 })
 
@@ -128,11 +129,119 @@ def audit_file(path: str) -> list:
                         "kind": "silent_empty_return",
                         "line": sub.lineno,
                         "func": fn,
+                        "exc": "",
                         "detail": "empty return inside try/except with no signal",
                     })
                     break
 
+    # Stable, line-independent ordinal within (func, kind).
+    #
+    # WHY NOT THE LINE NUMBER: the first version of the triage keyed on
+    # (file, line, func) and detached from the code the moment Stage 3 added 25
+    # lines to webhook.py -- _retry_delay moved 1727 -> 1752 and silently lost its
+    # LEGITIMATE classification. Worse than losing it: a NEW silent path landing on
+    # line 1727 would have inherited that classification and been waved through.
+    #
+    # The ordinal moves only when the silent paths inside that one function change,
+    # which is exactly when a human should re-triage.
+    findings.sort(key=lambda f: f["line"])
+    seen: dict = {}
+    for f in findings:
+        group = (f["func"], f["kind"])
+        f["ordinal"] = seen.get(group, 0)
+        seen[group] = f["ordinal"] + 1
+
     return findings
+
+
+def site_key(filename: str, finding: dict) -> tuple:
+    """The identity of a silent path, independent of where it sits in the file.
+
+    `exc` is part of the key on purpose: widening `except ValueError` to
+    `except Exception` is a different swallow with a different blast radius, so it
+    must forfeit the old classification rather than inherit it.
+    """
+    return (filename, finding["func"], finding["kind"],
+            finding["exc"], finding["ordinal"])
+
+
+def _load_triage():
+    sys.path.insert(0, HERE)
+    from fail_silent_triage import TRIAGE, FIXED, REAL_BUG, MIN_REASON
+    return TRIAGE, FIXED, REAL_BUG, MIN_REASON
+
+
+def check(sites: dict) -> int:
+    """Fail the build on any UNEXPLAINED silent path.
+
+    Deliberately NOT "fail on any silent path": 25 sites are correct-but-invisible
+    and making them visible is P0.4/P0.5 work. Gating on zero would either block
+    the build for weeks or push people to delete the audit. Gating on
+    *classification* is enforceable today and still catches the thing that hurt --
+    a new swallow arriving with nobody having thought about it.
+    """
+    TRIAGE, FIXED, REAL_BUG, MIN_REASON = _load_triage()
+    problems = []
+
+    keys = set(sites)
+    triaged = set(TRIAGE)
+
+    # 1. a silent path nobody classified
+    for key in sorted(keys - triaged):
+        f, fn, kind, caught, ordinal = key
+        problems.append(
+            f"UNCLASSIFIED  {f}:{fn} line {sites[key]['line']}\n"
+            f"                {kind} catching {caught or '-'} (#{ordinal})\n"
+            f"                Add it to tools/fail_silent_triage.py with a reason.")
+
+    # 2. a fix that came back
+    for key in sorted(keys):
+        fn_key = (key[0], key[1])
+        if fn_key in FIXED:
+            problems.append(
+                f"REGRESSION    {key[0]}:{key[1]} line {sites[key]['line']}\n"
+                f"                This was fixed: {FIXED[fn_key]}")
+
+    # 3. a classification pointing at code that no longer exists
+    for key in sorted(triaged - keys):
+        f, fn, kind, caught, ordinal = key
+        problems.append(
+            f"STALE         {f}:{fn}  {kind} catching {caught or '-'} (#{ordinal})\n"
+            f"                Classified but the audit no longer finds it. Either "
+            f"the site was fixed (move it to FIXED) or the code changed shape "
+            f"(re-triage it).")
+
+    # 4. a real bug left standing
+    for key, (bucket, _) in sorted(TRIAGE.items()):
+        if bucket == REAL_BUG:
+            problems.append(
+                f"REAL_BUG      {key[0]}:{key[1]}  must be fixed, not annotated.")
+
+    # 5. an annotation that does not explain anything, or a reference that rotted
+    from fail_silent_triage import resolve_reason
+    for key, (bucket, _) in sorted(TRIAGE.items()):
+        try:
+            reason = resolve_reason(key)
+        except (ValueError, KeyError) as exc:
+            problems.append(
+                f"BAD REFERENCE {key[0]}:{key[1]}  {exc}")
+            continue
+        if len(reason.strip()) < MIN_REASON:
+            problems.append(
+                f"NO REASON     {key[0]}:{key[1]}  {bucket} with a "
+                f"{len(reason.strip())}-char reason (minimum {MIN_REASON}).")
+
+    if problems:
+        print("\n" + "=" * 74)
+        print(f"FAIL-SILENT GATE: {len(problems)} problem(s)")
+        print("=" * 74 + "\n")
+        for p in problems:
+            print("  " + p + "\n")
+        return 1
+
+    print(f"\n  gate OK -- all {len(keys)} silent path(s) classified with a reason, "
+          f"0 real bugs, {len(FIXED)} fixed function(s) still clean\n")
+    return 0
 
 
 def main(argv: list) -> int:
@@ -141,10 +250,14 @@ def main(argv: list) -> int:
 
     total = 0
     by_file = {}
+    sites = {}
     for path in files:
         found = audit_file(path)
+        name = os.path.basename(path)
+        for f in found:
+            sites[site_key(name, f)] = f
         if found:
-            by_file[os.path.basename(path)] = found
+            by_file[name] = found
             total += len(found)
 
     print("=" * 74)
@@ -163,6 +276,9 @@ def main(argv: list) -> int:
                 print(f"      line {f['line']:5}  {f['func']:34} {f['detail']}")
 
     print(f"\n  allow-listed as legitimately silent: {', '.join(sorted(ALLOW_SILENT))}")
+
+    if "--check" in argv:
+        return check(sites)
     return 0
 
 

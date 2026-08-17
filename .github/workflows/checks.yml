@@ -93,11 +93,20 @@ jobs:
         # corrected to a number, because there is no single right one.
         run: python tools/audit_public_claims.py
 
-      - name: Fail-silent audit (report only)
-        # Not gating yet: 51 sites remain, many legitimately silent. Printed
-        # so the number is visible in every build and can be ratcheted down.
-        continue-on-error: true
-        run: python tools/audit_fail_silent.py
+      - name: Fail-silent audit (blocking)
+        # BLOCKING since Stage 5. What it enforces is not "zero silent paths" --
+        # 25 sites are correct-but-invisible and making them visible is P0.4/P0.5
+        # work. Gating on zero would either block the build for weeks or get the
+        # audit deleted. It enforces that no silent path is UNEXPLAINED:
+        #   * every site the audit finds is classified in fail_silent_triage.py
+        #   * no site classified REAL_BUG is left standing
+        #   * a function that was fixed may not go silent again (FIXED)
+        #   * a classification whose code changed shape is stale, not inherited
+        #   * a cross-reference must resolve to a real, same-bucket entry
+        # Adversarially verified: a bare `except: pass` anywhere in app/, a
+        # reverted Stage 4 fix, a widened except clause, a REAL_BUG annotation,
+        # and a dangling SAME_AS each exit 1.
+        run: python tools/audit_fail_silent.py --check
 
       - name: Consumer-matcher vectors
         # The PropBench replay harness (judgment-engine/tools/replay.py) measures

@@ -661,15 +661,17 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 104 tests
+python tests/test_regression.py            # 105 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
-python tools/audit_fail_silent.py          # report-only: 51 sites, ratchet down
+python tools/audit_fail_silent.py --check  # 42 sites, every one classified
 ```
 
-The first five gate CI. The last is printed but non-blocking, so the count stays
-visible in every build.
+All six gate CI. The fail-silent gate does not demand zero silent paths — 25 are
+correct-but-invisible and making them visible is P0.4/P0.5 work. It demands that
+none is *unexplained*: classified in `tools/fail_silent_triage.py`, no `REAL_BUG`
+left standing, and no function that was fixed allowed to go silent again.
 
 ## License
 

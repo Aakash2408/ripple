@@ -2725,5 +2725,70 @@ def test_unreadable_reserved_list_never_becomes_a_rename():
         "message User {\n  string phone = 3;\n}\n")
 
 
+def test_fail_silent_gate_rejects_an_unexplained_swallow():
+    """The gate enforces that no silent path is UNEXPLAINED -- not that none exist.
+
+    Three things had to be true before this could gate anything, and two of them
+    were wrong when Stage 5 started:
+
+    1. The triage keyed on (file, LINE, func) and had already detached: Stage 3
+       added 25 lines to webhook.py, so _retry_delay moved 1727 -> 1752 and two
+       LEGITIMATE classifications pointed at lines that no longer existed. The
+       dangerous direction is the other one -- a NEW swallow landing on line 1727
+       would have INHERITED "LEGITIMATE". Hence the key is now
+       (file, func, kind, caught, ordinal).
+    2. Cross-references were prose ("As line 79.", "As line 458."), stale by
+       construction for the same reason. They are now SAME_AS and must resolve.
+    3. `caught` is part of the identity, so widening `except ValueError` to
+       `except Exception` forfeits the classification instead of inheriting it.
+    """
+    import glob
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.join(_root, "tools"))
+    import audit_fail_silent as A
+    from fail_silent_triage import TRIAGE, FIXED, REAL_BUG, resolve_reason, SAME_AS
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(A.__file__)))
+    sites = {}
+    for path in sorted(glob.glob(os.path.join(root, "app", "*.py"))):
+        name = os.path.basename(path)
+        for f in A.audit_file(path):
+            sites[A.site_key(name, f)] = f
+
+    # 1. The real repository passes.
+    assert A.check(sites) == 0, "the gate must be green on the real tree"
+
+    # 2. Every classification resolves to prose, and no REAL_BUG is left standing.
+    for key, (bucket, _) in TRIAGE.items():
+        assert bucket != REAL_BUG, f"{key} annotated instead of fixed"
+        assert len(resolve_reason(key).strip()) >= 40, key
+
+    # 3. An unclassified swallow fails.
+    extra = ("brand_new.py", "_sneaky", "swallowed_except", "Exception", 0)
+    assert A.check({**sites, extra: {"line": 1}}) == 1, \
+        "a swallow nobody classified must fail the build"
+
+    # 4. A fix coming back fails, even at a different line and exception clause.
+    revert_file, revert_func = next(iter(FIXED))
+    reverted = (revert_file, revert_func, "swallowed_except", "OSError", 0)
+    assert A.check({**sites, reverted: {"line": 1}}) == 1, \
+        f"a silent path returning to {revert_file}:{revert_func} must fail"
+
+    # 5. A classification whose site vanished is stale, not silently dropped.
+    fewer = dict(sites)
+    fewer.pop(next(iter(sites)))
+    assert A.check(fewer) == 1, "a stale classification must fail the build"
+
+    # 6. A dangling cross-reference fails rather than reading as explained.
+    key = next(k for k, (_, r) in TRIAGE.items() if isinstance(r, SAME_AS))
+    bucket, original = TRIAGE[key]
+    TRIAGE[key] = (bucket, SAME_AS("nowhere.py", "no_such_function"))
+    try:
+        assert A.check(sites) == 1, "a SAME_AS pointing at nothing must fail"
+    finally:
+        TRIAGE[key] = (bucket, original)
+    assert A.check(sites) == 0, "restored"
+
+
 if __name__ == "__main__":
     sys.exit(_main())
