@@ -2391,5 +2391,100 @@ def test_capability_registry_derives_rather_than_declares():
     assert mechanical < judgment, (mechanical, judgment)
 
 
+def test_unknown_validation_is_never_valid():
+    """app/validated_fix.py ends its dispatch with
+
+        else:
+            # Can't validate -- assume valid
+            return True, ""
+
+    Measured, that returns VALID for: `phoneNumber: int32;` (TypeScript has no
+    int32), `public int32 PhoneNumber` (C# has no int32), a half-fix that accepts
+    a parameter and never sends it, and the literal string "!!! not rust". Six
+    for six on garbage.
+
+    For a product that modifies other people's code, UNKNOWN IS NOT VALID -- and
+    it is not INVALID either, because claiming a fix is broken when you did not
+    check is a different lie. Hence three states, with no path from absence of
+    evidence to VALID."""
+    from app.capability_claims import (ValidationState, validation_state,
+                                       validates, VALIDATORS)
+
+    assert len(ValidationState) == 3
+    # Declaring a toolchain is not having one.
+    for lang, spec in VALIDATORS.items():
+        if not spec.is_wired:
+            assert validation_state(lang) is ValidationState.UNABLE_TO_VALIDATE
+            assert not validates(lang), f"{lang} counted as validated"
+    # A language with no declared validator is also unable, never valid.
+    assert validation_state("cobol") is ValidationState.UNABLE_TO_VALIDATE
+    assert not validates("cobol")
+    # UNABLE must not be truthy-coerced anywhere downstream.
+    assert bool(ValidationState.UNABLE_TO_VALIDATE.value)  # the STRING is truthy
+    assert not validates("swift")                          # the PREDICATE is not
+
+
+def test_production_readiness_cannot_be_declared():
+    """production is a pure function of the other five. If it could be set by
+    hand it would be the same unverified assertion the registry replaced -- the
+    repo claimed 12-language fix generation while change_field_type was broken in
+    all nine languages it covered.
+
+    So: no module may define a production/PRODUCTION_READY table, and flipping
+    any one input must flip the verdict."""
+    import os as _os
+    from app import capability_claims as cc
+
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    app_dir = _os.path.join(root, "app")
+    banned = ("PRODUCTION_READY = {", "PRODUCTION = {", "production = {",
+              "PRODUCTION_SUPPORTED = {")
+    offenders = []
+    for name in sorted(_os.listdir(app_dir)):
+        if not name.endswith(".py"):
+            continue
+        body = open(_os.path.join(app_dir, name)).read()
+        offenders += [f"{name}: {b}" for b in banned if b in body]
+    assert not offenders, (
+        f"production must be COMPUTED, not declared: {offenders}")
+
+    # Today: nothing is production-ready, and the blocker is validation.
+    s = cc.summary()
+    assert s["production_ready"] == 0, s["production_ready"]
+    assert s["validate_ok"] == 0 and s["e2e_ok"] == 0
+    # Detection and fix generation are NOT the blockers -- both are mostly true.
+    assert s["generate_fix_ok"] > s["cells"] // 2, s["generate_fix_ok"]
+
+    # The verdict must respond to its inputs: a cell that fails ONLY on
+    # validation + e2e becomes ready when both are satisfied.
+    reasons = cc.blocking_reasons("typescript", "openapi", "remove_field")
+    assert len(reasons) == 2, reasons
+    assert any("UNABLE_TO_VALIDATE" in r for r in reasons)
+    assert any("end-to-end" in r for r in reasons)
+
+
+def test_every_e2e_claim_names_the_test_that_proves_it():
+    """A boolean e2e_tested: True is a comment. A test NAME is checkable.
+
+    E2E_FIXTURES is empty today and that is correct, not an oversight: the bar is
+    detection -> consumer discovery -> fix -> VALIDATION -> PR body, and
+    validation does not exist. Several tests here cover diff -> fix, and one posts
+    a synthetic push payload, but none reach a validated PR.
+
+    The invariant is what matters: any claim added later must name a callable that
+    exists in this module, so CI can confirm the evidence is real."""
+    import tests.test_regression as self_mod
+    from app.capability_claims import E2E_FIXTURES, e2e_tested
+
+    for cell, test_name in E2E_FIXTURES.items():
+        assert test_name, f"{cell} claims e2e with no evidence"
+        assert hasattr(self_mod, test_name), (
+            f"{cell} names {test_name!r}, which does not exist in the suite")
+        assert callable(getattr(self_mod, test_name))
+
+    # And an unclaimed cell must not read as tested.
+    assert not e2e_tested("typescript", "openapi", "remove_field")
+
+
 if __name__ == "__main__":
     sys.exit(_main())
