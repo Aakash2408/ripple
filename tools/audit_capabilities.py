@@ -162,6 +162,8 @@ def main(argv: list) -> int:
         # but say so, rather than printing a clean bill of health.
         print(f"\n  note: {evidence_error}")
 
+    _report_capability_claims_outside_the_registry()
+
     if violations:
         print(f"\n  {len(violations)} VIOLATION(S):")
         for v in violations[:30]:
@@ -171,6 +173,37 @@ def main(argv: list) -> int:
     print("\n  no unearned claims: every production=true has all five facts, "
           "and every e2e claim names a test that ran")
     return 0
+
+
+# Eligibility lists that still decide capability WITHOUT consulting the registry.
+# Report-only, following the precedent of tools/audit_fail_silent.py: the number
+# is printed in every build so it can be ratcheted down, rather than blocking work
+# on a refactor that changes routing behaviour.
+#
+# The distinction that matters: a per-language PATTERN TABLE is legitimate -- it is
+# what generate_fix() derives FROM. A per-language ELIGIBILITY LIST is a second
+# capability claim, and the registry cannot govern what it does not gate.
+_ELIGIBILITY_LISTS = {
+    "app/ai_confidence.py": "KNOWN_LANGUAGES -- 'languages Ripple has strong fix "
+                            "generation support for'. Also a CATEGORY ERROR: it "
+                            "lists proto and graphql as languages; those are "
+                            "contract types, not consumer languages.",
+    "app/fix_generator_multi.py": "SUPPORTED_LANGUAGES plus two inline tuples "
+                                  "that decide which languages get a fix at all",
+    "app/impact_prediction.py": "two lists -- but this module is unreferenced AND "
+                                "unimportable, so the lists are dead",
+}
+
+
+def _report_capability_claims_outside_the_registry() -> None:
+    print("\n  capability claims still OUTSIDE the registry (report only):")
+    for path, what in sorted(_ELIGIBILITY_LISTS.items()):
+        exists = "" if os.path.exists(os.path.join(ROOT, path)) else "  [GONE]"
+        print(f"      {path}{exists}")
+        print(f"          {what}")
+    print(f"      -> the registry REPORTS correctly but does not yet GOVERN "
+          f"routing: generate_fix() derives eligibility, while these lists still "
+          f"decide it.")
 
 
 if __name__ == "__main__":
