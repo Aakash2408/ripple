@@ -19,16 +19,53 @@ from typing import Optional
 from .diff_engine import BreakingChange
 
 
+_UNPARSED = object()   # distinct from None, which YAML can return
+
+
+class SchemaParseError(ValueError):
+    """The schema could not be parsed. NOT the same as an empty schema."""
+
+
 def parse_json_schema(content: str) -> dict:
-    """Parse JSON Schema from JSON or detect schema in YAML."""
+    """Parse JSON Schema from JSON or YAML.
+
+    RAISES SchemaParseError rather than returning {} on failure. Returning an
+    empty dict made a malformed schema indistinguishable from a schema with no
+    properties -- so the differ reported either "every field removed" or "nothing
+    changed" depending on which side failed to parse, and both are wrong answers
+    presented as confident ones. _process_spec_change wraps engine calls and logs
+    process_spec_error, so raising surfaces the failure instead of hiding it.
+
+    The previous version also used a BARE `except:`, which swallows
+    KeyboardInterrupt and SystemExit.
+    """
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except (json.JSONDecodeError, ValueError):
-        try:
-            import yaml
-            return yaml.safe_load(content) or {}
-        except:
-            return {}
+        parsed = _UNPARSED
+    if parsed is not _UNPARSED:
+        # A JSON array or scalar parses fine and is NOT a schema. The first
+        # version of this fix validated only the YAML path, so json.loads
+        # returning [1, 2, 3] was handed back as a schema -- caught by the test
+        # rather than by review.
+        if not isinstance(parsed, dict):
+            raise SchemaParseError(
+                f"schema must be a mapping, got {type(parsed).__name__}")
+        return parsed
+    try:
+        import yaml
+        parsed = yaml.safe_load(content)
+    except ImportError as e:
+        raise SchemaParseError(
+            "content is not JSON and PyYAML is unavailable to try YAML") from e
+    except Exception as e:                      # yaml.YAMLError and friends
+        raise SchemaParseError(f"not valid JSON or YAML: {type(e).__name__}") from e
+    if parsed is None:
+        raise SchemaParseError("content parsed as empty -- not a schema")
+    if not isinstance(parsed, dict):
+        raise SchemaParseError(
+            f"schema must be a mapping, got {type(parsed).__name__}")
+    return parsed
 
 
 def diff_jsonschema(old_content: str, new_content: str, file_path: str = "schema.json") -> list[BreakingChange]:

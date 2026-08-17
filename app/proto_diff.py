@@ -138,28 +138,61 @@ def _parse_fields(body: str) -> dict[str, ProtoField]:
     return fields
 
 
+# Sentinel placed in a reserved-number set when at least one entry could not be
+# parsed. A real proto field number is a positive int, so this cannot collide.
+_MALFORMED_RESERVED = -1
+
+
 def _parse_reserved(body: str) -> tuple[set, set]:
-    """Collect reserved field numbers and names."""
+    """Collect reserved field numbers and names.
+
+    Returns (numbers, names). `malformed` entries are recorded on the returned
+    number set via the module-level _MALFORMED_RESERVED marker so callers can
+    tell "nothing is reserved" from "we could not read what is reserved".
+    """
     numbers, names = set(), set()
+    malformed: list = []
+
+    # A `reserved` statement neither regex matches is INVISIBLE -- the loops below
+    # never see it, so a malformed list under-reports rather than erroring. That
+    # is the dangerous direction: a number missing from reserved_numbers turns a
+    # deliberate REMOVAL into a RENAME. Count the statements first and compare.
+    _stmts = len(re.findall(r'\breserved\b[^;]*;', body))
+    _matched = (len(_RESERVED_NUM_RE.findall(body))
+                + len(_RESERVED_NAME_RE.findall(body)))
+    if _stmts > _matched:
+        malformed.append(f"{_stmts - _matched} unparseable reserved statement(s)")
     for m in _RESERVED_NUM_RE.finditer(body):
         for part in m.group(1).split(","):
             part = part.strip()
             if not part:
                 continue
+            # A malformed reserved entry used to be skipped silently. That is
+            # not a cosmetic loss: reserved_numbers is what _find_field_rename
+            # uses to tell a DELIBERATE REMOVAL from a rename. A number missing
+            # from this set can flip a removal into a rename, telling consumers
+            # to rename references to a field that is gone. So an unparseable
+            # entry is recorded, and the caller treats the set as untrustworthy.
             if "-" in part:  # range: "5 - 9"
                 bits = [b.strip() for b in part.split("-")]
                 try:
                     lo, hi = int(bits[0]), int(bits[1])
                     numbers.update(range(lo, hi + 1))
                 except (ValueError, IndexError):
-                    continue
+                    malformed.append(part)
             else:
                 try:
                     numbers.add(int(part))
                 except ValueError:
-                    continue
+                    malformed.append(part)
     for m in _RESERVED_NAME_RE.finditer(body):
         names.update(re.findall(r'"(\w+)"', m.group(1)))
+    if malformed:
+        # Mark the set as untrustworthy rather than silently under-reporting.
+        # _find_field_rename refuses to infer a rename against an unreliable
+        # reserved set, because the failure direction matters: under-reporting
+        # reserved numbers turns a deliberate REMOVAL into a RENAME.
+        numbers.add(_MALFORMED_RESERVED)
     return numbers, names
 
 
@@ -420,6 +453,11 @@ def _find_field_rename(old_field, old_msg: ProtoMessage,
     protobuf idiom for deliberate retirement -- the author is saying "gone", not
     "renamed", and a coincidental number match must not override that.
     """
+    if _MALFORMED_RESERVED in new_msg.reserved_numbers:
+        # We could not read the reserved list. Inferring a rename here risks
+        # telling consumers to RENAME references to a field that was deliberately
+        # REMOVED, which is the more damaging error, so refuse.
+        return ""
     if (old_field.number in new_msg.reserved_numbers
             or old_field.name in new_msg.reserved_names):
         return ""

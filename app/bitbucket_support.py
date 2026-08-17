@@ -79,8 +79,18 @@ class BitbucketClient:
         try:
             with urlopen(req, timeout=15, context=SSL_CTX) as resp:
                 return resp.read().decode()
-        except HTTPError:
-            return ""
+        except HTTPError as e:
+            # 404 is the ONLY definitive answer: the file is not there. Every
+            # other status means we could not look -- 401/403 auth, 429 rate
+            # limit, 5xx outage -- and returning "" for those told the caller the
+            # spec does not exist, i.e. NO BREAKING CHANGES.
+            #
+            # This absent-vs-unreachable conflation is the third instance in this
+            # codebase: it caused the 403-vs-404 cache poisoning in PropBench
+            # twice and one false published claim about PRs that did exist.
+            if e.code == 404:
+                return ""
+            raise
     
     def get_file_at_commit(self, workspace: str, repo_slug: str, path: str, sha: str) -> str:
         """Fetch file at a specific commit SHA."""

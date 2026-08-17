@@ -39,7 +39,7 @@ TRIAGE: dict[tuple, tuple] = {
         "`except HTTPError: return ''` conflates 404 (file absent) with "
         "401/403/429/503 (could not look). A caller reading '' concludes the "
         "spec does not exist, i.e. no breaking changes. Same shape as the "
-        "403-vs-404 cache poisoning that hit PropBench twice."),
+        "403-vs-404 cache poisoning that hit PropBench twice."),    # FIXED in Stage 4: 404 returns '', every other status raises.
     ("proto_diff.py", 154, "_parse_reserved"): (
         REAL_BUG,
         "A malformed reserved RANGE is skipped, so those numbers are absent from "
@@ -47,16 +47,16 @@ TRIAGE: dict[tuple, tuple] = {
         "deliberate removal -- so this can silently flip a REMOVAL into a "
         "RENAME, telling consumers to rename references to a field that is gone. "
         "Narrow trigger, high consequence, and newly load-bearing since field "
-        "numbers became the rename signal."),
+        "numbers became the rename signal."),    # FIXED in Stage 4: unparseable reserved marks the set untrustworthy.
     ("proto_diff.py", 159, "_parse_reserved"): (
         REAL_BUG,
-        "Same as line 154 for a single malformed reserved number."),
+        "Same as line 154 for a single malformed reserved number."),    # FIXED in Stage 4: as line 154.
     ("jsonschema_diff.py", 30, "parse_json_schema"): (
         REAL_BUG,
         "A malformed JSON Schema returns an empty parse, which the differ reads "
         "as a schema with no properties -- so every field looks removed, or "
         "nothing looks changed, depending on which side failed. A parse failure "
-        "and an empty schema must not be the same value."),
+        "and an empty schema must not be the same value."),    # FIXED in Stage 4: raises SchemaParseError instead of returning {}.
 
     # ------------------------------------------------------------ NEEDS_SIGNAL
     ("bitbucket_support.py", 83, "get_file"): (
@@ -131,12 +131,16 @@ TRIAGE: dict[tuple, tuple] = {
         NEEDS_SIGNAL,
         "Falls back to the module singleton without saying so, so per-org "
         "isolation can silently degrade to a shared store."),
+    # Was NEEDS_SIGNAL pending verification in Stage 2. VERIFIED in Stage 4:
+    # `expires_at = time.time() + 3600` is set BEFORE the try, and GitHub
+    # documents installation tokens as one hour, so a malformed expires_at falls
+    # back to exactly the documented lifetime. Reclassified LEGITIMATE on evidence
+    # rather than on the name of the function.
     ("github_app_auth.py", 211, "get_installation_token"): (
-        NEEDS_SIGNAL,
-        "A malformed expires_at is swallowed, leaving whatever default was set. "
-        "NOT VERIFIED: I did not confirm that default, so I am not claiming this "
-        "is safe -- if it is far-future the token is used past expiry and every "
-        "call 401s. Needs a look before Stage 4, not a guess."),
+        LEGITIMATE,
+        "Verified: expires_at defaults to time.time() + 3600 before the try, and "
+        "GitHub documents installation tokens as 1h, so a malformed expires_at "
+        "falls back to the real lifetime."),
     ("multi_step_reasoning.py", 237, "resolve_fix_target"): (
         NEEDS_SIGNAL,
         "ValueError swallowed while resolving a target; the step reports no "

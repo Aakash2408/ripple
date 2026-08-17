@@ -2668,5 +2668,62 @@ def test_every_fix_attempt_ends_in_a_stated_outcome():
             os.environ["RIPPLE_DATA_DIR"] = old
 
 
+def test_absent_is_distinguishable_from_unreachable():
+    """Three of the four real bugs in the fail-silent triage were ONE shape: an
+    error path that conflates "it is not there" with "I could not look".
+
+    That shape has now appeared four times in this codebase -- the 403-vs-404
+    cache poisoning in PropBench twice, one false published claim about PRs that
+    did exist, and bitbucket_support.get_file returning "" for any HTTPError. A
+    caller reading "" concludes the spec does not exist, i.e. NO BREAKING
+    CHANGES."""
+    import inspect
+    from app import bitbucket_support
+    from app.jsonschema_diff import parse_json_schema, SchemaParseError
+
+    # 1. Only 404 may be treated as absent.
+    src = inspect.getsource(bitbucket_support.BitbucketClient.get_file)
+    assert "e.code == 404" in src, (
+        "get_file must special-case 404; any other status means 'could not look'")
+    assert "raise" in src, "non-404 must propagate, not return ''"
+
+    # 2. A malformed schema must not look like an empty schema.
+    for bad in ("{not json", "[1, 2, 3]", ""):
+        try:
+            parse_json_schema(bad)
+            raise AssertionError(f"parsed {bad!r} without complaint")
+        except SchemaParseError:
+            pass
+    assert parse_json_schema('{"properties": {}}') == {"properties": {}}
+
+
+def test_unreadable_reserved_list_never_becomes_a_rename():
+    """reserved_numbers is what tells a DELIBERATE REMOVAL from a rename. A
+    `reserved` statement the regex cannot match is INVISIBLE to the parse loop, so
+    a malformed list under-reports -- and under-reporting flips a removal into a
+    rename, telling consumers to rename references to a field that is gone.
+
+    The first version of this fix only handled malformed ENTRIES inside a matched
+    statement, which missed the real case: `reserved 3-abc;` matches neither regex,
+    so the handler never ran. Statement count vs match count catches it."""
+    from app.proto_diff import diff_proto
+
+    old = "message User {\n  string phone_number = 3;\n}\n"
+
+    def kinds(new):
+        return {c.change_type for c in diff_proto(old, new, "u.proto")}
+
+    # Unreadable reserved list -> refuse to infer a rename.
+    assert "field_renamed" not in kinds(
+        'message User {\n  reserved 3-abc;\n  string phone = 3;\n}\n')
+    # Well-formed reserved -> a removal, in all three spellings.
+    for reserved in ('reserved "phone_number";', "reserved 3;", "reserved 2-4;"):
+        got = kinds(f"message User {{\n  {reserved}\n  string phone = 9;\n}}\n")
+        assert "field_renamed" not in got, (reserved, got)
+    # No reserved statement -> a rename, which is the whole point of the signal.
+    assert "field_renamed" in kinds(
+        "message User {\n  string phone = 3;\n}\n")
+
+
 if __name__ == "__main__":
     sys.exit(_main())
