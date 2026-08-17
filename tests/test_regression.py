@@ -720,28 +720,52 @@ def test_failed_prs_are_not_counted_as_created():
 
 
 def test_activity_survives_process_restart():
-    """An in-memory-only log resets on every Railway redeploy -- which is
-    what erased the successful 08:49 run before it could be inspected."""
-    import tempfile
-    import importlib
-    old_dir = os.environ.get("RIPPLE_DATA_DIR")
-    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
-    try:
-        from app import activity
-        importlib.reload(activity)
-        activity.reset()
-        activity.record("pr_result", {"repo": "o/x",
-                                      "url": "https://github.com/o/x/pull/1"})
+    """An in-memory-only log resets on every Railway redeploy -- which is what
+    erased the successful 08:49 run before it could be inspected.
 
-        # Simulate a restart: reload the module, same data dir
-        importlib.reload(activity)
-        assert activity.counters()["prs_created"] == 1, \
-            "activity did not survive a restart"
-    finally:
-        if old_dir is None:
-            os.environ.pop("RIPPLE_DATA_DIR", None)
-        else:
-            os.environ["RIPPLE_DATA_DIR"] = old_dir
+    Uses a REAL SUBPROCESS, not importlib.reload(). A reload re-executes module
+    top-level code inside a process that already has the data loaded, so
+    module-level state can survive in ways a genuine restart would not -- the
+    previous version of this test could have passed on an in-memory store.
+    Writing in one interpreter and reading in another is the only shape that
+    actually proves persistence.
+
+    This proves the CODE persists. It does NOT prove the deployed volume
+    survives a redeploy -- that needs the live service, see
+    tools/verify_durability.py."""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as data_dir:
+        env = {**os.environ, "RIPPLE_DATA_DIR": data_dir, "PYTHONPATH": root}
+
+        writer = (
+            "from app import activity\n"
+            "activity.reset()\n"
+            "activity.record('pr_result', {'repo': 'o/x',\n"
+            "    'url': 'https://github.com/o/x/pull/1'})\n"
+        )
+        r = subprocess.run([sys.executable, "-c", writer], env=env,
+                           capture_output=True, text=True, cwd=root)
+        assert r.returncode == 0, f"writer failed: {r.stderr[-400:]}"
+
+        # A DIFFERENT interpreter reads it back. No shared memory of any kind.
+        reader = (
+            "import json\n"
+            "from app import activity\n"
+            "print(json.dumps({'prs': activity.counters()['prs_created'],\n"
+            "                  'events': len(activity.all_events())}))\n"
+        )
+        r = subprocess.run([sys.executable, "-c", reader], env=env,
+                           capture_output=True, text=True, cwd=root)
+        assert r.returncode == 0, f"reader failed: {r.stderr[-400:]}"
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        assert got["prs"] == 1, (
+            f"activity did not survive a real process restart: {got}")
+        assert got["events"] >= 1, got
 
 
 def test_dashboard_has_no_duplicate_activity_store():
