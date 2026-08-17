@@ -93,5 +93,14 @@ jobs:
           m = find_package_consumers(src, member, PKG, 'go')
           assert len(m) == 1 and m[0].match_type == 'package_member', m
           assert find_matches_in_file(src, member, PKG, 'go', vector='package')
-          print('consumer-matcher vectors OK')
+          # The vector must be REACHABLE, not merely implemented. It was once
+          # built, unit-tested and CI-gated while unreachable from production.
+          from app.change_types import vector_for
+          assert vector_for('package_removed') == 'package'
+          assert vector_for('field_removed') == 'symbol'
+          from app.webhook import _find_removed_specs
+          d = _find_removed_specs({'commits': [{'removed': [
+              'api/v1/user.proto', 'api/v1/order.proto']}]})
+          assert len(d) == 1 and d[0]['change_type'] == 'package_removed', d
+          print('consumer-matcher vectors OK (routing + emitter reachable)')
           "
