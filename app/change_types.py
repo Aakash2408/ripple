@@ -54,12 +54,42 @@ CANONICAL_OPS = {
     "remove_operation": (JUDGMENT, "an rpc/method/endpoint/procedure was removed"),
     "add_required": (JUDGMENT, "a required field/argument/header was added"),
     "restrict_schema": (JUDGMENT, "schema was narrowed (signature, additionalProperties)"),
+    # A whole contract FILE or DIRECTORY was deleted, so every symbol it
+    # declared is gone at once. This cannot come from a diff engine: every
+    # engine has the shape diff_x(old_content, new_content, file_path) and
+    # therefore never sees more than one file. It is detected at the push-event
+    # layer from the payload's `removed` list.
+    #
+    # JUDGMENT, not MECHANICAL: consumers must drop their imports AND replace
+    # whatever they were using them for, and Ripple cannot invent the
+    # replacement. Deleting the import alone would leave code that does not
+    # compile; deleting the call sites would silently remove behaviour.
+    "remove_package": (JUDGMENT, "a whole spec file or package directory was deleted"),
     "wire_incompatible": (WIRE_ONLY, "field number/id changed -- wire break, no source fix"),
     # Adding an OPTIONAL field breaks nothing: existing consumers keep
     # compiling and keep deserializing. rag_engine's diff heuristic emits
     # 'field_added' for these, and storing them as fix patterns would pollute
     # the RAG store with entries that can never produce a fix.
     "add_optional": (NON_BREAKING, "an optional field was added -- not a breaking change"),
+}
+
+
+# Change types emitted OUTSIDE the diff engines.
+#
+# tools/audit_change_types.py discovers emitters by scanning the 10 diff
+# engines. That is the right default, but it cannot see these: a diff engine has
+# the shape diff_x(old_content, new_content, file_path) and therefore never
+# observes a file that ceased to exist. Package and whole-file deletions are
+# detected at the push-event layer instead, from the payload's `removed` list.
+#
+# Registered explicitly so the audit's "emitted by no engine" note stays
+# meaningful. Without this, remove_package would be listed alongside
+# rename_field -- conflating "emitted somewhere the audit does not scan" with
+# "genuinely dead code", which is precisely the distinction the audit exists to
+# draw.
+EVENT_LAYER_TYPES = {
+    "spec_removed": "app/webhook.py::_find_removed_specs",
+    "package_removed": "app/webhook.py::_find_removed_specs",
 }
 
 
@@ -133,6 +163,18 @@ CHANGE_TYPE_MAP = {
     # --- wire-only -------------------------------------------------------
     "field_number_changed": "wire_incompatible",   # proto
     "field_id_changed": "wire_incompatible",       # thrift
+
+    # --- whole file or directory deleted ---------------------------------
+    # Emitted by the push-event layer (_find_removed_specs), NOT by a diff
+    # engine -- engines compare two versions of ONE file and structurally
+    # cannot see a file disappear. Before this existed, `git rm api/user.proto`
+    # produced nothing at all: _find_changed_specs read only `modified` and
+    # `added` from the payload, so the most severe possible change -- deleting
+    # the entire contract -- was not detected, let alone fixed.
+    "spec_removed": "remove_package",              # one contract file deleted
+    "package_removed": "remove_package",           # a directory of contracts deleted
+    "directory_removed": "remove_package",         # alias
+    "module_removed": "remove_package",            # alias
 
     # --- emitted by rag_engine's diff heuristic during PropBench/git
     #     indexing, not by the diff engines ---------------------------------

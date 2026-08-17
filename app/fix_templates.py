@@ -811,6 +811,56 @@ def apply_fix_template(
         )
         return result, explanation
 
+    elif op == 'remove_package':
+        # A whole contract file or directory is gone, so every symbol it
+        # declared vanished at once. Two kinds of consumer file exist and they
+        # need different treatment, but only a human can supply the
+        # replacement, so both are annotated rather than edited:
+        #
+        #   importers  -- the import path no longer resolves. Commenting out the
+        #                 import alone guarantees the file stops compiling,
+        #                 since every use of it is now undefined. So annotate
+        #                 the import instead of removing it, keeping the broken
+        #                 dependency visible in the diff.
+        #   members    -- files inside a deleted directory were themselves
+        #                 removed upstream; nothing here can fix them.
+        #
+        # Deleting the import and its call sites would compile but silently drop
+        # whatever the package did, which is the outcome Ripple must never
+        # choose on the customer's behalf.
+        note = (f"the contract '{field_name}' was DELETED upstream. Every symbol "
+                f"it declared is gone. Restore an equivalent dependency or "
+                f"remove this usage deliberately.")
+        names = _symbol_names(variants)
+        # Match on the path too, since an import references the directory rather
+        # than any identifier: `import \"api/v1/user.proto\"`.
+        tail = field_name.rstrip('/').rsplit('/', 1)[-1]
+        if tail and tail not in names:
+            names = names | {tail}
+        result, sites = _annotate_sites(code, names, lang, note)
+        if sites == 0:
+            # No textual reference, yet this file was reported as a consumer --
+            # most often a member of the deleted directory, whose relationship
+            # is structural rather than by name. Mark it anyway: an unchanged
+            # file opens no PR, which would turn a detected deletion back into
+            # silence.
+            token = _comment_token(lang)
+            result = (f"{token} {MARKER}: the contract '{field_name}' was deleted "
+                      f"upstream. This file referenced it structurally rather "
+                      f"than by name (e.g. it lived inside the deleted "
+                      f"package) -- review whether it should be removed or "
+                      f"repointed.\n" + code)
+            sites = 1
+        explanation = (
+            f"PARTIAL: the contract '{field_name}' was DELETED upstream, so every "
+            f"symbol it declared is gone at once. Annotated {sites} site(s) with "
+            f"{MARKER}. Nothing was edited or removed: dropping the import would "
+            f"leave every usage undefined, and dropping the usages would silently "
+            f"delete behaviour. Restoring an equivalent dependency or retiring "
+            f"the code is a product decision Ripple deliberately did not make."
+        )
+        return result, explanation
+
     elif op == 'wire_incompatible':
         # A proto field number or thrift field id changed. This breaks the
         # SERIALIZATION contract, not the source contract: consumer code never

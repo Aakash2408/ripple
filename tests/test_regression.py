@@ -856,6 +856,78 @@ def test_apply_fix_template_called_with_the_real_signature():
     assert not bad, f"stale kwargs in apply_fix_template call(s): {bad}"
 
 
+def test_deleted_specs_are_detected_at_the_event_layer():
+    """`git rm api/user.proto` used to produce NOTHING.
+
+    _find_changed_specs reads only `modified` and `added` from the push payload.
+    Nothing read `removed`, so deleting a contract outright -- the most severe
+    change a producer can make, since every symbol it declared disappears at
+    once -- was not detected at all. Not detected-but-unfixable: invisible.
+
+    No diff engine can supply this. Each has the shape
+    diff_x(old_content, new_content, file_path) and never sees more than one
+    file, so a file that ceased to exist is outside what any of them observe.
+    """
+    from app.webhook import _find_removed_specs
+    from app.change_types import canonical_op, category
+
+    # A single deleted contract.
+    one = _find_removed_specs(
+        {"commits": [{"removed": ["api/user.proto"], "modified": [], "added": []}]})
+    assert len(one) == 1, one
+    assert one[0]["change_type"] == "spec_removed"
+    assert canonical_op("spec_removed") == "remove_package"
+    assert category("spec_removed") == "judgment", \
+        "a deleted contract cannot be fixed mechanically -- the replacement is " \
+        "a product decision"
+
+    # Several from one directory collapse into ONE package deletion, because
+    # consumers reference the package path rather than each file.
+    many = _find_removed_specs({"commits": [{"removed": [
+        "api/v1/user.proto", "api/v1/order.proto", "api/v1/payment.proto",
+        "README.md",
+    ], "modified": [], "added": []}]})
+    assert len(many) == 1, f"expected one package deletion, got {many}"
+    assert many[0]["change_type"] == "package_removed"
+    assert many[0]["path"] == "api/v1/"
+    assert many[0]["count"] == 3, "non-spec files must not be counted"
+
+    # Non-spec deletions are not breaking changes.
+    assert _find_removed_specs(
+        {"commits": [{"removed": ["README.md", ".gitignore"]}]}) == []
+
+    # Separate directories stay separate.
+    mixed = _find_removed_specs({"commits": [{"removed": [
+        "api/a.proto", "api/b.proto", "other/c.proto"]}]})
+    kinds = sorted(m["change_type"] for m in mixed)
+    assert kinds == ["package_removed", "spec_removed"], mixed
+
+
+def test_package_deletion_opens_a_marked_pr_not_silence():
+    """A judgment change must produce a NON-EMPTY marked diff.
+
+    fixed_code == content opens no PR, so returning the file unchanged would
+    turn a detected deletion straight back into silence. Nothing may be edited
+    or removed either: dropping the import leaves every usage undefined, and
+    dropping the usages silently deletes behaviour.
+    """
+    from app.fix_templates import apply_fix_template
+
+    importer = 'import "api/v1/user.proto"\n\nfunc main(){ c := userpb.New() }\n'
+    out, expl = apply_fix_template(importer, "go", "package_removed", "api/v1")
+    assert out != importer, "unchanged code opens no PR"
+    assert "RIPPLE-ACTION-REQUIRED" in out
+    assert "PARTIAL" in expl
+    # The import must survive -- removing it is what breaks the build.
+    assert 'import "api/v1/user.proto"' in out
+
+    # A member of the deleted directory names nothing, but must still be marked.
+    member = "package group\n\nfunc mustRunAs() error { return nil }\n"
+    out2, _ = apply_fix_template(member, "go", "package_removed",
+                                 "pkg/security/podsecuritypolicy")
+    assert out2 != member and "RIPPLE-ACTION-REQUIRED" in out2
+
+
 def test_config_languages_are_matched_not_skipped():
     """YAML and shell files were skipped entirely for having no matcher.
 

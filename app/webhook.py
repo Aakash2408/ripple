@@ -910,6 +910,67 @@ def _find_changed_specs(payload: dict) -> list[tuple[str, str, str]]:
     return spec_files
 
 
+def _find_removed_specs(payload: dict) -> list[dict]:
+    """Find contract files DELETED in this push, grouped into package deletions.
+
+    _find_changed_specs reads only `modified` and `added`. Nothing read
+    `removed`, so `git rm api/user.proto` produced no detection at all -- not a
+    detected-but-unfixable change, simply invisible. Deleting a contract
+    outright is the most severe change a producer can make: every symbol it
+    declared disappears at once, and every consumer breaks.
+
+    A diff engine cannot supply this. Each has the shape
+    diff_x(old_content, new_content, file_path) and never sees more than one
+    file, so a file that ceased to exist is outside what any of them can
+    observe. The push payload is the only layer that knows.
+
+    Returns one entry per deletion unit:
+        {change_type, path, package, files, count}
+
+    Several specs removed under a common directory are reported ONCE as
+    `package_removed` with that directory as the propagation vector, because
+    consumers reference the package path rather than each file. A lone deletion
+    is `spec_removed`.
+    """
+    removed: list[str] = []
+    for commit in payload.get("commits", []):
+        for filepath in commit.get("removed", []) or []:
+            if _is_spec_file(filepath) and filepath not in removed:
+                removed.append(filepath)
+
+    if not removed:
+        return []
+
+    # Group by parent directory. Two or more contracts vanishing from one
+    # directory is a package deletion, which consumers see as a path that no
+    # longer resolves.
+    by_dir: dict[str, list[str]] = {}
+    for path in removed:
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        by_dir.setdefault(parent, []).append(path)
+
+    out: list[dict] = []
+    for parent, files in sorted(by_dir.items()):
+        if len(files) > 1 and parent:
+            out.append({
+                "change_type": "package_removed",
+                "path": parent + "/",
+                "package": parent,
+                "files": sorted(files),
+                "count": len(files),
+            })
+        else:
+            for f in sorted(files):
+                out.append({
+                    "change_type": "spec_removed",
+                    "path": f,
+                    "package": parent,
+                    "files": [f],
+                    "count": 1,
+                })
+    return out
+
+
 def _is_spec_file(filepath: str) -> bool:
     """Check if a file is an API contract (OpenAPI, Proto, GraphQL, or DB schema)."""
     lower = filepath.lower()

@@ -92,9 +92,33 @@ def main() -> int:
 
     print("  ✅ every emitted change type maps to a canonical operation")
 
+    # Event-layer types are emitted where this audit does not scan: a diff
+    # engine compares two versions of ONE file and cannot observe a deletion.
+    # Verify each registered emitter really does emit it, so the registry cannot
+    # become a way to silence the audit with a claim.
+    from app.change_types import EVENT_LAYER_TYPES
+    event_types = set()
+    for ct, where in EVENT_LAYER_TYPES.items():
+        srcfile = where.split("::")[0]
+        try:
+            body = open(os.path.join(ROOT, srcfile)).read()
+        except OSError:
+            print(f"  ✗ {ct}: registered emitter {srcfile} does not exist")
+            return 1
+        if f'"{ct}"' not in body and f"'{ct}'" not in body:
+            print(f"  ✗ {ct}: registered as emitted by {where}, but that file "
+                  f"never mentions it")
+            return 1
+        event_types.add(ct)
+    if event_types:
+        print(f"\n  {len(event_types)} change type(s) emitted by the event layer "
+              f"(not by a diff engine), each verified present in its emitter:")
+        for ct in sorted(event_types):
+            print(f"      {ct:18} <- {EVENT_LAYER_TYPES[ct]}")
+
     # Report ops with no emitter, so the taxonomy does not drift into fiction
     used_ops = {op for _, op in
-                [(c, canonical_op(c)) for c in all_types]}
+                [(c, canonical_op(c)) for c in all_types | event_types]}
     unused = sorted(set(CANONICAL_OPS) - used_ops)
     if unused:
         print(f"\n  note: {len(unused)} canonical op(s) currently emitted by no engine: "
