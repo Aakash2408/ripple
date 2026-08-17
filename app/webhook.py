@@ -76,7 +76,8 @@ from .consumer_graph import ConsumerGraph
 from .multi_invoker import MultiInvokerDetector
 from .playbook_engine import PlaybookEngine, EnsembleConsumerFinder
 from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLATE
-from .confidence import format_pr_body, classify_confidence, should_create_pr
+from .confidence import format_pr_body, classify_confidence
+from .routing import pr_level, Decision
 from .expand_contract import advise as expand_contract_advise, analyze_changes as ec_analyze
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .retry_queue import get_retry_queue, should_retry, should_retry_error
@@ -1457,15 +1458,33 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                             file_reasons = pred.get("reasons", file_reasons)
                             break
                     
-                    # Only create PR if confidence is high enough
-                    if not should_create_pr(file_confidence, min_confidence):
-                        _log_activity("pr_skipped_low_confidence", {
+                    # THE ROUTING DECISION. Previously this consulted confidence
+                    # and nothing else, so a cell the registry knew had four
+                    # blockers opened a PR titled "Automated Fix" exactly like a
+                    # validated one. The registry could answer that question the
+                    # whole time and nothing asked it.
+                    decision = pr_level(
+                        language=_detect_lang(consumer_file),
+                        contract=contract_type,
+                        change_type=change.change_type,
+                        confidence=file_confidence,
+                        min_confidence=min_confidence,
+                    )
+                    if not decision.opens_pr:
+                        _log_activity("pr_skipped", {
                             "file": consumer_file,
                             "confidence": file_confidence,
                             "min_required": min_confidence,
+                            **decision.as_detail(),
                         })
                         continue
-                    
+                    _log_activity("pr_routing", {
+                        "file": consumer_file,
+                        "contract": contract_type,
+                        "change_type": change.change_type,
+                        **decision.as_detail(),
+                    })
+
                     pr_url = _create_fix_pr(
                         consumer_repo, consumer_file,
                         fixed_code, change, repo, token,
@@ -1473,6 +1492,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                         sources=file_sources,
                         reasons=file_reasons,
                         all_predictions=ensemble_predictions[:5],
+                        decision=decision,
                     )
                     _log_activity("pr_result", {
                         "repo": consumer_repo,
@@ -2420,6 +2440,7 @@ def _create_fix_pr(
     change: BreakingChange, source_repo: str, token: str,
     confidence: float = 0.8, sources: list = None,
     reasons: list = None, all_predictions: list = None,
+    decision: Decision = None,
 ) -> str:
     """Create a PR with the fix in the consumer repo, including confidence report."""
     # Get default branch
@@ -2516,6 +2537,7 @@ def _create_fix_pr(
         all_predictions=all_predictions,
         residual_refs=residual_refs,
         consumer_file=file_path,
+        decision=decision,
     )
     
     # Create PR

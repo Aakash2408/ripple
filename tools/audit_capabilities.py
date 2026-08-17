@@ -162,12 +162,15 @@ def main(argv: list) -> int:
         # but say so, rather than printing a clean bill of health.
         print(f"\n  note: {evidence_error}")
 
-    _report_capability_claims_outside_the_registry()
+    outside = _gate_capability_claims_outside_the_registry()
 
     if violations:
         print(f"\n  {len(violations)} VIOLATION(S):")
         for v in violations[:30]:
             print(f"      {v}")
+        return 1
+
+    if outside:
         return 1
 
     print("\n  no unearned claims: every production=true has all five facts, "
@@ -176,36 +179,103 @@ def main(argv: list) -> int:
 
 
 # Eligibility lists that still decide capability WITHOUT consulting the registry.
-# Report-only, following the precedent of tools/audit_fail_silent.py: the number
-# is printed in every build so it can be ratcheted down, rather than blocking work
-# on a refactor that changes routing behaviour.
+# BLOCKING since Stage 6. Every file that held a per-language eligibility list is
+# now deleted, and this asserts they do not come back.
 #
 # The distinction that matters: a per-language PATTERN TABLE is legitimate -- it is
 # what generate_fix() derives FROM. A per-language ELIGIBILITY LIST is a second
 # capability claim, and the registry cannot govern what it does not gate.
-# fix_generator_multi.py used to appear here with SUPPORTED_LANGUAGES and two
-# inline eligibility tuples. It was DELETED: 862 lines with zero production
-# callers, so its lists never decided anything. Counting files had made it look
-# like a competing implementation; the call graph showed it was dead.
-_ELIGIBILITY_LISTS = {
-    "app/ai_confidence.py": "KNOWN_LANGUAGES -- 'languages Ripple has strong fix "
-                            "generation support for'. Also a CATEGORY ERROR: it "
-                            "lists proto and graphql as languages; those are "
-                            "contract types, not consumer languages.",
-    "app/impact_prediction.py": "two lists -- but this module is unreferenced AND "
-                                "unimportable, so the lists are dead",
+#
+# All three offenders turned out to be DEAD, which is the honest finding:
+#   fix_generator_multi.py   862 lines, zero production callers  (deleted, 9ece147)
+#   ai_confidence.py         KNOWN_LANGUAGES, zero callers       (deleted, Stage 6)
+#   impact_prediction.py     two lists, unreferenced AND unimportable (Stage 6)
+# ai_confidence.py also carried a CATEGORY ERROR -- it listed `proto` and `graphql`
+# as LANGUAGES when they are contract types; app/languages.py has always been
+# right, so the error never reached a decision.
+#
+# Counting files had made these look like competing implementations. The call graph
+# showed all three were dead, so none of their lists ever decided anything. What
+# actually governs routing now is app/routing.py, which asks the registry.
+_DELETED_ELIGIBILITY_LISTS = {
+    "app/fix_generator_multi.py": "SUPPORTED_LANGUAGES + two inline tuples",
+    "app/ai_confidence.py": "KNOWN_LANGUAGES (also listed proto/graphql as languages)",
+    "app/impact_prediction.py": "two per-language lists",
 }
 
+# The one module allowed to answer eligibility, and the registry functions it must
+# consult. Asserted so a future edit cannot quietly reintroduce a local list.
+_ROUTER = "app/routing.py"
 
-def _report_capability_claims_outside_the_registry() -> None:
-    print("\n  capability claims still OUTSIDE the registry (report only):")
-    for path, what in sorted(_ELIGIBILITY_LISTS.items()):
-        exists = "" if os.path.exists(os.path.join(ROOT, path)) else "  [GONE]"
-        print(f"      {path}{exists}")
-        print(f"          {what}")
-    print(f"      -> the registry REPORTS correctly but does not yet GOVERN "
-          f"routing: generate_fix() derives eligibility, while these lists still "
-          f"decide it.")
+
+def _gate_capability_claims_outside_the_registry() -> int:
+    problems = []
+
+    for path, what in sorted(_DELETED_ELIGIBILITY_LISTS.items()):
+        if os.path.exists(os.path.join(ROOT, path)):
+            problems.append(
+                f"{path} is back. It held {what}, which is a capability claim "
+                f"outside the registry. Ask app/capability_claims.py instead.")
+
+    router = os.path.join(ROOT, _ROUTER)
+    if not os.path.exists(router):
+        problems.append(f"{_ROUTER} is missing -- nothing governs routing.")
+    else:
+        src = open(router).read()
+        if "capability_claims" not in src:
+            problems.append(
+                f"{_ROUTER} no longer consults capability_claims, so the registry "
+                f"has stopped governing routing.")
+        problems.extend(_language_lists_declared_in(router, src))
+
+    print("\n  capability claims outside the registry:")
+    if problems:
+        for p in problems:
+            print(f"      FAIL  {p}")
+        return 1
+    print(f"      none -- {len(_DELETED_ELIGIBILITY_LISTS)} list-holding module(s) "
+          f"deleted and still gone")
+    print(f"      {_ROUTER} decides routing by asking capability_claims")
+    return 0
+
+
+def _language_lists_declared_in(path: str, src: str) -> list:
+    """Module-level collections of language names, found by PARSING not grepping.
+
+    The first version of this check tested `"KNOWN_LANGUAGES" in src` and failed on
+    app/routing.py's own docstring, which explains that KNOWN_LANGUAGES was deleted.
+    A gate that cannot tell a declaration from prose about a declaration is the same
+    defect as the phantom-field gate that grepped for getattr instead of parsing it.
+
+    Checking SHAPE rather than NAME also makes it stronger: any module-level literal
+    holding three or more known language names is an eligibility list whatever it is
+    called, so renaming it does not evade the gate.
+    """
+    import ast
+    from app import languages as _languages
+
+    known = set(_languages.languages())
+    problems = []
+    tree = ast.parse(src)
+    for node in tree.body:                      # module level only
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if isinstance(value, ast.Call):         # frozenset({...}) / set([...])
+            value = value.args[0] if value.args else None
+        if not isinstance(value, (ast.Set, ast.List, ast.Tuple)):
+            continue
+        names = {e.value for e in value.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+        hits = names & known
+        if len(hits) >= 3:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            label = ", ".join(getattr(t, "id", "?") for t in targets)
+            problems.append(
+                f"{os.path.basename(path)} declares {label} at line {node.lineno} "
+                f"-- {len(hits)} language name(s). Routing must ASK the registry, "
+                f"not keep a copy.")
+    return problems
 
 
 if __name__ == "__main__":

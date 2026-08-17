@@ -192,10 +192,30 @@ def canonical_op(change_type: str) -> str:
 
     Falls back by suffix so a NEW engine dialect degrades to the right
     operation instead of dead-ending at "Unknown change_type".
+
+    IDEMPOTENT. It was not, and that was a live trap: CHANGE_TYPE_MAP is keyed by
+    RAW engine dialects, so an already-canonical name like "remove_field" was not a
+    key, fell through every suffix heuristic ("remove_field" does not contain
+    "removed"), and returned "". Callers then read the empty string as "no
+    canonical op":
+
+      * app/outcomes.py blocked_reason() rendered "no transformation exists for
+        {op}" with a BLANK where the operation should be -- a user-facing reason
+        that explains nothing, in the function written to abolish silence.
+      * app/fix_templates.py apply_fix_template() would treat it as an unknown
+        change type, leave the code unchanged, and open no PR.
+      * The capability registry expects canonical ops, so routing asking about
+        "remove_field" got answers about "".
+
+    This is the falsy-read pattern that produced the phantom getattr fields, the
+    wrong ANTHROPIC env var, and history_learner returning None: a lookup that
+    misses returns something usable-looking instead of failing.
     """
     if not change_type:
         return ""
     ct = change_type.strip()
+    if ct in CANONICAL_OPS:          # already canonical -- identity, not ""
+        return ct
     if ct in CHANGE_TYPE_MAP:
         return CHANGE_TYPE_MAP[ct]
 

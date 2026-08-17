@@ -296,6 +296,21 @@ Every PR Ripple opens includes a **confidence badge** showing how certain Ripple
 
 Badges appear in the PR title and body. CI/CD gates can be configured to only auto-merge above a threshold (e.g., `min_confidence: 0.85` in `.ripple.yaml`).
 
+**Confidence is not clearance.** Every PR also carries a safety level decided by
+the capability registry, not by confidence:
+
+| Level | Meaning |
+|---|---|
+| 🟢 `AUTO` | The registry has cleared this language × contract × operation: a transformation exists, validation passes, and an end-to-end fixture proves it. |
+| 🟡 `REVIEW` | A fix was produced but something is unproven. The PR opens, states the reasons, and asks for a human. |
+| 🔴 `BLOCKED` | No PR. |
+
+**Today every PR is `REVIEW`.** Real toolchain validation is not built and
+`E2E_FIXTURES` is empty, so no cell can satisfy `AUTO` — `python tools/audit_capabilities.py`
+reports 0 of 48 fixable cells production-ready. Ripple therefore never claims a fix
+is automatic. `app/routing.py` derives the level by asking
+`app/capability_claims.py`; it keeps no list of its own, and CI fails if it grows one.
+
 ## Research: PropBench
 
 Ripple is backed by **PropBench** — a research benchmark for measuring
@@ -661,7 +676,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 105 tests
+python tests/test_regression.py            # 107 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes

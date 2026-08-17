@@ -2790,5 +2790,126 @@ def test_fail_silent_gate_rejects_an_unexplained_swallow():
     assert A.check(sites) == 0, "restored"
 
 
+def test_canonical_op_is_idempotent():
+    """canonical_op() returned "" for an ALREADY-canonical operation.
+
+    CHANGE_TYPE_MAP is keyed by raw engine dialects, so "remove_field" was not a
+    key, fell through every suffix heuristic ("remove_field" does not contain
+    "removed"), and returned the empty string. Three readers were affected:
+
+      * outcomes.blocked_reason() rendered "no transformation exists for {op}" with
+        a BLANK operation -- an empty explanation, produced by the function written
+        in Stage 3 to abolish empty explanations.
+      * fix_templates.apply_fix_template() would treat it as an unknown change
+        type: unchanged code, no PR.
+      * The capability registry is keyed by canonical ops, so asking it about
+        "remove_field" asked about "".
+
+    Same falsy-read shape as the phantom getattr fields and the wrong ANTHROPIC
+    env var: a lookup that misses returns something usable-looking.
+    """
+    from app.change_types import canonical_op, CANONICAL_OPS
+
+    for op in CANONICAL_OPS:
+        assert canonical_op(op) == op, f"{op} is canonical but mapped to {canonical_op(op)!r}"
+        assert canonical_op(canonical_op(op)) == op, f"{op} not idempotent"
+
+    # Raw dialects still normalise, which is the original purpose.
+    assert canonical_op("removed_field") == "remove_field"
+    assert canonical_op("added_required_field") == "add_required"
+    assert canonical_op("") == ""
+
+    # The blank explanation this produced is gone.
+    from app.outcomes import blocked_reason
+    for change_type in ("remove_field", "removed_field"):
+        reason = blocked_reason(change_type, "Unsupported change type")
+        assert "for  in" not in reason, f"blank operation in: {reason}"
+        assert "remove_field" in reason, reason
+
+
+def test_registry_governs_routing_and_auto_is_never_unearned():
+    """The registry could compute production_ready() all along and NOTHING ASKED.
+
+    Only tools/ and tests/ imported it. Production decided with
+    should_create_pr(confidence) alone, and format_pr_body() titled every result
+    "## Ripple - Automated Fix" -- including cells the registry knew had four unmet
+    blockers. Same defect shape as the package vector: built, tested, CI-gated, and
+    unreachable from the path that mattered.
+    """
+    from app.routing import pr_level, Level
+    from app import capability_claims as cc
+    from app.capabilities import CONTRACT_ENGINES
+    from app import languages
+    from app.change_types import CANONICAL_OPS
+
+    # 1. AUTO is impossible for any cell the registry has not cleared. Swept over
+    #    the whole matrix rather than a sample, because the point is that no
+    #    combination can slip through.
+    checked = 0
+    for lang in sorted(languages.languages()):
+        for contract in sorted(CONTRACT_ENGINES):
+            for op in sorted(CANONICAL_OPS):
+                d = pr_level(lang, contract, op, confidence=0.99,
+                             min_confidence=0.5)
+                checked += 1
+                if d.level is Level.AUTO:
+                    assert cc.production_ready(lang, contract, op), \
+                        f"AUTO for a cell the registry has not cleared: " \
+                        f"{lang}/{contract}/{op}"
+                else:
+                    assert d.reasons, f"{d.level} with no reason: {lang}/{contract}/{op}"
+    assert checked > 500, checked
+
+    # 2. A raw engine dialect and its canonical form must route identically --
+    #    otherwise the registry is answering a different question than the one the
+    #    webhook asked.
+    for raw, canon in (("removed_field", "remove_field"),
+                       ("added_required_field", "add_required")):
+        a = pr_level("typescript", "openapi", raw, 0.9, 0.5)
+        b = pr_level("typescript", "openapi", canon, 0.9, 0.5)
+        assert a == b, (raw, a, b)
+
+    # 3. Below the threshold: no PR, with the reason stated.
+    low = pr_level("typescript", "openapi", "removed_field", 0.10, 0.5)
+    assert low.level is Level.BLOCKED and not low.opens_pr
+    assert "below the configured minimum" in low.reasons[0]
+
+    # 4. An unmappable change type is REVIEW with the gap named, never AUTO.
+    unknown = pr_level("typescript", "openapi", "%%nonsense%%", 0.99, 0.5)
+    assert unknown.level is Level.REVIEW and unknown.opens_pr
+    assert "canonical operation" in unknown.reasons[0]
+
+    # 5. The PR body -- the artifact a customer reads -- must not claim more than
+    #    the level. And a MISSING decision must not upgrade the claim: absence of
+    #    evidence is not clearance.
+    from app.confidence import format_pr_body
+    review = pr_level("swift", "proto", "removed_field", 0.92, 0.5)
+    body = format_pr_body("Field removed", "acme/spec", 0.92, ["grep"], ["ref"],
+                          decision=review)
+    assert "Automated Fix" not in body.split("\n")[0], body.split("\n")[0]
+    assert "human review required" in body.split("\n")[0]
+    for reason in review.reasons:
+        assert reason in body, reason
+    bare = format_pr_body("Field removed", "acme/spec", 0.92, ["grep"], ["ref"])
+    assert "Automated Fix" not in bare.split("\n")[0]
+
+    # 6. Routing keeps NO language list of its own -- it asks. Checked structurally
+    #    via the same AST helper the CI gate uses, so the test and the gate cannot
+    #    disagree about what counts as a list.
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    from audit_capabilities import _language_lists_declared_in
+    router = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "routing.py")
+    assert _language_lists_declared_in(router, open(router).read()) == []
+
+    # 7. The three modules that held eligibility lists are gone and stay gone.
+    app_dir = os.path.dirname(router)
+    for dead in ("ai_confidence.py", "impact_prediction.py",
+                 "fix_generator_multi.py"):
+        assert not os.path.exists(os.path.join(app_dir, dead)), dead
+
+
 if __name__ == "__main__":
     sys.exit(_main())

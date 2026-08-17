@@ -92,7 +92,7 @@ def format_pr_body(change_description: str, source_repo: str,
                    reasons: list[str], all_predictions: list[dict] = None,
                    breaking_change: dict = None, fix_summary: str = "",
                    residual_refs: list = None,
-                   consumer_file: str = "") -> str:
+                   consumer_file: str = "", decision=None) -> str:
     """
     Generate a complete PR body with confidence, impact report, and learning context.
 
@@ -103,19 +103,45 @@ def format_pr_body(change_description: str, source_repo: str,
     """
     level = classify_confidence(confidence)
     
-    # Don't claim a complete fix when references survive.
-    heading = ("## Ripple — Partial Fix (review required)" if residual_refs
-               else "## Ripple — Automated Fix")
-    
-    body_parts = [
-        heading,
-        "",
+    # The heading is a CLAIM, and until Stage 6 it said "Automated Fix" for every
+    # cell -- including ones the capability registry knew had four unmet blockers.
+    # The registry could answer that the whole time; nothing asked it. The level
+    # now comes from routing.pr_level(), which asks.
+    #
+    # A missing decision does NOT upgrade the claim: absence of evidence is not
+    # clearance, the same rule tools/verify_durability.py follows.
+    if residual_refs:
+        heading = "## Ripple — Partial Fix (review required)"
+    elif decision is not None and decision.level.value == "AUTO":
+        heading = "## Ripple — Automated Fix"
+    else:
+        heading = "## Ripple — Proposed Fix (human review required)"
+
+    body_parts = [heading, ""]
+
+    if decision is not None and decision.reasons:
+        body_parts.extend([
+            f"### Why this needs review — safety level `{decision.level.value}`",
+            "",
+            "Ripple's capability registry has not cleared this combination for "
+            "automatic merging:",
+            "",
+        ])
+        body_parts.extend(f"- {r}" for r in decision.reasons)
+        body_parts.extend([
+            "",
+            "The breaking change was detected deterministically. What is unproven "
+            "is the *generated fix*, so read the diff before merging.",
+            "",
+        ])
+
+    body_parts.extend([
         "### Breaking Change",
         "",
         "| Field | Value |",
         "|---|---|",
         f"| **Source** | `{source_repo}` |",
-    ]
+    ])
     
     if breaking_change:
         body_parts.append(f"| **Contract** | `{breaking_change.get('file', 'spec')}` ({breaking_change.get('type', 'API')}) |")
