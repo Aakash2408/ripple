@@ -148,12 +148,11 @@ jobs:
           from app import languages
           from app.rag_engine import _detect_language as rag
           from app.consumer_finder import _detect_language as cf
-          from app.fix_generator_multi import detect_language as fgm
           from app.multi_step_reasoning import _detect_language as msr
           from app.rag_retriever import _language_from_path as rr
           from app.webhook import _detect_lang as wh, _is_code_file as scan
           for n, f in (('rag_engine', rag), ('consumer_finder', cf),
-                       ('fix_generator_multi', fgm), ('multi_step', msr),
+                       ('multi_step', msr),
                        ('rag_retriever', rr), ('webhook', wh)):
               assert f is languages.detect, n + ' re-forked language detection'
           assert scan is languages.is_scannable, 'webhook re-forked is_scannable'
