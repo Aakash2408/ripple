@@ -1920,12 +1920,13 @@ def test_every_detector_resolves_to_the_canonical_one():
 
     Includes the three extensions that exposed the original disagreements:
       .js   -> fix_generator_multi said typescript, six others said javascript
+               (that module is now DELETED -- it had zero production callers;
+                the contradiction is pinned below so it cannot return)
       .yaml -> only rag_engine knew it, and the file filter rejected it anyway
       .kts  -> two of eight knew it"""
     from app import languages
     from app.rag_engine import _detect_language as rag
     from app.consumer_finder import _detect_language as cf
-    from app.fix_generator_multi import detect_language as fgm
     from app.multi_step_reasoning import _detect_language as msr
     from app.rag_retriever import _language_from_path as rr
     from app.webhook import _detect_lang as wh, _is_code_file as wh_isfile
@@ -1933,7 +1934,7 @@ def test_every_detector_resolves_to_the_canonical_one():
 
     # Same function OBJECT: no wrapper can have been slipped in.
     for name, fn in (("rag_engine", rag), ("consumer_finder", cf),
-                     ("fix_generator_multi", fgm), ("multi_step_reasoning", msr),
+                     ("multi_step_reasoning", msr),
                      ("rag_retriever", rr), ("webhook", wh)):
         assert fn is languages.detect, f"{name} no longer resolves to languages.detect"
     assert wh_isfile is languages.is_scannable, "webhook re-forked is_scannable"
@@ -2523,6 +2524,65 @@ def test_every_e2e_claim_names_the_test_that_proves_it():
 
     # And an unclaimed cell must not read as tested.
     assert not e2e_tested("typescript", "openapi", "remove_field")
+
+
+def test_cli_and_production_discover_the_same_consumers():
+    """consumer_finder.find_consumers matched on the ENDPOINT PATH and HTTP
+    METHOD while the webhook matched on the FIELD SYMBOL. Not two
+    implementations of one question -- two different questions. So `ripple scan`
+    could report a different consumer set than the service would for the
+    identical change, and neither was wrong on its own terms. A local command
+    that is not a preview of the service is worse than no local command.
+
+    find_consumers now owns only the directory walk and the ConsumerMatch
+    conversion; matching is delegated to smart_consumer_finder, which the webhook
+    and the PropBench harness both use.
+
+    Also pins the filter: the walk uses languages.is_scannable(), so vendored and
+    generated files are refused. The old extension-only check accepted
+    node_modules/*.js and *.pb.go, which the webhook has always rejected."""
+    import os as _os
+    import tempfile
+    from app.diff_engine import BreakingChange
+    from app.consumer_finder import find_consumers
+    from app.smart_consumer_finder import find_matches_in_file
+    from app.languages import detect, is_scannable
+
+    files = {
+        "svc/client.py": "def show(u):\n    return u.phone_number\n",
+        "web/app.ts": "const p = user.phoneNumber;\n",
+        "deploy/cfg.yaml": "field: phone_number\n",
+        "node_modules/x.js": "const p = o.phoneNumber;\n",
+        "api/user.pb.go": "PhoneNumber string\n",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        for rel, body in files.items():
+            path = _os.path.join(d, rel)
+            _os.makedirs(_os.path.dirname(path), exist_ok=True)
+            open(path, "w").write(body)
+
+        bc = BreakingChange("field_removed", "/users", "get", "phone_number",
+                            "string", "b", "breaking", "x")
+        cli = {_os.path.relpath(m.file_path, d) for m in find_consumers([d], bc)}
+
+        # What production's matcher finds, filtered by production's own file rule.
+        expected = set()
+        for rel in files:
+            path = _os.path.join(d, rel)
+            if not is_scannable(path):
+                continue
+            if find_matches_in_file(open(path).read(), path, "phone_number",
+                                    detect(path)):
+                expected.add(rel)
+
+        assert cli == expected, (
+            f"CLI and production disagree.\n  cli={sorted(cli)}\n  "
+            f"production={sorted(expected)}")
+        # And the filter is doing real work in this fixture.
+        assert "node_modules/x.js" not in cli, "vendored file scanned"
+        assert "api/user.pb.go" not in cli, "generated file scanned"
+        assert "deploy/cfg.yaml" in cli, (
+            "yaml consumer missed -- the old extension-only filter excluded it")
 
 
 if __name__ == "__main__":

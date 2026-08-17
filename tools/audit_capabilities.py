@@ -183,13 +183,15 @@ def main(argv: list) -> int:
 # The distinction that matters: a per-language PATTERN TABLE is legitimate -- it is
 # what generate_fix() derives FROM. A per-language ELIGIBILITY LIST is a second
 # capability claim, and the registry cannot govern what it does not gate.
+# fix_generator_multi.py used to appear here with SUPPORTED_LANGUAGES and two
+# inline eligibility tuples. It was DELETED: 862 lines with zero production
+# callers, so its lists never decided anything. Counting files had made it look
+# like a competing implementation; the call graph showed it was dead.
 _ELIGIBILITY_LISTS = {
     "app/ai_confidence.py": "KNOWN_LANGUAGES -- 'languages Ripple has strong fix "
                             "generation support for'. Also a CATEGORY ERROR: it "
                             "lists proto and graphql as languages; those are "
                             "contract types, not consumer languages.",
-    "app/fix_generator_multi.py": "SUPPORTED_LANGUAGES plus two inline tuples "
-                                  "that decide which languages get a fix at all",
     "app/impact_prediction.py": "two lists -- but this module is unreferenced AND "
                                 "unimportable, so the lists are dead",
 }

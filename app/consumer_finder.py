@@ -15,7 +15,6 @@ That's enough for the demo.
 """
 
 import os
-import re
 from dataclasses import dataclass
 
 from .diff_engine import BreakingChange
@@ -37,118 +36,93 @@ def find_consumers(
     breaking_change: BreakingChange,
     exclude_patterns: list[str] = None,
 ) -> list[ConsumerMatch]:
+    """Find files that consume the thing a breaking change affected.
+
+    DELEGATES matching to smart_consumer_finder, which is what the webhook and
+    the PropBench replay harness use. This function owns only the directory walk
+    and the ConsumerMatch conversion.
+
+    WHY THIS CHANGED
+    It used to match on the ENDPOINT PATH and HTTP METHOD while production
+    matched on the FIELD SYMBOL -- a different question, not a different
+    implementation of the same one. So `ripple scan` and `ripple analyze` could
+    report a different consumer set than the webhook would for the identical
+    change, and neither was wrong on its own terms. That is the
+    production-vs-CLI divergence: the local command was not a preview of what
+    the service would do.
+
+    Now there is one matcher. The directory walk stays here because the webhook
+    walks a GitHub tree instead of a filesystem -- different traversal, same
+    matching.
     """
-    Find files that consume the endpoint affected by a breaking change.
-    
-    Simple strategy:
-    1. Find files containing the endpoint path
-    2. Filter to those that use the HTTP method
-    3. Rank by confidence
-    """
+    from app.languages import detect as _detect, is_scannable
+    from app.smart_consumer_finder import find_matches_in_file
+    from app.change_types import vector_for
+
     if exclude_patterns is None:
         exclude_patterns = [
             "node_modules", ".git", "dist", "build", "__pycache__",
             "vendor", ".venv", "target", ".gradle",
         ]
-    
-    endpoint_path = breaking_change.path  # e.g., "/users"
-    http_method = breaking_change.method  # e.g., "post"
-    
-    matches = []
-    
+
+    # The symbol production searches for, and the vector derived FROM the change
+    # rather than passed in -- the same rule the webhook uses.
+    target = breaking_change.field_name or breaking_change.path
+    try:
+        vector = vector_for(breaking_change.change_type)
+    except Exception:
+        vector = "symbol"
+
+    matches: list[ConsumerMatch] = []
+
     for search_dir in search_dirs:
         for root, dirs, files in os.walk(search_dir):
-            # Skip excluded directories
             dirs[:] = [d for d in dirs if d not in exclude_patterns]
-            
             for filename in files:
-                # Only scan code files
-                if not _is_code_file(filename):
-                    continue
-                
                 filepath = os.path.join(root, filename)
-                file_matches = _scan_file(filepath, endpoint_path, http_method)
-                matches.extend(file_matches)
-    
-    # Sort by confidence (high first)
+                # is_scannable() is the canonical decision, shared with the
+                # webhook: it also rejects vendored and generated files, which
+                # the old extension-only check did not.
+                if not is_scannable(filepath):
+                    continue
+                try:
+                    with open(filepath, "r", errors="ignore") as fh:
+                        content = fh.read()
+                except (IOError, OSError):
+                    continue
+                language = _detect(filepath)
+                for m in find_matches_in_file(content, filepath, target,
+                                              language, vector=vector):
+                    matches.append(ConsumerMatch(
+                        file_path=m.file_path,
+                        line_number=m.line_number,
+                        code_snippet=m.line_content.strip(),
+                        # SmartMatch scores 0.0-1.0; ConsumerMatch is a band.
+                        confidence=("high" if m.confidence >= 0.85
+                                    else "medium" if m.confidence >= 0.6
+                                    else "low"),
+                        match_reason=m.match_type,
+                        language=language,
+                    ))
+
     confidence_order = {"high": 0, "medium": 1, "low": 2}
     matches.sort(key=lambda m: confidence_order.get(m.confidence, 3))
-    
     return matches
 
 
 # Was a second _is_code_file with a THIRD extension set, disagreeing with
 # both webhook's filter and every detector. Canonical now.
-from .languages import is_scannable as _is_code_file  # noqa: E402
 
 
-def _scan_file(filepath: str, endpoint_path: str, http_method: str) -> list[ConsumerMatch]:
-    """Scan a single file for references to the endpoint."""
-    try:
-        with open(filepath, "r", errors="ignore") as f:
-            lines = f.readlines()
-    except (IOError, OSError):
-        return []
-    
-    matches = []
-    language = _detect_language(filepath)
-    
-    # Patterns to look for
-    # 1. Direct URL path reference
-    path_pattern = re.compile(re.escape(endpoint_path), re.IGNORECASE)
-    
-    # 2. HTTP method call patterns by language
-    method_patterns = _get_method_patterns(http_method, language)
-    
-    for line_num, line in enumerate(lines, 1):
-        # Check for endpoint path
-        if path_pattern.search(line):
-            # Found the path — now check if it's an HTTP call
-            confidence = "medium"
-            reason = f"References endpoint path '{endpoint_path}'"
-            
-            # Check surrounding lines for method call
-            context = "".join(lines[max(0, line_num-3):min(len(lines), line_num+3)])
-            
-            for pattern in method_patterns:
-                if pattern.search(context):
-                    confidence = "high"
-                    reason = f"HTTP {http_method.upper()} call to '{endpoint_path}'"
-                    break
-            
-            matches.append(ConsumerMatch(
-                file_path=filepath,
-                line_number=line_num,
-                code_snippet=line.strip(),
-                confidence=confidence,
-                match_reason=reason,
-                language=language,
-            ))
-    
-    return matches
 
 
-from .languages import detect as _detect_language  # noqa: E402
+# Re-exported, not used here: tests/test_regression.py asserts
+# `consumer_finder._detect_language is languages.detect`, which is what stops a
+# module quietly re-adding its own detector. Removing this would make that gate
+# silently weaker rather than fail.
+from .languages import detect as _detect_language  # noqa: E402,F401
 
 
-def _get_method_patterns(http_method: str, language: str) -> list[re.Pattern]:
-    """Get regex patterns for HTTP method calls by language."""
-    method_lower = http_method.lower()
-    method_upper = http_method.upper()
-    
-    patterns = [
-        # Generic patterns (work across languages)
-        re.compile(rf'\.{method_lower}\s*\(', re.IGNORECASE),       # .post(, .get(
-        re.compile(rf'"{method_upper}"', re.IGNORECASE),            # "POST", "GET"
-        re.compile(rf"'{method_upper}'", re.IGNORECASE),            # 'POST', 'GET'
-        re.compile(rf'method\s*[:=]\s*["\']?{method_upper}', re.IGNORECASE),  # method: "POST"
-        re.compile(rf'requests\.{method_lower}', re.IGNORECASE),    # requests.post (Python)
-        re.compile(rf'http\.{method_lower}', re.IGNORECASE),        # http.post
-        re.compile(rf'fetch\(.*{method_upper}', re.IGNORECASE),     # fetch(...POST
-        re.compile(rf'\.{method_upper}\s*\(', re.IGNORECASE),       # .POST( (Java HttpRequest)
-    ]
-    
-    return patterns
 
 
 def format_consumers(matches: list[ConsumerMatch]) -> str:
