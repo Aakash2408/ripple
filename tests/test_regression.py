@@ -914,7 +914,7 @@ def test_package_vector_finds_what_symbol_search_cannot():
     blind to that, however good its variant generation is.
     """
     from app.smart_consumer_finder import (
-        find_package_consumers, find_field_consumers, find_consumers,
+        find_package_consumers, find_field_consumers, find_matches_in_file,
     )
     PKG = "pkg/security/podsecuritypolicy/"
 
@@ -957,7 +957,7 @@ def test_symbol_matcher_behaviour_is_unchanged_by_path_signal():
     """The path signal is additive. The symbol path feeds the live webhook and
     must stay bit-identical, so it is a separate function, not a new branch
     inside find_field_consumers."""
-    from app.smart_consumer_finder import find_field_consumers, find_consumers
+    from app.smart_consumer_finder import find_field_consumers, find_matches_in_file
 
     src = (
         "func send(u User) error {\n"
@@ -970,10 +970,10 @@ def test_symbol_matcher_behaviour_is_unchanged_by_path_signal():
     assert all(not m.match_type.startswith("package_") for m in direct)
 
     # The dispatcher must delegate identically, not re-implement.
-    viad = find_consumers(src, "h.go", "phone_number", "go", vector="symbol")
+    viad = find_matches_in_file(src, "h.go", "phone_number", "go", vector="symbol")
     assert [(m.line_number, m.match_type, m.confidence) for m in viad] == \
            [(m.line_number, m.match_type, m.confidence) for m in direct], \
-        "find_consumers(vector='symbol') diverged from find_field_consumers"
+        "find_matches_in_file(vector='symbol') diverged from find_field_consumers"
 
 
 def test_propbench_indexer_reads_the_real_schema():

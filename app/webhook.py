@@ -68,7 +68,7 @@ from .github_app_auth import (
     is_app_configured, get_installation_token,
     list_installation_repositories, AppAuthError,
 )
-from .consumer_finder import find_consumers, ConsumerMatch
+from .consumer_finder import ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from .pr_engine import CreatedPR
 from .history_learner import HistoryLearner

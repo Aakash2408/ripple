@@ -533,7 +533,7 @@ def find_package_consumers(
     return matches
 
 
-def find_consumers(
+def find_matches_in_file(
     file_content: str,
     file_path: str,
     target: str,
@@ -541,7 +541,25 @@ def find_consumers(
     vector: str = "symbol",
     min_confidence: float = 0.5,
 ) -> list[SmartMatch]:
-    """Dispatch on propagation vector.
+    """Find references in ONE file, dispatching on propagation vector.
+
+    Named for its scope. This module's dispatcher was originally called
+    `find_consumers`, which collided with `consumer_finder.find_consumers` -- a
+    different function with a different contract:
+
+        consumer_finder.find_consumers(search_dirs, breaking_change, ...)
+            -> list[ConsumerMatch]   # searches many DIRECTORIES
+        smart_consumer_finder.find_matches_in_file(content, path, target, lang)
+            -> list[SmartMatch]      # examines ONE file's content
+
+    webhook.py imported the first name and never called it, so nothing was
+    actually broken -- but two same-named functions with incompatible signatures
+    across two modules is how a caller ends up wired to the wrong one, and it
+    made the package vector look connected when it was not.
+
+    vector:
+        "symbol"   a declared identifier was removed; consumers name it
+        "package"  a directory was deleted; consumers are members or importers
 
     Querying the wrong vector under-reports badly: on kubernetes#109798 a symbol
     query scored 38.5% while the correct package query scores 90.9% on the same
