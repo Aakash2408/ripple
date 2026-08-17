@@ -1825,5 +1825,135 @@ def test_add_required_anchors_on_the_call_site_not_the_field():
     assert code != src, "unchanged file opens no PR -- detection becomes silence"
 
 
+def test_language_detection_has_exactly_one_map():
+    """There were EIGHT extension->language maps, plus TWO copies of the
+    scannable-file decision, and they disagreed WITH EACH OTHER -- not merely
+    drifted. Production saw 5 languages while the benchmark measured 15, so the
+    published recall figure described a capability the deployed system lacked.
+
+    Pins the STRUCTURE: any new inline map re-forks the concept, and no unit
+    test of any individual function would fail when it does. This is the same
+    guard shape as test_fix_generated_is_logged_exactly_once, which caught a
+    real regression."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    app_dir = _os.path.join(root, "app")
+
+    # An extension->language mapping is recognisable by a quoted dotted
+    # extension used as a dict key.
+    probes = ('".py":', "'.py':", '".go":', "'.go':", '".ts":', "'.ts':",
+              '".rb":', "'.rb':", '".java":', "'.java':")
+    offenders = []
+    for name in sorted(_os.listdir(app_dir)):
+        if not name.endswith(".py") or name == "languages.py":
+            continue
+        body = open(_os.path.join(app_dir, name)).read()
+        hits = [q for q in probes if q in body]
+        if hits:
+            offenders.append(f"{name}: {hits}")
+    assert not offenders, (
+        "extension->language map outside app/languages.py -- import from there "
+        f"instead: {offenders}"
+    )
+
+
+def test_no_second_language_detector_or_file_filter_is_defined():
+    """A delegating wrapper is still a second place to change, and a second
+    place to forget. Only languages.py may DEFINE these; everyone else imports.
+
+    history_learner keeps a thin method because it is called as self._detect_
+    language() from inside the class, so it is allowed -- but
+    test_every_detector_resolves_to_the_canonical_one proves it still returns
+    the canonical answer."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    app_dir = _os.path.join(root, "app")
+    allowed = {("history_learner.py", "def _detect_language")}
+    banned = ("def _detect_lang(", "def _detect_language(", "def detect_language(",
+              "def _language_from_path(", "def _is_code_file(", "def is_scannable(")
+    offenders = []
+    for name in sorted(_os.listdir(app_dir)):
+        if not name.endswith(".py") or name == "languages.py":
+            continue
+        body = open(_os.path.join(app_dir, name)).read()
+        for b in banned:
+            if b in body and (name, b.rstrip("(")) not in allowed:
+                offenders.append(f"{name}: {b}")
+    assert not offenders, (
+        f"second definition of a canonical concept: {offenders}"
+    )
+
+
+def test_every_detector_resolves_to_the_canonical_one():
+    """Identity where possible, behaviour everywhere. Catches the failure the
+    structural tests cannot see: an alias that points somewhere else, or a
+    module that quietly re-adds a private fallback.
+
+    Includes the three extensions that exposed the original disagreements:
+      .js   -> fix_generator_multi said typescript, six others said javascript
+      .yaml -> only rag_engine knew it, and the file filter rejected it anyway
+      .kts  -> two of eight knew it"""
+    from app import languages
+    from app.rag_engine import _detect_language as rag
+    from app.consumer_finder import _detect_language as cf
+    from app.fix_generator_multi import detect_language as fgm
+    from app.multi_step_reasoning import _detect_language as msr
+    from app.rag_retriever import _language_from_path as rr
+    from app.webhook import _detect_lang as wh, _is_code_file as wh_isfile
+    from app.history_learner import HistoryLearner
+
+    # Same function OBJECT: no wrapper can have been slipped in.
+    for name, fn in (("rag_engine", rag), ("consumer_finder", cf),
+                     ("fix_generator_multi", fgm), ("multi_step_reasoning", msr),
+                     ("rag_retriever", rr), ("webhook", wh)):
+        assert fn is languages.detect, f"{name} no longer resolves to languages.detect"
+    assert wh_isfile is languages.is_scannable, "webhook re-forked is_scannable"
+
+    # history_learner is a method, so check behaviour instead.
+    hl = HistoryLearner.__new__(HistoryLearner)
+    exts = (".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".go", ".rs", ".rb",
+            ".kt", ".kts", ".cs", ".swift", ".php", ".scala", ".sc", ".dart",
+            ".yaml", ".yml", ".sh", ".bash", ".zsh", ".md", ".proto")
+    for e in exts:
+        want = languages.detect("f" + e)
+        got = hl._detect_language("f" + e)
+        assert got == want, f"history_learner disagrees on {e}: {got} != {want}"
+
+    # One sentinel. None and "generic" were both in use before.
+    assert languages.detect("README.md") == languages.UNKNOWN
+    assert languages.detect("a.js") == "javascript", "the .js contradiction is back"
+
+
+def test_benchmark_and_production_share_the_language_path():
+    """PropBench's replay.py imports the detector from Ripple to score recall.
+    It used to import app.rag_engine._detect_language (15 languages) while the
+    webhook ran its own (5), so the headline number could not describe the
+    deployed system. Now both resolve to the same object -- assert it here, in
+    Ripple, because the harness lives in a different repository and its import
+    is the thing that must not silently re-point."""
+    from app import languages
+    from app.webhook import _detect_lang as production
+    from app.rag_engine import _detect_language as harness_path
+    assert production is harness_path is languages.detect, (
+        "benchmark and production no longer share the language path"
+    )
+
+
+def test_scannable_admits_the_languages_matchers_exist_for():
+    """The file filter rejected .yaml and .sh AFTER matchers were written for
+    them. rag_engine's own comment records the cost: 137 files a real PR had to
+    change were skipped for having no matcher -- 24 of 36 on kubernetes#109798.
+    The matchers landed; the filter still said no, so the fix was invisible."""
+    from app.languages import is_scannable, detect
+    for path in ("deploy/values.yaml", "hack/local-up-cluster.sh",
+                 "src/Main.kt", "src/Client.cs", "src/a.rs", "src/a.rb"):
+        assert is_scannable(path), f"{path} ({detect(path)}) is not scannable"
+    # Vendored and generated code must still be refused: those are never
+    # hand-edited, so a PR touching one is always wrong.
+    for path in ("node_modules/x/index.js", "vendor/y.go", "api/user.pb.go",
+                 "types/index.d.ts", "dist/app.min.js", "README.md"):
+        assert not is_scannable(path), f"{path} should not be scannable"
+
+
 if __name__ == "__main__":
     sys.exit(_main())

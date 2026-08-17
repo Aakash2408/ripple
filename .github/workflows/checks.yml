@@ -104,3 +104,41 @@ jobs:
           assert len(d) == 1 and d[0]['change_type'] == 'package_removed', d
           print('consumer-matcher vectors OK (routing + emitter reachable)')
           "
+
+      - name: Language detection is singular
+        # There were EIGHT extension->language maps and TWO copies of the
+        # scannable-file decision, disagreeing WITH EACH OTHER rather than just
+        # drifting: production resolved 5 languages while PropBench's replay
+        # harness measured 15, so the published recall figure described a
+        # capability the deployed system did not have.
+        #
+        # The regression suite pins this structurally, but this step states the
+        # invariant where it is visible in every build log, because the failure
+        # mode is silent -- nothing errors when a module re-adds its own map.
+        run: |
+          python -c "
+          from app import languages
+          from app.rag_engine import _detect_language as rag
+          from app.consumer_finder import _detect_language as cf
+          from app.fix_generator_multi import detect_language as fgm
+          from app.multi_step_reasoning import _detect_language as msr
+          from app.rag_retriever import _language_from_path as rr
+          from app.webhook import _detect_lang as wh, _is_code_file as scan
+          for n, f in (('rag_engine', rag), ('consumer_finder', cf),
+                       ('fix_generator_multi', fgm), ('multi_step', msr),
+                       ('rag_retriever', rr), ('webhook', wh)):
+              assert f is languages.detect, n + ' re-forked language detection'
+          assert scan is languages.is_scannable, 'webhook re-forked is_scannable'
+          # The three extensions that exposed the original disagreements.
+          assert languages.detect('a.js') == 'javascript'   # was 'typescript' in one map
+          assert languages.detect('a.yaml') == 'yaml'       # 1 of 8 knew it
+          assert languages.detect('a.kts') == 'kotlin'      # 2 of 8 knew it
+          # Matchers exist for yaml and shell; the file filter used to reject
+          # them anyway, which made those matchers unreachable.
+          assert languages.is_scannable('hack/up.sh')
+          assert languages.is_scannable('deploy/values.yaml')
+          assert not languages.is_scannable('api/user.pb.go')   # generated
+          assert not languages.is_scannable('node_modules/x.js')  # vendored
+          print('language detection OK (%d languages, one map, benchmark == production)'
+                % len(languages.languages()))
+          "
