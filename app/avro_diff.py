@@ -99,6 +99,8 @@ def diff_avro(old_content: str, new_content: str, file_path: str = "schema.avsc"
                     method=old_schema.get("name", ""),
                     field_name=name,
                     field_type=f"{old_type} -> {new_type}",
+                    old_type=old_type,
+                    new_type=new_type,
                     location="avro",
                     severity="breaking",
                     description=f"Field '{name}' type changed from '{old_type}' to '{new_type}'. Schema evolution incompatible.",
@@ -108,6 +110,7 @@ def diff_avro(old_content: str, new_content: str, file_path: str = "schema.avsc"
         if old_schema.get("name") != new_schema.get("name"):
             changes.append(BreakingChange(
                 change_type="record_renamed",
+                new_name=str(new_schema.get("name", "")),
                 path=file_path,
                 method=new_schema.get("name", ""),
                 field_name=f"{old_schema.get('name')} -> {new_schema.get('name')}",

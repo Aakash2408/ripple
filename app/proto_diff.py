@@ -221,7 +221,9 @@ def parse_proto(content: str) -> dict[str, ProtoMessage]:
 
 # ------------------------------------------------------------------- diff
 def _bc(change_type: str, path: str, method: str, field_name: str,
-        field_type: str, location: str, description: str) -> BreakingChange:
+        field_type: str, location: str, description: str,
+        new_name: str = "", old_type: str = "",
+        new_type: str = "") -> BreakingChange:
     return BreakingChange(
         change_type=change_type,
         path=path,
@@ -231,6 +233,9 @@ def _bc(change_type: str, path: str, method: str, field_name: str,
         location=location,
         severity="breaking",
         description=description,
+        new_name=new_name,
+        old_type=old_type,
+        new_type=new_type,
     )
 
 
@@ -262,6 +267,7 @@ def _diff_messages(old: ProtoSchema, new: ProtoSchema,
                     "message",
                     f"Message '{msg_name}' renamed to '{renamed_to}' — "
                     f"all imports and references break",
+                    new_name=renamed_to,
                 ))
             else:
                 changes.append(_bc(
@@ -275,6 +281,21 @@ def _diff_messages(old: ProtoSchema, new: ProtoSchema,
             new_field = new_msg.fields.get(fname)
 
             if new_field is None:
+                # A rename LOOKS like a removal plus an addition in a text
+                # diff. In protobuf the field NUMBER is the wire identity, so a
+                # field whose number and type survive under a different name is
+                # a rename by definition -- this is not a similarity guess.
+                renamed_to = _find_field_rename(old_field, old_msg, new_msg)
+                if renamed_to:
+                    changes.append(_bc(
+                        "field_renamed", file_path, msg_name, fname,
+                        old_field.type, "message_field",
+                        f"Field '{fname}' renamed to '{renamed_to}' in message "
+                        f"'{msg_name}' (number {old_field.number} unchanged) "
+                        f"— source consumers referencing the old name break",
+                        new_name=renamed_to,
+                    ))
+                    continue
                 # Reserving a removed field is correct protobuf hygiene, but
                 # it is still breaking for source-level consumers.
                 reserved = (old_field.number in new_msg.reserved_numbers
@@ -289,10 +310,12 @@ def _diff_messages(old: ProtoSchema, new: ProtoSchema,
 
             if new_field.type != old_field.type:
                 changes.append(_bc(
-                    "field_type_changed", file_path, msg_name, fname, new_field.type,
+                    "field_type_changed", file_path, msg_name, fname,
+                    f"{old_field.type} -> {new_field.type}",
                     "message_field",
                     f"Field '{fname}' type changed from '{old_field.type}' "
                     f"to '{new_field.type}' — deserialization fails",
+                    old_type=old_field.type, new_type=new_field.type,
                 ))
 
             if new_field.number != old_field.number:
@@ -380,6 +403,32 @@ def _diff_services(old: ProtoSchema, new: ProtoSchema,
                     f"{old_rpc.signature()} to {new_rpc.signature()}",
                 ))
     return changes
+
+
+def _find_field_rename(old_field, old_msg: ProtoMessage,
+                       new_msg: ProtoMessage) -> str:
+    """The new name of a renamed field, or "" if it was genuinely removed.
+
+    Field NUMBER is protobuf's identity: the wire format carries numbers, not
+    names. So a field whose number AND type reappear under a different name has
+    been renamed, and no consumer's serialized data changed -- but every
+    consumer's SOURCE that names the field breaks. That distinction is why this
+    matters: reporting it as a removal would tell the consumer to delete
+    references to a field that still exists.
+
+    Returns "" when the number or name is RESERVED, because reserving is the
+    protobuf idiom for deliberate retirement -- the author is saying "gone", not
+    "renamed", and a coincidental number match must not override that.
+    """
+    if (old_field.number in new_msg.reserved_numbers
+            or old_field.name in new_msg.reserved_names):
+        return ""
+    for cand in new_msg.fields.values():
+        if (cand.name not in old_msg.fields
+                and cand.number == old_field.number
+                and cand.type == old_field.type):
+            return cand.name
+    return ""
 
 
 def _find_rename(old_msg: ProtoMessage, new_messages: dict,

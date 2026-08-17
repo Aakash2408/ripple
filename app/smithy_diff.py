@@ -117,6 +117,8 @@ def diff_smithy(old_content: str, new_content: str, file_path: str = "model.smit
                     change_type="member_type_changed", path=file_path, method=struct_name,
                     field_name=member_name,
                     field_type=f"{old_members[member_name]['type']} -> {new_members[member_name]['type']}",
+                    old_type=old_members[member_name]["type"],
+                    new_type=new_members[member_name]["type"],
                     location="smithy", severity="breaking",
                     description=f"Member '{member_name}' type changed in '{struct_name}'.",
                 ))

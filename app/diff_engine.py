@@ -181,6 +181,8 @@ def diff_specs(old_path: str, new_path: str) -> DiffResult:
                         method=method,
                         field_name=field_name,
                         field_type=f"{old_type} -> {new_type}",
+                        old_type=old_type,
+                        new_type=new_type,
                         location="request_body",
                         severity="breaking",
                         description=f"Field '{field_name}' type changed from '{old_type}' to '{new_type}'. Consumers sending the old type will get validation errors.",

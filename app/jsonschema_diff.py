@@ -93,6 +93,8 @@ def _diff_schema_recursive(old: dict, new: dict, file_path: str, path_prefix: st
                 method=path_prefix or "root",
                 field_name=prop_name,
                 field_type=f"{old_type} -> {new_type}",
+                old_type=old_type,
+                new_type=new_type,
                 location="jsonschema",
                 severity="breaking",
                 description=f"Property '{prop_name}' type changed from '{old_type}' to '{new_type}'.",

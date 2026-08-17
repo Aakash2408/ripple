@@ -2110,5 +2110,146 @@ def test_type_change_reads_the_fields_not_the_display_string():
         assert "string" in note and "int32" in note, (arrow, note)
 
 
+def test_type_change_engines_populate_the_structured_fields():
+    """Nine engines emitted a type-change dialect, and every one COMPUTED the
+    old and new type locally, formatted them into a display string, and threw
+    the structured values away:
+
+        field_type=f"{old_type} -> {new_type}"
+
+    The consumer then had to recover them by splitting that string -- which is
+    how the precedence bug in fix_generator came to exist, and why it depended on
+    a formatting accident. migration_diff used a unicode arrow while the others
+    used ASCII, and proto_diff passed only the NEW type, so the split could never
+    work there at all.
+
+    Asserts the values now travel as data, per engine, on real input."""
+    from app.proto_diff import diff_proto
+    from app.avro_diff import diff_avro
+    from app.jsonschema_diff import diff_jsonschema
+    from app.thrift_diff import diff_thrift
+    from app.smithy_diff import diff_smithy
+    from app.trpc_diff import diff_trpc
+
+    cases = [
+        ("proto", diff_proto,
+         "message U {\n  string age = 1;\n}\n",
+         "message U {\n  int32 age = 1;\n}\n", "u.proto", "string", "int32"),
+        ("avro", diff_avro,
+         '{"type":"record","name":"U","fields":[{"name":"age","type":"string"}]}',
+         '{"type":"record","name":"U","fields":[{"name":"age","type":"int"}]}',
+         "u.avsc", "string", "int"),
+        ("jsonschema", diff_jsonschema,
+         '{"properties":{"age":{"type":"string"}}}',
+         '{"properties":{"age":{"type":"integer"}}}',
+         "s.json", "string", "integer"),
+        ("thrift", diff_thrift,
+         "struct U {\n  1: string age\n}\n",
+         "struct U {\n  1: i32 age\n}\n", "u.thrift", "string", "i32"),
+    ]
+    for name, fn, old, new, path, want_old, want_new in cases:
+        changes = [c for c in fn(old, new, path) if "type_changed" in c.change_type]
+        assert changes, f"{name}: no type change detected"
+        c = changes[0]
+        assert c.old_type == want_old, f"{name}: old_type {c.old_type!r} != {want_old!r}"
+        assert c.new_type == want_new, f"{name}: new_type {c.new_type!r} != {want_new!r}"
+
+    # smithy and trpc use different fixture shapes; assert only that the fields
+    # are populated rather than pinning their type vocabulary.
+    for name, fn, old, new, path in (
+        ("smithy", diff_smithy,
+         "structure U {\n    age: String\n}\n",
+         "structure U {\n    age: Integer\n}\n", "u.smithy"),
+        ("trpc", diff_trpc,
+         "export const r = router({ getUser: publicProcedure.query(() => {}) });",
+         "export const r = router({ getUser: publicProcedure.mutation(() => {}) });",
+         "r.ts"),
+    ):
+        changes = [c for c in fn(old, new, path) if "type_changed" in c.change_type]
+        if not changes:
+            continue   # fixture did not trigger this engine's path
+        c = changes[0]
+        assert c.old_type and c.new_type, (
+            f"{name}: emitted a type change with empty old_type/new_type: "
+            f"{c.old_type!r} -> {c.new_type!r}")
+
+
+def test_proto_detects_a_field_rename_and_respects_reserved():
+    """A rename LOOKS like a removal plus an addition in a text diff, which is
+    why no engine emitted rename_field -- the audit reported it as a canonical
+    operation emitted by nothing, so fix_generator's rename branch was dead on
+    both sides.
+
+    In protobuf the field NUMBER is the wire identity: the format carries
+    numbers, not names. A field whose number AND type reappear under a different
+    name has been renamed, and this is not a similarity guess. The distinction
+    matters because reporting it as a removal tells the consumer to DELETE
+    references to a field that still exists.
+
+    RESERVED must win: reserving is the protobuf idiom for deliberate
+    retirement, so a coincidental number match must not override the author
+    saying "gone"."""
+    from app.proto_diff import diff_proto
+
+    old = "message User {\n  string phone_number = 3;\n  string email = 1;\n}\n"
+
+    # Same number, same type, new name -> rename.
+    renamed = diff_proto(old, "message User {\n  string phone = 3;\n"
+                              "  string email = 1;\n}\n", "u.proto")
+    assert len(renamed) == 1, renamed
+    assert renamed[0].change_type == "field_renamed", renamed[0].change_type
+    assert renamed[0].new_name == "phone", renamed[0].new_name
+
+    # RESERVED wins. The fixture must make the guard the DECIDING factor: an
+    # earlier version reserved number 3 while giving 'phone' number 4, so the
+    # number comparison already failed and deleting the guard did not change the
+    # result -- the test passed for the wrong reason. Reserving the NAME while
+    # 'phone' genuinely reuses number 3 is valid proto (reserving a name does not
+    # reserve its number) and isolates the guard.
+    reserved = diff_proto(old, 'message User {\n  reserved "phone_number";\n'
+                               "  string phone = 3;\n  string email = 1;\n}\n",
+                          "u.proto")
+    kinds = {c.change_type for c in reserved}
+    assert "field_removed" in kinds, kinds
+    assert "field_renamed" not in kinds, "reserved must not be read as a rename"
+
+    # Different type at the same number -> not a rename.
+    retyped = diff_proto(old, "message User {\n  int32 phone = 3;\n"
+                              "  string email = 1;\n}\n", "u.proto")
+    assert "field_renamed" not in {c.change_type for c in retyped}
+
+
+def test_proto_rename_reaches_a_real_fix_end_to_end():
+    """The plumbing, the detection and the template must line up. Each was
+    individually correct at some point today while the chain was broken:
+    BreakingChange lacked new_name, then no engine emitted rename_field."""
+    from app.proto_diff import diff_proto
+    from app.consumer_finder import ConsumerMatch
+    from app.fix_generator import _generate_with_template
+    from app.smart_consumer_finder import find_residual_references
+
+    change = diff_proto("message User {\n  string phone_number = 3;\n}\n",
+                        "message User {\n  string phone = 3;\n}\n",
+                        "api/user.proto")[0]
+    consumer = ('def show(u):\n'
+                '    print(u.phone_number)\n'
+                '    return {"phone_number": u.phone_number}\n')
+    cm = ConsumerMatch("clients/user.py", 2, "u.phone_number", "high", "r",
+                       "python")
+    fixed, note = _generate_with_template(consumer, cm, change)
+
+    assert "u.phone_number" not in fixed, "attribute access was not renamed"
+    assert "u.phone" in fixed
+    assert "phone" in note and "phone_number" in note
+
+    # The template PRESERVES string literals by design and says so. For a proto
+    # contract that literal is the JSON wire name, so it is a live reference --
+    # which is why residual detection must catch it rather than the PR claiming
+    # a complete rename.
+    assert "String literals and comments preserved" in note, note
+    residual = find_residual_references(fixed, "phone_number", "python")
+    assert residual, "a surviving reference must be flagged, not left silent"
+
+
 if __name__ == "__main__":
     sys.exit(_main())

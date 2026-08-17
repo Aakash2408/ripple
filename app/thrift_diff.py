@@ -117,6 +117,8 @@ def diff_thrift(old_content: str, new_content: str, file_path: str = "service.th
                     change_type="field_type_changed", path=file_path, method=struct_name,
                     field_name=field_name, 
                     field_type=f"{old_fields[field_name]['type']} -> {new_fields[field_name]['type']}",
+                    old_type=old_fields[field_name]["type"],
+                    new_type=new_fields[field_name]["type"],
                     location="thrift", severity="breaking",
                     description=f"Field '{field_name}' type changed in struct '{struct_name}'.",
                 ))

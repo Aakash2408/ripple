@@ -198,6 +198,8 @@ def diff_schema(old_content: str, new_content: str, file_path: str = "schema.sql
                         method=table_name,
                         field_name=col_name,
                         field_type=f"{old_col.type} → {new_col.type}",
+                        old_type=old_col.type,
+                        new_type=new_col.type,
                         location="database",
                         severity="breaking",
                         description=f"Column '{col_name}' in '{table_name}' changed type from '{old_col.type}' to '{new_col.type}'. Existing data may not cast correctly.",
@@ -242,6 +244,7 @@ def diff_schema(old_content: str, new_content: str, file_path: str = "schema.sql
                     if overlap > 0.7:
                         changes.append(BreakingChange(
                             change_type="table_renamed",
+                            new_name=table_name,
                             path=file_path,
                             method=table_name,
                             field_name=f"{old_name} → {table_name}",
