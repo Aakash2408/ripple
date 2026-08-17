@@ -1052,7 +1052,9 @@ def _is_spec_file(filepath: str) -> bool:
 
 
 def _log_fix_generated(repo: str, file_path: str, changed: bool,
-                       source: str, vector: str = "symbol") -> None:
+                       source: str, vector: str = "symbol",
+                       change_type: str = "", original_code: str = "",
+                       fixed_code: str = "", explanation: str = "") -> None:
     """The ONLY place fix_generated is logged.
 
     It was once emitted from both the fix loop and inside
@@ -1071,6 +1073,23 @@ def _log_fix_generated(repo: str, file_path: str, changed: bool,
         "vector": vector,
         "source": source,
     })
+
+    # Every consumer file also gets a STATED OUTCOME. `changed: false` above is a
+    # fact about the code, not a statement about what happened -- and it was the
+    # end of the trail, so a detected break could finish with nothing to show.
+    # The outcome is DERIVED here rather than passed in, for the same reason
+    # vector_for() derives the vector: a parameter a caller must remember to set
+    # is how the package vector ended up built, tested, gated and unreachable.
+    if change_type:
+        from .outcomes import terminal_outcome, blocked_reason, record, Outcome
+        outcome = terminal_outcome(change_type, original_code, fixed_code,
+                                   explanation)
+        detail = {"repo": repo, "file": file_path, "change_type": change_type,
+                  "vector": vector}
+        if outcome is Outcome.BLOCKED:
+            # A BLOCKED outcome with no reason is still silence.
+            detail["reason"] = blocked_reason(change_type, explanation)
+        record(outcome, **detail)
 
 
 async def _process_spec_deletion(repo: str, deletion: dict,
@@ -1150,6 +1169,8 @@ async def _process_spec_deletion(repo: str, deletion: dict,
             _log_fix_generated(
                 consumer_repo, file_path, True,
                 f"[{vector}/template] {explanation[:80]}", vector,
+                change_type=change_type, original_code=content,
+                fixed_code=fixed, explanation=explanation or "",
             )
             url = _create_fix_pr(
                 consumer_repo, file_path, fixed, change, repo, token,
@@ -1395,6 +1416,10 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                     consumer_repo, consumer_file,
                     fixed_code != consumer_content,
                     explanation[:60] if explanation else "",
+                    change_type=change.change_type,
+                    original_code=consumer_content,
+                    fixed_code=fixed_code,
+                    explanation=explanation or "",
                 )
                 
                 if fixed_code != consumer_content:

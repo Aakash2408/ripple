@@ -2609,5 +2609,64 @@ def test_cli_and_production_discover_the_same_consumers():
             "yaml consumer missed -- the old extension-only filter excluded it")
 
 
+def test_every_fix_attempt_ends_in_a_stated_outcome():
+    """`fixed_code == content` means no PR opens -- correct as a PR rule,
+    disastrous as an outcome. The fix loop logged fix_generated {changed: false}
+    and stopped: a fact about the code, not a statement about what happened. Every
+    silent-failure class found this year presented identically as "nothing
+    happened" -- the rename that fell through on a missing dataclass field, the
+    type change that no-opped in 6 of 9 languages, the `git rm` never read from
+    the payload, the 44 change types that reached fix_templates as "Unknown".
+
+    The outcome is DERIVED inside the fix_generated funnel, not passed by callers,
+    for the same reason vector_for() derives the vector: a parameter someone must
+    remember to set is how the package vector ended up built, tested, CI-gated and
+    unreachable from production."""
+    import tempfile
+    from app.outcomes import Outcome, terminal_outcome, blocked_reason
+    from app.fix_templates import MARKER
+
+    src = "x = obj.phone_number\n"
+
+    # 1. The derivation, including the case that used to be silence.
+    assert terminal_outcome("field_removed", src, "y = 1\n") is Outcome.FIX_GENERATED
+    assert terminal_outcome("field_removed", src,
+                            f"# {MARKER}: verify\n" + src) is Outcome.HUMAN_ACTION_REQUIRED
+    assert terminal_outcome("field_removed", src, src) is Outcome.BLOCKED
+    # wire_only: unchanged is CORRECT, and must not read as a refusal. Collapsing
+    # these two would repeat the capability registry's mistake of demanding a
+    # transformation from a category that forbids one.
+    assert terminal_outcome("field_number_changed", src,
+                            src) is Outcome.NO_CHANGE_REQUIRED
+    assert terminal_outcome("field_added", src, src) is Outcome.NO_CHANGE_REQUIRED
+
+    # 2. A BLOCKED outcome without a reason is still silence.
+    reason = blocked_reason("field_removed", "Unsupported change type for template fix")
+    assert "remove_field" in reason and reason.strip(), reason
+
+    # 3. It is actually EMITTED -- reachability, not just implementation.
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = tempfile.mkdtemp()
+    try:
+        import importlib
+        from app import activity
+        importlib.reload(activity)
+        activity.reset()
+        from app.webhook import _log_fix_generated
+        _log_fix_generated("o/c", "svc/a.py", False, "[template] unsupported",
+                           change_type="field_removed", original_code=src,
+                           fixed_code=src,
+                           explanation="Unsupported change type for template fix")
+        outcomes = [e for e in activity.all_events() if e["action"] == "outcome"]
+        assert len(outcomes) == 1, f"expected one outcome event, got {outcomes}"
+        assert outcomes[0]["outcome"] == "BLOCKED", outcomes[0]
+        assert outcomes[0].get("reason"), "BLOCKED with no reason is still silence"
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+
+
 if __name__ == "__main__":
     sys.exit(_main())
