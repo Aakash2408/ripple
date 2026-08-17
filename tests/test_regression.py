@@ -1656,45 +1656,68 @@ def test_llm_key_is_resolved_only_through_llm_config():
 
 
 def test_added_required_field_template_does_not_claim_more_than_it_did():
-    """The added_required_field template is written against the demo fixture:
-    the Python branch only matches a payload variable literally named
-    `payload`, and carries a hardcoded `age` parameter from that fixture. On
-    ordinary code (`json={...}` inline) the payload regex misses while the
-    signature fallback matches -- producing a function that ACCEPTS the new
-    field and never sends it.
+    """Every added_required_field branch was written against the demo fixture:
+      python     -- a parameter literally named `age`, a dict named `payload`
+      java       -- a literal replace of '{"name": "%s", "email": "%s"}'
+      typescript -- an interface named *Request, inserting `data.{field}`
 
-    The explanation was assigned unconditionally, outside both `if match:`
-    blocks, so the PR body claimed "included in request payload" for code that
-    does not include it. The syntax-only validator cannot catch this: the
-    half-fix compiles.
+    On ordinary code the signature edit matched while the payload edit missed,
+    and `explanation` was assigned OUTSIDE the `if match:` blocks -- so the PR
+    body claimed the payload had been updated for code that does not send the
+    field. The half-fix compiles, so the syntax-only validator passes it.
 
-    A wrong fix that compiles and is described as complete is worse than no
-    fix, because a reviewer trusts the note."""
+    Measured before the fix: java OVERSTATED, typescript was a silent no-op
+    carrying a false note, python overstated.
+
+    A wrong fix that compiles and is described as complete is worse than no fix,
+    because the reviewer trusts the note."""
     from app.diff_engine import BreakingChange
     from app.consumer_finder import ConsumerMatch
     from app.fix_generator import _generate_with_template
 
-    original = (
-        "import requests\n\n"
-        "def create_user(name: str, email: str):\n"
-        "    resp = requests.post(\n"
-        '        "https://api.example.com/users",\n'
-        '        json={"name": name, "email": email},\n'
-        "    )\n"
-        "    return resp.json()\n"
-    )
     bc = BreakingChange("added_required_field", "/users", "post", "country",
                         "string", "request_body", "breaking", "country added")
-    cm = ConsumerMatch("c.py", 5, 'json={...}', "high", "calls POST /users",
-                       "python")
+    cases = {
+        "python": (
+            "import requests\n\n"
+            "def create_user(name: str, email: str):\n"
+            '    resp = requests.post("/users", json={"name": name, "email": email})\n'
+            "    return resp.json()\n"
+        ),
+        "typescript": (
+            "export async function createUser(name: string, email: string) {\n"
+            '  const res = await client.post("/users", { name, email });\n'
+            "  return res.data;\n}\n"
+        ),
+        "java": (
+            "public class AccountsClient {\n"
+            "    public User createUser(String name, String email) {\n"
+            '        String body = mapper.writeValueAsString(Map.of("name", name, "email", email));\n'
+            '        return http.post("/users", body);\n    }\n}\n'
+        ),
+    }
 
-    code, note = _generate_with_template(original, cm, bc)
-    claims_payload = "request payload" in note or "included in" in note
-    actually_sends = '"country"' in code
-    assert not (claims_payload and not actually_sends), (
-        "template claims the field reached the payload but it did not:\n"
-        f"  note: {note}\n  code: {code}"
-    )
+    for lang, original in cases.items():
+        cm = ConsumerMatch("c", 1, "post", "high", "calls POST /users", lang)
+        code, note = _generate_with_template(original, cm, bc)
+
+        claims_complete = (
+            ("included in" in note or "and request payload" in note)
+            and "RIPPLE-ACTION-REQUIRED" not in note
+        )
+        # Present in BOTH the signature and the payload.
+        actually_complete = code.count("country") >= 2
+
+        assert not (claims_complete and not actually_complete), (
+            f"[{lang}] note claims a complete fix but the field is not sent:\n"
+            f"  note: {note}\n  code: {code}"
+        )
+        # An unchanged file opens no PR, so a note describing edits that did not
+        # happen must not be emitted either.
+        if code == original:
+            assert "Added" not in note, (
+                f"[{lang}] code unchanged but note claims an edit: {note}"
+            )
 
 
 if __name__ == "__main__":

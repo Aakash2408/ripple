@@ -224,33 +224,72 @@ def _generate_with_template(
     explanation = ""
     
     if consumer.language == "typescript":
-        # Add to interface
-        interface_pattern = re.compile(
-            r'(interface\s+\w+Request\s*\{[^}]*?)(})',
-            re.DOTALL
-        )
-        ts_type = "string" if field_type == "string" else "number" if field_type == "integer" else "any"
-        match = interface_pattern.search(fixed_code)
-        if match:
-            fixed_code = interface_pattern.sub(
-                rf'\1  {field_name}: {ts_type};\n\2',
-                fixed_code
+        # Was fixture-shaped: the interface pattern required a name ending in
+        # `Request`, and the payload edit inserted `data.{field}` -- assuming a
+        # variable named `data` existed at the call site. On ordinary code both
+        # missed, leaving the code UNCHANGED while the explanation still claimed
+        # the interface and payload had been updated. An unchanged file opens no
+        # PR, so that false note stayed invisible rather than being harmless.
+        ts_type = ("string" if field_type == "string"
+                   else "number" if field_type == "integer" else "any")
+        iface_ok = False
+        sig_ok = False
+        payload_ok = False
+
+        # 1. Interface, if there is one -- any interface/type, not just *Request.
+        iface_pattern = re.compile(r'((?:interface|type)\s+\w+\s*=?\s*\{)([^{}]*?)(\})',
+                                   re.DOTALL)
+        m = iface_pattern.search(fixed_code)
+        if m and f"{field_name}:" not in m.group(2):
+            body = m.group(2).rstrip()
+            sep = "" if not body.strip() else ("" if body.endswith(";") else ";")
+            fixed_code = (fixed_code[:m.start(2)] + body + sep
+                          + f"\n  {field_name}: {ts_type};\n"
+                          + fixed_code[m.end(2):])
+            iface_ok = True
+
+        # 2. Function signature.
+        func_pattern = re.compile(r'(function\s+\w+\s*\([^)]*?)(\))')
+        m = func_pattern.search(fixed_code)
+        if m and f"{field_name}:" not in m.group(1):
+            inner = m.group(1)
+            sep = "" if inner.rstrip().endswith("(") else ", "
+            fixed_code = (fixed_code[:m.end(1)] + f"{sep}{field_name}: {ts_type}"
+                          + fixed_code[m.end(1):])
+            sig_ok = True
+
+        # 3. Payload: the object literal passed to .post()/.put()/.patch().
+        #    Uses the bare identifier, matching the shorthand style already
+        #    there ({ name, email }) rather than inventing a `data` variable.
+        pay_pattern = re.compile(r'(\.(?:post|put|patch)\([^{}]*\{)([^{}]*?)(\})',
+                                 re.DOTALL)
+        m = pay_pattern.search(fixed_code)
+        if m and field_name not in m.group(2):
+            raw = m.group(2)
+            inner = raw.rstrip().rstrip(",")
+            sep = "" if not inner.strip() else ", "
+            # Keep whatever trailing whitespace the literal had, so `{ a, b }`
+            # does not become `{ a, b, c}`.
+            trail = raw[len(raw.rstrip()):]
+            fixed_code = (fixed_code[:m.start(2)] + inner + sep + field_name + trail
+                          + fixed_code[m.end(2):])
+            payload_ok = True
+
+        touched = [n for n, ok in (("interface", iface_ok), ("signature", sig_ok),
+                                   ("request payload", payload_ok)) if ok]
+        if payload_ok and (sig_ok or iface_ok):
+            explanation = f"Added '{field_name}' to {' and '.join(touched)}"
+        elif touched:
+            explanation = (
+                f"Added '{field_name}' to {' and '.join(touched)} but could NOT "
+                f"complete the change -- RIPPLE-ACTION-REQUIRED: "
+                f"{'send it in the request body' if not payload_ok else 'thread it through callers'}"
             )
-        
-        # Add to API call payload — find the object being passed to .post()
-        # Look for the last property in the object literal before the closing }
-        payload_pattern = re.compile(
-            r'(\.post\([^{]*\{[^}]*?)(,?\n\s*\})',
-            re.DOTALL
-        )
-        match = payload_pattern.search(fixed_code)
-        if match:
-            fixed_code = payload_pattern.sub(
-                rf'\1,\n    {field_name}: data.{field_name}\2',
-                fixed_code
+        else:
+            explanation = (
+                f"No template fix applied for '{field_name}' (typescript): no "
+                f"interface, function signature, or request payload matched"
             )
-        
-        explanation = f"Added '{field_name}' to interface and API call payload"
     
     elif consumer.language == "python":
         # The previous version of this branch was written against the demo
@@ -322,41 +361,69 @@ def _generate_with_template(
             )
 
     elif consumer.language == "java":
-        # Add parameter to method
-        method_pattern = re.compile(
-            r'(public\s+\w+\s+create\w+\([^)]*)',
-            re.DOTALL
-        )
-        match = method_pattern.search(fixed_code)
-        if match:
-            insert_point = match.end()
-            fixed_code = (
-                fixed_code[:insert_point] +
-                f", String {field_name}" +
-                fixed_code[insert_point:]
+        # Was fixture-shaped in the same way the python branch was: it did a
+        # literal replace of the demo's exact JSON string
+        # ('{"name": "%s", "email": "%s"}') and of the literal argument list
+        # "name, email". Real code uses Map.of(...), a builder, or an object
+        # mapper, so the payload edit never fired while the signature edit did
+        # -- and the explanation claimed the JSON payload had been updated.
+        sig_ok = False
+        payload_ok = False
+
+        # 1. Signature: any public method, not just create*.
+        method_pattern = re.compile(r'(public\s+[\w<>\[\], ]+\s+\w+\s*\([^)]*)')
+        m = method_pattern.search(fixed_code)
+        if m and f"String {field_name}" not in fixed_code:
+            at = m.end()
+            sep = "" if fixed_code[m.start():at].rstrip().endswith("(") else ", "
+            fixed_code = fixed_code[:at] + f"{sep}String {field_name}" + fixed_code[at:]
+            sig_ok = True
+
+        # 2. Payload: the shapes that actually occur.
+        if f'"{field_name}"' not in fixed_code:
+            # Map.of("a", a, "b", b)  ->  append the pair
+            mo = re.search(r'Map\.of\(([^()]*)\)', fixed_code)
+            fmt = re.search(r'String\.format\(\s*"([^"]*\{[^"]*)"', fixed_code)
+            if mo:
+                inner = mo.group(1).rstrip().rstrip(",")
+                sep = "" if not inner.strip() else ", "
+                fixed_code = (fixed_code[:mo.start(1)] + inner + sep
+                              + f'"{field_name}", {field_name}'
+                              + fixed_code[mo.end(1):])
+                payload_ok = True
+            elif fmt and fmt.group(1).rstrip().endswith("}"):
+                # Insert before the JSON template's closing brace, and append
+                # the matching String.format argument.
+                tmpl = fmt.group(1)
+                new_tmpl = tmpl.rstrip()[:-1].rstrip().rstrip(",") \
+                    + f', \\"{field_name}\\": \\"%s\\"' + "}"
+                fixed_code = fixed_code.replace(tmpl, new_tmpl, 1)
+                call = re.search(r'String\.format\(\s*"[^"]*"\s*,([^)]*)\)', fixed_code)
+                if call:
+                    args = call.group(1).rstrip().rstrip(",")
+                    fixed_code = (fixed_code[:call.start(1)] + args + f", {field_name}"
+                                  + fixed_code[call.end(1):])
+                payload_ok = True
+
+        if sig_ok and payload_ok:
+            explanation = f"Added '{field_name}' parameter and included in JSON payload"
+        elif sig_ok:
+            explanation = (
+                f"Added '{field_name}' parameter to the method signature but "
+                f"could NOT locate the JSON payload -- RIPPLE-ACTION-REQUIRED: "
+                f"send '{field_name}' in the request body yourself"
             )
-        
-        # Add to JSON payload
-        json_pattern = re.compile(
-            r'(String\.format\(\s*"[^"]*)',
-            re.DOTALL
-        )
-        match = json_pattern.search(fixed_code)
-        if match:
-            # Replace the JSON format string to include new field
-            old_json = match.group(0)
-            # Find the closing } in the JSON template
-            fixed_code = fixed_code.replace(
-                '{"name": "%s", "email": "%s"}',
-                '{"name": "%s", "email": "%s", "' + field_name + '": "%s"}'
+        elif payload_ok:
+            explanation = (
+                f"Added '{field_name}' to the JSON payload but could NOT locate "
+                f"the method signature -- RIPPLE-ACTION-REQUIRED: thread "
+                f"'{field_name}' through callers"
             )
-            # Add the parameter to String.format args
-            fixed_code = fixed_code.replace(
-                "name, email",
-                f"name, email, {field_name}"
+        else:
+            explanation = (
+                f"No template fix applied for '{field_name}' (java): neither a "
+                f"method signature nor a JSON payload matched"
             )
-        
-        explanation = f"Added '{field_name}' parameter and included in JSON payload"
     
     else:
         explanation = "Unsupported language for template fix"
