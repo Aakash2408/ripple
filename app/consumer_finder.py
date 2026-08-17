@@ -17,7 +17,6 @@ That's enough for the demo.
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 from .diff_engine import BreakingChange
 
@@ -78,20 +77,9 @@ def find_consumers(
     return matches
 
 
-def _is_code_file(filename: str) -> bool:
-    """Check if a file is worth scanning."""
-    code_extensions = {
-        ".ts", ".tsx", ".js", ".jsx",  # TypeScript/JavaScript
-        ".py",                          # Python
-        ".java", ".kt",                 # JVM
-        ".go",                          # Go
-        ".rs",                          # Rust
-        ".rb",                          # Ruby
-        ".cs",                          # C#
-        ".swift",                       # Swift
-        ".php",                         # PHP
-    }
-    return Path(filename).suffix.lower() in code_extensions
+# Was a second _is_code_file with a THIRD extension set, disagreeing with
+# both webhook's filter and every detector. Canonical now.
+from .languages import is_scannable as _is_code_file  # noqa: E402
 
 
 def _scan_file(filepath: str, endpoint_path: str, http_method: str) -> list[ConsumerMatch]:
@@ -140,22 +128,7 @@ def _scan_file(filepath: str, endpoint_path: str, http_method: str) -> list[Cons
     return matches
 
 
-def _detect_language(filepath: str) -> str:
-    """Detect programming language from file extension."""
-    ext = Path(filepath).suffix.lower()
-    lang_map = {
-        ".ts": "typescript", ".tsx": "typescript",
-        ".js": "javascript", ".jsx": "javascript",
-        ".py": "python",
-        ".java": "java", ".kt": "kotlin",
-        ".go": "go",
-        ".rs": "rust",
-        ".rb": "ruby",
-        ".cs": "csharp",
-        ".swift": "swift",
-        ".php": "php",
-    }
-    return lang_map.get(ext, "unknown")
+from .languages import detect as _detect_language  # noqa: E402
 
 
 def _get_method_patterns(http_method: str, language: str) -> list[re.Pattern]:

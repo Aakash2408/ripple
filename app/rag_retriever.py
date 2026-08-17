@@ -8,19 +8,15 @@ from typing import Optional
 from app.rag_store import rag_store, FixPattern, StructuredPattern
 
 
-_EXT_LANG = {
-    ".go": "go", ".ts": "typescript", ".tsx": "typescript",
-    ".js": "javascript", ".jsx": "javascript", ".py": "python",
-    ".java": "java", ".rs": "rust", ".rb": "ruby",
-    ".kt": "kotlin", ".cs": "csharp",
-}
+from app.languages import detect as _language_from_path  # noqa: E402
 
-
-def _language_from_path(file_path: str) -> str:
-    for ext, lang in _EXT_LANG.items():
-        if file_path.endswith(ext):
-            return lang
-    return "generic"
+# This module held an EIGHTH language map, with a THIRD sentinel: it returned
+# "generic" where others returned "unknown" or None. That mattered in
+# _score_pattern below -- an unrecognised file exact-matched a stored pattern
+# whose language is literally "generic", scoring a full 0.25 language match
+# instead of the 0.1 the `in ("generic", "*")` branch intends for a weak
+# signal. Now an unrecognised file scores 0.1, which is the documented meaning.
+# Behaviourally inert today: the pattern store is empty and has never run.
 
 
 def _resolve_store(store=None):

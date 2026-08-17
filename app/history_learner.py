@@ -23,8 +23,7 @@ import subprocess
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+from .languages import UNKNOWN
 
 from .consumer_graph import ConsumerGraph
 
@@ -164,7 +163,10 @@ class HistoryLearner:
                 if rel.confidence >= self.min_confidence and rel.co_change_count >= self.min_co_changes:
                     # Infer language from file extension
                     lang = self._detect_language(rel.target_file)
-                    if lang:  # Only register code files, not configs/docs
+                    # Was `if lang:` -- correct only while a miss returned None.
+                    # "unknown" is truthy, so that guard silently stopped
+                    # filtering the moment the sentinel was unified.
+                    if lang != UNKNOWN:
                         graph.register_consumer(
                             path=endpoint_path,
                             method=method,
@@ -229,16 +231,16 @@ class HistoryLearner:
         lower = filepath.lower()
         return any(p in lower for p in patterns)
     
-    def _detect_language(self, filepath: str) -> Optional[str]:
-        """Detect language from file extension (only code files)."""
-        ext = Path(filepath).suffix.lower()
-        lang_map = {
-            ".py": "python", ".ts": "typescript", ".tsx": "typescript",
-            ".js": "javascript", ".jsx": "javascript",
-            ".java": "java", ".kt": "kotlin",
-            ".go": "go", ".rs": "rust", ".rb": "ruby",
-        }
-        return lang_map.get(ext)
+    def _detect_language(self, filepath: str) -> str:
+        """Delegates to app/languages.py.
+
+        Returned None for a miss where every other implementation returned
+        "unknown", so the caller's `if lang:` guard meant something different
+        here than the same line would elsewhere. One sentinel now, and the
+        caller asks is_known() rather than relying on truthiness.
+        """
+        from .languages import detect
+        return detect(filepath)
     
     def stats(self) -> str:
         """Return human-readable stats."""

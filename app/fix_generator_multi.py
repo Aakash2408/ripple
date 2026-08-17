@@ -13,7 +13,6 @@ Falls back to original generate_fix() for python/typescript/java.
 """
 
 import re
-from pathlib import Path
 from typing import Optional
 
 from .diff_engine import BreakingChange
@@ -37,32 +36,13 @@ SUPPORTED_LANGUAGES = [
     "dart",
 ]
 
-# File extension -> language mapping
-_EXTENSION_MAP: dict[str, str] = {
-    ".py": "python",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".js": "typescript",
-    ".jsx": "typescript",
-    ".java": "java",
-    ".go": "go",
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".cs": "csharp",
-    ".swift": "swift",
-    ".php": "php",
-    ".scala": "scala",
-    ".sc": "scala",
-    ".dart": "dart",
-}
 
-
-def detect_language(filepath: str) -> str:
-    """Determine programming language from file extension."""
-    ext = Path(filepath).suffix.lower()
-    return _EXTENSION_MAP.get(ext, "unknown")
+# This module mapped '.js' -> 'typescript', the only outright CONTRADICTION
+# among the six implementations. Because the router below sends typescript to
+# the original generator, that mislabelling quietly routed javascript away from
+# its own (incomplete) templates instead of exposing the gap. Canonical now, so
+# '.js' is javascript -- and javascript is routed explicitly below.
+from .languages import detect as detect_language  # noqa: E402
 
 
 def generate_fix_multi(
@@ -80,7 +60,10 @@ def generate_fix_multi(
     language = consumer.language or detect_language(consumer.file_path)
 
     # Original languages handled by fix_generator.py
-    if language in ("python", "typescript", "java"):
+    # javascript listed explicitly: it used to arrive here disguised as
+    # typescript, so dropping the disguise without naming it would have made
+    # every .js file return None instead of getting a fix.
+    if language in ("python", "typescript", "javascript", "java"):
         return generate_fix(consumer, breaking_change, use_llm=use_llm)
 
     # New languages handled here

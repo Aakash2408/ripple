@@ -292,23 +292,7 @@ def format_reasoning(call_chain: CallChain, fix_target: FixTarget) -> str:
 
 # --- Private helpers ---
 
-def _detect_language(filepath: str) -> str:
-    """Detect language from file extension."""
-    ext_map = {
-        ".go": "go",
-        ".py": "python",
-        ".js": "javascript",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-        ".java": "java",
-        ".rb": "ruby",
-        ".kt": "kotlin",
-        ".kts": "kotlin",
-    }
-    for ext, lang in ext_map.items():
-        if filepath.endswith(ext):
-            return lang
-    return "unknown"
+from .languages import detect as _detect_language  # noqa: E402
 
 
 def _find_containing_function(lines: list[str], target_line: int, language: str) -> Optional[str]:

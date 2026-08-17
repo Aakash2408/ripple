@@ -2383,55 +2383,11 @@ def _scan_repo_tree_for_consumers(
     return results
 
 
-def _is_code_file(filepath: str) -> bool:
-    """Is this a file a human would hand-edit to adapt to a contract change?
-
-    Extension alone is insufficient: vendored dependencies and generated
-    code carry real source extensions but must never be patched by a PR.
-    """
-    exts = {".ts", ".tsx", ".js", ".py", ".java", ".go", ".rs", ".rb"}
-    if not any(filepath.endswith(ext) for ext in exts):
-        return False
-    
-    lowered = filepath.lower()
-    
-    # Vendored dependencies and build output. Excluding these is not a
-    # heuristic -- they are never hand-edited source, so a PR touching them
-    # is always wrong.
-    non_source_dirs = (
-        "node_modules/", "vendor/", "third_party/", "dist/", "build/",
-        ".next/", "coverage/", "target/debug/", "target/release/",
-        "site-packages/", ".venv/", "venv/",
-    )
-    if any(seg in lowered for seg in non_source_dirs):
-        return False
-    
-    # Generated code: regenerated from the contract, so editing it is
-    # pointless -- the generator output changes when the spec changes.
-    if lowered.endswith((".min.js", ".d.ts", ".pb.go", "_pb2.py",
-                         "_pb2_grpc.py", ".generated.ts", ".g.dart")):
-        return False
-    
-    # NOTE: 'website/', 'docs/', 'marketing/', 'examples/' were previously
-    # excluded here to stop Ripple opening a PR against its own landing
-    # page. That was suppressing a symptom of unscoped repo discovery, not
-    # a real rule -- a customer can legitimately call an API from an
-    # example app or a docs site. Now that installation scope is
-    # authoritative, cross-repo false positives are gone, and per-customer
-    # exclusions belong in .ripple.yaml `ignore:` (already honoured via
-    # config.should_ignore) rather than in a hardcoded list here.
-    
-    return True
-
-
-def _detect_lang(filepath: str) -> str:
-    """Detect language from extension."""
-    if filepath.endswith((".ts", ".tsx")): return "typescript"
-    if filepath.endswith((".js", ".jsx")): return "javascript"
-    if filepath.endswith(".py"): return "python"
-    if filepath.endswith(".java"): return "java"
-    if filepath.endswith(".go"): return "go"
-    return "unknown"
+# _is_code_file and _detect_lang lived here, and disagreed with each other:
+# `.rs`/`.rb` passed the file filter while the detector returned "unknown", so
+# rust and ruby were scanned with the generic matcher. Both now come from
+# app/languages.py -- see the module docstring for the full survey.
+from .languages import detect as _detect_lang, is_scannable as _is_code_file  # noqa: E402
 
 
 def _create_fix_pr(

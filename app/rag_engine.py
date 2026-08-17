@@ -264,18 +264,13 @@ class RagStore:
 # --- Pattern Extraction ---
 
 SPEC_EXTENSIONS = {'.proto', '.graphql', '.gql', '.yaml', '.yml', '.json', '.avro', '.thrift', '.smithy'}
-LANG_MAP = {
-    '.go': 'go', '.ts': 'typescript', '.tsx': 'typescript', '.js': 'javascript',
-    '.py': 'python', '.java': 'java', '.rs': 'rust', '.rb': 'ruby',
-    '.kt': 'kotlin', '.cs': 'csharp', '.swift': 'swift', '.php': 'php',
-    '.scala': 'scala', '.dart': 'dart',
-    # Config and scripts. Measured on the PropBench replay: 137 files a real PR
-    # had to change were skipped for having no matcher -- 24 of 36 on
-    # kubernetes#109798, i.e. most of that change. Manifests and scripts
-    # reference removed resources by name just as source does.
-    '.yaml': 'yaml', '.yml': 'yaml',
-    '.sh': 'shell', '.bash': 'shell', '.zsh': 'shell',
-}
+# LANG_MAP moved to app/languages.py. It was the superset of six
+# implementations and the one PropBench's replay.py measured, so it became the
+# canonical map -- see that module's docstring.
+from .languages import (  # noqa: E402
+    detect as _detect_language,
+    is_known as _lang_is_known,
+)
 
 FRAMEWORK_PATTERNS = {
     'rails': ['/app/controllers/', '/app/models/', 'Gemfile', 'config/routes.rb'],
@@ -289,11 +284,6 @@ FRAMEWORK_PATTERNS = {
     'axum': ['axum::', 'Router::new()', 'Cargo.toml'],
     'actix': ['actix_web', 'HttpServer', 'Cargo.toml'],
 }
-
-
-def _detect_language(filepath: str) -> str:
-    ext = Path(filepath).suffix.lower()
-    return LANG_MAP.get(ext, 'unknown')
 
 
 def _detect_framework(files: list[str]) -> str:
@@ -470,7 +460,7 @@ def index_from_git(repo_path: str, store: RagStore, since: str = '12 months ago'
 
         files = files_output.split('\n') if files_output else []
         spec_files = [f for f in files if Path(f).suffix.lower() in SPEC_EXTENSIONS]
-        consumer_files = [f for f in files if f not in spec_files and Path(f).suffix.lower() in LANG_MAP]
+        consumer_files = [f for f in files if f not in spec_files and _lang_is_known(f)]
 
         if not spec_files or not consumer_files:
             continue
@@ -536,7 +526,7 @@ def index_single_commit(repo_path: str, commit_sha: str, store: RagStore) -> dic
 
     files = files_output.split('\n') if files_output else []
     spec_files = [f for f in files if Path(f).suffix.lower() in SPEC_EXTENSIONS]
-    consumer_files = [f for f in files if f not in spec_files and Path(f).suffix.lower() in LANG_MAP]
+    consumer_files = [f for f in files if f not in spec_files and _lang_is_known(f)]
 
     if not spec_files or not consumer_files:
         return stats
