@@ -137,7 +137,7 @@ uvicorn app.webhook:app --port 8000
 
 1. **Detect** — Parses API contracts (OpenAPI, Protobuf, GraphQL, database schemas) and finds breaking changes
 2. **Find** — Scans your org's repos for code that calls the changed endpoint
-3. **Fix** — Generates the minimal code fix for each consumer in **12 languages** (Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart) with LLM fallback for any other language
+3. **Fix** — Generates the minimal code fix for each consumer. Fix templates cover 8-15 languages depending on the change type; **none is validated end-to-end yet** (see `tools/audit_capabilities.py`) (Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart) with LLM fallback for any other language
 4. **Validate** — Syntax-checks every fix before opening a PR
 5. **PR** — Opens a pull request with the fix, confidence badge, and clear explanation
 6. **Visualize** — Maps your full dependency graph (`/graph` endpoint) in ASCII, Mermaid, or D3 format
@@ -210,7 +210,7 @@ Helps teams avoid breaking changes entirely when possible.
 
 ## Multi-Language Fix Generation
 
-Ripple generates idiomatic fixes in **12 languages** natively, with LLM fallback for anything else:
+Ripple has fix templates for up to 15 languages natively (8-15 per change type; consumer matching is language-specific for 11 of them), with LLM fallback for anything else:
 
 | Language | Engine | Fix Quality |
 |---|---|---|
@@ -390,7 +390,7 @@ Get the template: `GET /config/template`
 
 ## Supported Change Types
 
-All 47 change types emitted by the 10 diff engines reach a fix handler, in one of
+All 55 change types emitted by the 10 diff engines reach a fix handler, in one of
 four categories. Not every category produces a finished fix, and the PR says
 which one it got:
 
@@ -661,7 +661,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 70 tests
+python tests/test_regression.py            # 100 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes

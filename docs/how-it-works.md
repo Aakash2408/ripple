@@ -35,7 +35,7 @@ Results are ranked by confidence and deduplicated.
 
 ## 3. Fix
 
-Ripple generates idiomatic fixes in **12 languages + LLM fallback**:
+Ripple has fix templates for up to 15 languages (8-15 per change type, detection covers 15, consumer matching is language-specific for 11) **+ LLM fallback**:
 
 Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart
 

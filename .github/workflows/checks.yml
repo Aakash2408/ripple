@@ -80,6 +80,19 @@ jobs:
         # defect the registry exists to remove.
         run: python tools/audit_capabilities.py
 
+      - name: Public claims match the registry
+        # landing/index.html said "3 platforms" and "82 tests" while the code had
+        # 7 and 96, and changelog.html sat four days stale -- both edited
+        # recently, neither read. A number in prose has no owner and no test, so
+        # it decays silently.
+        #
+        # Gates the claims that map 1:1 onto a derived fact (contract types,
+        # change types, test count) and requires every LANGUAGE count to say
+        # which of four things it means: 15 detected, 11 with a specific consumer
+        # matcher, 8-15 with a fix handler, 0 validated. A bare count cannot be
+        # corrected to a number, because there is no single right one.
+        run: python tools/audit_public_claims.py
+
       - name: Fail-silent audit (report only)
         # Not gating yet: 51 sites remain, many legitimately silent. Printed
         # so the number is visible in every build and can be ratcheted down.

@@ -34,7 +34,7 @@ Ripple detects contract changes (OpenAPI, Proto, GraphQL, etc.)
     ↓
 Finds all downstream consumers using 5-channel ensemble finder
     ↓
-Generates fixes in the consumer's language (12 languages + LLM)
+Generates fixes in the consumer's language (fix templates for 8-15 languages per change type, none validated end-to-end yet, + LLM)
     ↓
 Opens a PR with:
   • AI confidence score

@@ -135,7 +135,7 @@ export const INTELLIGENCE = [
     body: "Every PR shows why Ripple made this fix, with a per-factor confidence breakdown and the provenance of the fix that produced it.",
   },
   {
-    title: "12 Languages",
+    title: "15 Languages Detected",
     body: "Template fixes for Python, TypeScript, Java, Go, Rust, Ruby, Kotlin, C#, Swift, PHP, Scala, Dart — plus LLM for anything else.",
   },
   {
