@@ -1656,7 +1656,8 @@ def test_llm_key_is_resolved_only_through_llm_config():
 
 
 def test_added_required_field_template_does_not_claim_more_than_it_did():
-    """Every added_required_field branch was written against the demo fixture:
+    """fix_generator held its OWN inline added_required_field implementation for
+    typescript/python/java, all three written against the demo fixture:
       python     -- a parameter literally named `age`, a dict named `payload`
       java       -- a literal replace of '{"name": "%s", "email": "%s"}'
       typescript -- an interface named *Request, inserting `data.{field}`
@@ -1664,13 +1665,16 @@ def test_added_required_field_template_does_not_claim_more_than_it_did():
     On ordinary code the signature edit matched while the payload edit missed,
     and `explanation` was assigned OUTSIDE the `if match:` blocks -- so the PR
     body claimed the payload had been updated for code that does not send the
-    field. The half-fix compiles, so the syntax-only validator passes it.
+    field. The half-fix compiles, so the syntax-only validator passed it.
+    Measured: java OVERSTATED, typescript was a silent no-op carrying a false
+    note, python overstated.
 
-    Measured before the fix: java OVERSTATED, typescript was a silent no-op
-    carrying a false note, python overstated.
-
-    A wrong fix that compiles and is described as complete is worse than no fix,
-    because the reviewer trusts the note."""
+    That whole branch is now DELETED and delegated to fix_templates, which had
+    always implemented the same operation for all nine languages -- see
+    test_added_required_field_delegates_to_fix_templates. This test remains as
+    the behavioural guard on the invariant that outlives either implementation:
+    a note must never describe more than the code actually does, because the
+    reviewer trusts the note."""
     from app.diff_engine import BreakingChange
     from app.consumer_finder import ConsumerMatch
     from app.fix_generator import _generate_with_template
@@ -1718,6 +1722,51 @@ def test_added_required_field_template_does_not_claim_more_than_it_did():
             assert "Added" not in note, (
                 f"[{lang}] code unchanged but note claims an edit: {note}"
             )
+
+
+def test_added_required_field_delegates_to_fix_templates():
+    """added_required_field was the ONE change type fix_generator implemented
+    inline; removed_field, field_renamed and field_type_changed all delegate to
+    fix_templates. So one operation had two implementations that disagreed on
+    its CATEGORY:
+
+      fix_templates  treats add_required as JUDGMENT -- annotates construction
+                     sites, and says explicitly it did not invent a value
+      inline version treated it as mechanical -- appended a REQUIRED positional
+                     parameter and wrote the field into the payload, which
+                     breaks every existing caller with a TypeError and silently
+                     decides what value to send
+
+    Only the fix_templates path is exercised by tools/coverage_matrix.py, so the
+    implementation production actually used was ungated.
+
+    Pins that the duplicate does not come back: fix_generator must return byte
+    identical output to a direct apply_fix_template call."""
+    from app.diff_engine import BreakingChange
+    from app.consumer_finder import ConsumerMatch
+    from app.fix_generator import _generate_with_template
+    from app.fix_templates import apply_fix_template, MARKER
+
+    bc = BreakingChange("added_required_field", "/users", "post", "country",
+                        "string", "request_body", "breaking", "country added")
+    original = (
+        "def create_user(name, email):\n"
+        '    return post("/users", {"name": name, "email": email})\n'
+    )
+
+    for lang in ("python", "typescript", "java", "go", "ruby", "rust",
+                 "kotlin", "csharp"):
+        cm = ConsumerMatch("c", 1, "post", "high", "r", lang)
+        got_code, got_note = _generate_with_template(original, cm, bc)
+        want_code, want_note = apply_fix_template(
+            code=original, language=lang, change_type="add_required",
+            field_name="country",
+        )
+        assert got_code == want_code, f"[{lang}] fix_generator diverged from fix_templates"
+        assert got_note == want_note, f"[{lang}] explanation diverged"
+        # JUDGMENT contract: a non-empty diff (so a PR opens) that is marked.
+        assert got_code != original, f"[{lang}] no diff -> no PR -> silence"
+        assert MARKER in got_code, f"[{lang}] judgment fix is not marked"
 
 
 if __name__ == "__main__":
