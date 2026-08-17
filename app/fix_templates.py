@@ -602,6 +602,40 @@ def _annotate_sites(code: str, names: set, lang: str, note: str) -> tuple[str, i
     return '\n'.join(out), count
 
 
+def _annotate_hint_sites(code: str, hints, lang: str, note: str) -> tuple[str, int]:
+    """Annotate lines containing any of `hints` as a plain substring.
+
+    Exists for add_required, where the usual anchor cannot work: a NEWLY
+    required field is by definition absent from consumer code, so matching on
+    field-name variants finds nothing and every add_required fix fell through
+    to a file-top marker ("somewhere in this file, supply X"). The anchor has
+    to be the CALL SITE instead -- the endpoint path literal, or the type being
+    constructed.
+
+    Substring rather than word-boundary matching, because the useful anchors are
+    not identifiers: `"/users"` has no word boundary before the slash.
+
+    Returns (annotated_code, sites_annotated).
+    """
+    token = _comment_token(lang)
+    out = []
+    count = 0
+    prev_was_marker = False
+    # Short hints match too much: a 2-char anchor would tag half the file.
+    usable = [h for h in hints if h and len(h) >= 3]
+    for line in code.split('\n'):
+        stripped = line.strip()
+        is_comment = stripped.startswith(token) or stripped.startswith('*')
+        if (not is_comment and stripped and not prev_was_marker
+                and any(h in line for h in usable)):
+            indent = line[:len(line) - len(line.lstrip())]
+            out.append(f"{indent}{token} {MARKER}: {note}")
+            count += 1
+        out.append(line)
+        prev_was_marker = MARKER in line
+    return '\n'.join(out), count
+
+
 def _comment_out_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:
     """Comment OUT lines referencing the symbol, with a marker above.
 
@@ -640,6 +674,7 @@ def apply_fix_template(
     new_name: str = '',
     old_type: str = '',
     new_type: str = '',
+    site_hints: tuple = (),
 ) -> tuple[str, str]:
     """
     Apply a deterministic fix template to source code.
@@ -652,6 +687,10 @@ def apply_fix_template(
         new_name: For rename operations, the new field name.
         old_type: For type change operations, the original type.
         new_type: For type change operations, the new type.
+        site_hints: Call-site anchors (endpoint path literal, constructed type
+            name) used ONLY by add_required, whose field is absent from consumer
+            code by definition. Without them the fix can only mark the file, not
+            the line. Substring-matched, so `"/users"` works.
 
     Returns:
         Tuple of (fixed_code, explanation_string).
@@ -779,16 +818,30 @@ def apply_fix_template(
         # confidently wrong fix.
         note = (f"required field '{field_name}' was added to the contract -- "
                 f"supply a value at this construction site.")
-        result, sites = _annotate_sites(code, _symbol_names(variants), lang, note)
+
+        # Anchor on the CALL SITE, not the field. A newly required field cannot
+        # appear in consumer code yet, so the field-name match below can only
+        # ever miss -- measured both ways before this was added, and every
+        # add_required fix landed as a file-top marker.
+        result, sites = _annotate_hint_sites(code, site_hints, lang, note)
+        precision = "call site(s)"
+
+        if sites == 0:
+            # The field name may still appear (e.g. an optional param of the
+            # same name already exists), so this is worth trying second.
+            result, sites = _annotate_sites(code, _symbol_names(variants), lang, note)
+            precision = "site(s)"
+
         if sites == 0:
             token = _comment_token(lang)
             result = (f"{token} {MARKER}: required field '{field_name}' added "
                       f"to the contract; no construction site detected in this "
                       f"file -- verify manually.\n" + code)
             sites = 1
+            precision = "file (no line-level anchor found)"
         explanation = (
             f"PARTIAL: required field '{field_name}' was added. Marked "
-            f"{sites} site(s) with {MARKER}. Ripple did NOT invent a value: "
+            f"{sites} {precision} with {MARKER}. Ripple did NOT invent a value: "
             f"choosing one silently changes behaviour, so the value is left to "
             f"a human."
         )

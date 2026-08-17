@@ -1744,7 +1744,7 @@ def test_added_required_field_delegates_to_fix_templates():
     identical output to a direct apply_fix_template call."""
     from app.diff_engine import BreakingChange
     from app.consumer_finder import ConsumerMatch
-    from app.fix_generator import _generate_with_template
+    from app.fix_generator import _generate_with_template, _call_site_hints
     from app.fix_templates import apply_fix_template, MARKER
 
     bc = BreakingChange("added_required_field", "/users", "post", "country",
@@ -1760,13 +1760,69 @@ def test_added_required_field_delegates_to_fix_templates():
         got_code, got_note = _generate_with_template(original, cm, bc)
         want_code, want_note = apply_fix_template(
             code=original, language=lang, change_type="add_required",
-            field_name="country",
+            field_name="country", site_hints=_call_site_hints(bc),
         )
         assert got_code == want_code, f"[{lang}] fix_generator diverged from fix_templates"
         assert got_note == want_note, f"[{lang}] explanation diverged"
         # JUDGMENT contract: a non-empty diff (so a PR opens) that is marked.
         assert got_code != original, f"[{lang}] no diff -> no PR -> silence"
         assert MARKER in got_code, f"[{lang}] judgment fix is not marked"
+
+
+def test_add_required_anchors_on_the_call_site_not_the_field():
+    """add_required annotated by field-name variants -- but a NEWLY required
+    field is by definition absent from consumer code, so that match could only
+    ever miss. Measured both ways (field absent AND field already present): every
+    add_required fix landed as a file-top marker saying "somewhere in this file,
+    supply X". Honest, but useless for review at scale.
+
+    The anchor has to be the CALL SITE -- the endpoint path the contract and the
+    consumer both name, or the constructed type for proto/GraphQL engines. The
+    file-top marker stays as the last resort, because an unchanged file opens no
+    PR and detection would become silence."""
+    from app.diff_engine import BreakingChange
+    from app.consumer_finder import ConsumerMatch
+    from app.fix_generator import _generate_with_template
+    from app.fix_templates import MARKER
+
+    def first_line_is_file_marker(code):
+        return "no construction site detected" in code.split("\n")[0]
+
+    rest = BreakingChange("added_required_field", "/users", "post", "country",
+                          "string", "request_body", "breaking", "x")
+    proto = BreakingChange("added_required_field", "User", "post", "country",
+                           "string", "request_body", "breaking", "x")
+
+    # 1. Literal path at the call site -> line-level.
+    code, note = _generate_with_template(
+        'def create_user(name, email):\n'
+        '    return post("/users", {"name": name, "email": email})\n',
+        ConsumerMatch("c", 1, "x", "high", "r", "python"), rest)
+    assert not first_line_is_file_marker(code), code
+    assert "call site" in note, note
+    marked = [l for l in code.split("\n") if MARKER in l]
+    assert len(marked) == 1 and marked[0].strip().startswith("#"), code
+
+    # 2. URL built rather than written literally -> still line-level, via the
+    #    trailing path segment.
+    code, _ = _generate_with_template(
+        "const url = `${base}/users/${id}`;\n"
+        "await client.post(url, { name, email });\n",
+        ConsumerMatch("c", 1, "x", "high", "r", "typescript"), rest)
+    assert not first_line_is_file_marker(code), code
+
+    # 3. proto/GraphQL: `path` holds a message name, matched in any casing.
+    code, _ = _generate_with_template(
+        "func f() {\n\tu := User{Name: n}\n\treturn send(u)\n}\n",
+        ConsumerMatch("c", 1, "x", "high", "r", "go"), proto)
+    assert not first_line_is_file_marker(code), code
+
+    # 4. No anchor anywhere -> file-top marker, NOT an unchanged file.
+    src = "def helper(a)\n  a + 1\nend\n"
+    code, note = _generate_with_template(
+        src, ConsumerMatch("c", 1, "x", "high", "r", "ruby"), rest)
+    assert first_line_is_file_marker(code), code
+    assert code != src, "unchanged file opens no PR -- detection becomes silence"
 
 
 if __name__ == "__main__":

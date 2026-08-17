@@ -240,7 +240,37 @@ def _generate_with_template(
         language=consumer.language or "unknown",
         change_type="add_required",
         field_name=field_name,
+        site_hints=_call_site_hints(breaking_change),
     )
+
+
+def _call_site_hints(breaking_change: BreakingChange) -> tuple[str, ...]:
+    """Anchors for locating the construction site of an affected request.
+
+    add_required cannot anchor on the field: a newly required field is by
+    definition absent from consumer code. The endpoint path is the one thing the
+    contract and the consumer both name -- `post("/users", ...)` and, for
+    proto/GraphQL engines where `path` holds a message or type name, `User{...}`.
+
+    Ordered widest-anchor-first. The trailing segment is included because
+    consumers commonly build the URL (`f"{base}/users/{id}"`) rather than
+    writing the path literally, and it is only used when nothing more specific
+    matched -- a spurious anchor costs a stray comment, never a code edit.
+    """
+    hints: list[str] = []
+    path = (breaking_change.path or "").strip()
+    if path:
+        hints.append(path)
+        if "/" in path:
+            segment = path.rstrip("/").rsplit("/", 1)[-1]
+            # 4+ chars: shorter segments ("id", "me", "v1") match everywhere.
+            if segment and segment != path and len(segment) >= 4:
+                hints.append(segment)
+        else:
+            # An identifier-shaped path is a type/message name: cover the
+            # casings a consumer might use.
+            hints.extend(n for n in _field_variants(path) if n != path)
+    return tuple(hints)
 
 
 def _remove_field_references(original_code: str, field_name: str, language: str) -> tuple[str, str]:
