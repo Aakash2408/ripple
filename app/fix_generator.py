@@ -191,23 +191,61 @@ def _generate_with_template(
         return _remove_field_references(original_code, field_name, consumer.language)
     
     if breaking_change.change_type in ("field_renamed", "renamed_field"):
-        from .fix_templates import apply_fix_template
-        new_name = getattr(breaking_change, 'new_name', '') or ''
+        from .fix_templates import apply_fix_template, annotate_references
+        # Was getattr(breaking_change, 'new_name', '') on a dataclass with no
+        # such field, so new_name was ALWAYS '' and this branch never fired --
+        # every rename fell through to "Unsupported change type", leaving the
+        # code unchanged, which opens no PR. Detection became silence.
+        new_name = breaking_change.new_name
         if new_name:
-            return apply_fix_template(
+            fixed, expl = apply_fix_template(
                 code=original_code,
                 language=consumer.language or "unknown",
                 change_type="field_renamed",
                 field_name=field_name,
                 new_name=new_name,
             )
-    
+            if fixed != original_code:
+                return fixed, expl
+            # The template recognised the operation but matched nothing (it is
+            # a no-op for javascript and ruby today). Flag rather than go quiet.
+            return annotate_references(
+                original_code, consumer.language or "unknown", field_name,
+                f"field '{field_name}' was renamed to '{new_name}' -- update "
+                f"these references.")
+        # An engine that detects the rename but cannot name the target. Do NOT
+        # borrow field_removed here: that deletes references to a field which
+        # still exists under a new name, and would report "Removed all
+        # references".
+        return annotate_references(
+            original_code, consumer.language or "unknown", field_name,
+            f"field '{field_name}' was renamed, but the diff engine did not "
+            f"report the new name -- rename these references by hand.")
+
     if breaking_change.change_type in ("field_type_changed", "type_changed"):
-        from .fix_templates import apply_fix_template
-        old_type = getattr(breaking_change, 'old_type', '') or breaking_change.field_type.split(' → ')[0] if ' → ' in str(breaking_change.field_type) else ''
-        new_type = breaking_change.field_type.split(' → ')[1] if ' → ' in str(breaking_change.field_type) else ''
+        from .fix_templates import apply_fix_template, annotate_references
+        # PRECEDENCE BUG: this read
+        #     getattr(bc,'old_type','') or bc.field_type.split(...)[0] if COND else ''
+        # which Python groups as
+        #     (getattr(...) or split(...)) if COND else ''
+        # because a conditional expression binds looser than `or`. So whenever
+        # field_type lacked ' -> ', old_type became '' EVEN IF the attribute
+        # held a value -- and the attribute never existed anyway. The branch
+        # therefore fired only when field_type happened to be formatted as
+        # "old -> new", i.e. it depended on a string-formatting accident.
+        old_type = breaking_change.old_type
+        new_type = breaking_change.new_type
+        if not (old_type and new_type):
+            # Fall back to parsing the display string, accepting either arrow.
+            raw = str(breaking_change.field_type)
+            for arrow in (" \u2192 ", " -> "):
+                if arrow in raw:
+                    left, _, right = raw.partition(arrow)
+                    old_type = old_type or left.strip()
+                    new_type = new_type or right.strip()
+                    break
         if old_type and new_type:
-            return apply_fix_template(
+            fixed, expl = apply_fix_template(
                 code=original_code,
                 language=consumer.language or "unknown",
                 change_type="type_changed",
@@ -215,6 +253,20 @@ def _generate_with_template(
                 old_type=old_type,
                 new_type=new_type,
             )
+            if fixed != original_code:
+                return fixed, expl
+            # change_field_type is a measured no-op in 6 of 9 languages. That is
+            # a template gap, but it must not surface as silence.
+            return annotate_references(
+                original_code, consumer.language or "unknown", field_name,
+                f"type of '{field_name}' changed from {old_type} to {new_type} "
+                f"-- verify these references still compile.")
+        # A type change we cannot describe is still a break the consumer must
+        # look at.
+        return annotate_references(
+            original_code, consumer.language or "unknown", field_name,
+            f"type of '{field_name}' changed, but the diff engine did not "
+            f"report the old and new types -- verify these references.")
     
     if breaking_change.change_type != "added_required_field":
         return original_code, "Unsupported change type for template fix"

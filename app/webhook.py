@@ -2437,7 +2437,18 @@ def _create_fix_pr(
     if change.change_type in ("field_removed", "removed_field"):
         commit_msg = f"fix: Remove references to deleted field '{change.field_name}'"
     elif change.change_type == "field_renamed":
-        commit_msg = f"fix: Rename field '{change.field_name}' to '{getattr(change, 'new_name', '') or 'new name'}'"
+        # Read the declared field. This was getattr(change, 'new_name', '') on a
+        # dataclass that had no such field, so the fallback ALWAYS won and every
+        # rename PR was titled, literally:
+        #     fix: Rename field 'phone_number' to 'new name'
+        if change.new_name:
+            commit_msg = (f"fix: Rename field '{change.field_name}' to "
+                          f"'{change.new_name}'")
+        else:
+            # Say what is actually known rather than inventing a placeholder
+            # that reads like a real target.
+            commit_msg = (f"fix: Adapt to renamed field '{change.field_name}' "
+                          f"(new name not reported by the diff engine)")
     elif change.change_type in ("type_changed", "field_type_changed"):
         commit_msg = f"fix: Update type of field '{change.field_name}'"
     else:

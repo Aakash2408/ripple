@@ -666,6 +666,36 @@ def _comment_out_sites(code: str, names: set, lang: str, note: str) -> tuple[str
 
 # --- Main entry point ---
 
+def annotate_references(code: str, language: str, symbol: str,
+                        note: str) -> tuple[str, str]:
+    """Mark every reference to `symbol` with MARKER and `note`. Changes nothing else.
+
+    The escape hatch for a break Ripple has DETECTED but cannot describe well
+    enough to transform -- an engine that reports a rename without naming the
+    target, or a type change without reporting from/to.
+
+    Exists because the alternatives are both wrong. Returning the code unchanged
+    means fixed_code == content, so no PR opens and detection becomes silence.
+    Borrowing another operation's template lies: routing an unnamed rename
+    through field_removed DELETES references to a field that still exists under
+    a new name, and the note would read "Removed all references".
+
+    Always yields a non-empty diff so a PR opens: falls back to a file-top
+    marker when no line references the symbol.
+    """
+    lang = language.lower().strip()
+    variants = name_variants(symbol)
+    result, sites = _annotate_sites(code, _symbol_names(variants), lang, note)
+    where = f"{sites} site(s)"
+    if sites == 0:
+        token = _comment_token(lang)
+        result = f"{token} {MARKER}: {note}\n" + code
+        sites, where = 1, "file (no line-level reference found)"
+    return result, (f"PARTIAL: marked {where} with {MARKER}. {note} Ripple did "
+                    f"NOT transform the code: it lacks the information to do so "
+                    f"correctly, and guessing would be worse than flagging.")
+
+
 def apply_fix_template(
     code: str,
     language: str,

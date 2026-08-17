@@ -28,6 +28,26 @@ class BreakingChange:
     severity: str             # "breaking", "warning", "info"
     description: str
 
+    # Operation-specific detail. Three sites already READ these via
+    # getattr(change, 'new_name', '') on a dataclass that never declared them,
+    # so every read resolved to the falsy default and the code behind it was
+    # dead:
+    #
+    #   fix_generator  the rename branch required new_name to delegate, so
+    #                  renames never reached a template and fell through to
+    #                  "Unsupported change type" -- unchanged code, no PR,
+    #                  silence.
+    #   fix_generator  the type-change branch could only recover old_type by
+    #                  string-splitting field_type on ' -> '.
+    #   webhook        the rename COMMIT MESSAGE rendered literally
+    #                  "fix: Rename field 'phone_number' to 'new name'".
+    #
+    # Defaulted and appended, so all 65 existing construction sites are
+    # unaffected. Engines populate them in the next commit.
+    new_name: str = ""        # rename_field / rename_type: the new name
+    old_type: str = ""        # change_field_type: the type before
+    new_type: str = ""        # change_field_type: the type after
+
 
 @dataclass
 class DiffResult:

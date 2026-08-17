@@ -1955,5 +1955,160 @@ def test_scannable_admits_the_languages_matchers_exist_for():
         assert not is_scannable(path), f"{path} should not be scannable"
 
 
+def test_breaking_change_declares_the_fields_that_are_read():
+    """Three sites read new_name / old_type off BreakingChange via getattr on a
+    dataclass that never DECLARED them, so every read resolved to the falsy
+    default and the code behind it was dead:
+
+      fix_generator  the rename branch required new_name to delegate, so every
+                     rename fell through to "Unsupported change type" -->
+                     unchanged code --> no PR --> silence.
+      fix_generator  the type-change branch could only recover old_type by
+                     string-splitting field_type on an arrow.
+      webhook        the rename commit message rendered, literally,
+                     "fix: Rename field 'phone_number' to 'new name'".
+
+    getattr with a default is the same failure shape as
+    os.environ.get("ANTHROPIC_API_KEY"): a read that cannot fail, so nothing
+    errors and the dead branch looks live."""
+    import dataclasses
+    from app.diff_engine import BreakingChange
+    names = {f.name for f in dataclasses.fields(BreakingChange)}
+    for required in ("new_name", "old_type", "new_type"):
+        assert required in names, f"BreakingChange does not declare {required}"
+
+    # Defaulted, so the 65 existing 8-positional construction sites still work.
+    bc = BreakingChange("field_renamed", "/u", "get", "f", "string", "b",
+                        "breaking", "d")
+    assert bc.new_name == "" and bc.old_type == "" and bc.new_type == ""
+
+
+def test_no_phantom_getattr_on_breaking_change():
+    """Pins the STRUCTURE, because declaring the fields does not stop the next
+    reader from reaching for one that does not exist. A getattr with a default
+    silently succeeds, which is exactly why these three survived.
+
+    Walks the AST rather than grepping text. The first version of this test
+    grepped, and immediately failed on the COMMENTS in diff_engine.py,
+    fix_generator.py and webhook.py that quote the old code to explain the bug --
+    a gate that forbids describing the defect it prevents is worse than no gate,
+    because the fix is to delete the explanation."""
+    import ast
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    app_dir = _os.path.join(root, "app")
+    watched = {"breaking_change", "change", "bc"}
+    fields = {"new_name", "old_type", "new_type", "field_name", "change_type",
+              "field_type"}
+    offenders = []
+
+    for name in sorted(_os.listdir(app_dir)):
+        if not name.endswith(".py"):
+            continue
+        tree = ast.parse(open(_os.path.join(app_dir, name)).read(), filename=name)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2):
+                continue
+            target, attr = node.args[0], node.args[1]
+            if (isinstance(target, ast.Name) and target.id in watched
+                    and isinstance(attr, ast.Constant) and attr.value in fields):
+                offenders.append(f"{name}:{node.lineno} getattr({target.id}, "
+                                 f"{attr.value!r})")
+
+    assert not offenders, (
+        "BreakingChange field read via getattr -- declare it on the dataclass "
+        f"and read it directly, so a missing field fails loudly: {offenders}"
+    )
+
+
+def test_rename_and_type_change_never_produce_silence():
+    """Both branches used to return the code unchanged, and unchanged code opens
+    no PR -- so a detected break produced nothing at all. Measured before:
+    rename was silent ALWAYS (new_name could not exist), and type-change was
+    silent unless field_type happened to be formatted "old -> new".
+
+    Also pins that the fallbacks do not LIE. Routing an unnamed rename through
+    field_removed would delete references to a field that still exists under a
+    new name, and would report "Removed all references" while doing it."""
+    from app.diff_engine import BreakingChange
+    from app.consumer_finder import ConsumerMatch
+    from app.fix_generator import _generate_with_template
+    from app.fix_templates import MARKER
+
+    sources = {
+        "python": ("class W:\n    phone_number: str\n\n"
+                   "def f(u):\n    return u.phone_number\n"),
+        "javascript": "const x = obj.phoneNumber;\n",
+        "ruby": "x = obj.phone_number\n",
+        "java": "class W { private String phoneNumber; }\n",
+    }
+
+    def change(ct, **kw):
+        ft = kw.pop("field_type", "string")
+        return BreakingChange(ct, "/u", "get", "phone_number", ft, "b",
+                              "breaking", "d", **kw)
+
+    cases = [
+        ("rename with a target", lambda: change("field_renamed", new_name="phone")),
+        ("rename with no target", lambda: change("field_renamed")),
+        ("type change via fields",
+         lambda: change("field_type_changed", old_type="string", new_type="int32")),
+        # No arrow in field_type: this is the shape the precedence bug broke.
+        ("type change, fields only, plain field_type",
+         lambda: change("field_type_changed", field_type="int32",
+                        old_type="string", new_type="int32")),
+        ("type change, arrow only",
+         lambda: change("field_type_changed", field_type="string \u2192 int32")),
+        ("type change, nothing known", lambda: change("field_type_changed")),
+    ]
+
+    for lang, src in sources.items():
+        cm = ConsumerMatch("c", 1, "x", "high", "r", lang)
+        for label, factory in cases:
+            out, note = _generate_with_template(src, cm, factory())
+            assert out != src, f"[{lang}] {label}: unchanged -> no PR -> silence"
+            # Either a real transform, or an honest marked partial.
+            transformed = "Renamed" in note or "Changed type" in note
+            assert transformed or MARKER in out, (
+                f"[{lang}] {label}: neither transformed nor marked: {note}")
+            assert "Removed all references" not in note, (
+                f"[{lang}] {label}: a rename/type-change must never report a "
+                f"removal -- the field still exists: {note}")
+
+
+def test_type_change_reads_the_fields_not_the_display_string():
+    """The old expression was
+
+        getattr(bc,'old_type','') or bc.field_type.split(' -> ')[0] if COND else ''
+
+    which Python groups as (a or b) if COND else '', because a conditional
+    expression binds looser than `or`. So with no arrow in field_type, old_type
+    became '' EVEN IF the attribute held a value. The branch fired only on a
+    string-formatting accident."""
+    from app.diff_engine import BreakingChange
+    from app.consumer_finder import ConsumerMatch
+    from app.fix_generator import _generate_with_template
+
+    src = "class W:\n    phone_number: str\n"
+    cm = ConsumerMatch("c", 1, "x", "high", "r", "typescript")
+
+    # field_type carries NO arrow; the declared fields must still be used.
+    bc = BreakingChange("field_type_changed", "/u", "get", "phone_number",
+                        "int32", "b", "breaking", "d",
+                        old_type="string", new_type="int32")
+    _, note = _generate_with_template(src, cm, bc)
+    assert "string" in note and "int32" in note, note
+
+    # Both arrow spellings still parse, for engines that only set field_type.
+    for arrow in (" \u2192 ", " -> "):
+        bc = BreakingChange("field_type_changed", "/u", "get", "phone_number",
+                            f"string{arrow}int32", "b", "breaking", "d")
+        _, note = _generate_with_template(src, cm, bc)
+        assert "string" in note and "int32" in note, (arrow, note)
+
+
 if __name__ == "__main__":
     sys.exit(_main())
