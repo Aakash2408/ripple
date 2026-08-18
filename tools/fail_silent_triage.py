@@ -316,6 +316,17 @@ TRIAGE: dict[tuple, tuple] = {
     ("tls.py", "make_ssl_context", "swallowed_except", "Exception", 0): (
         LEGITIMATE, SAME_AS("tls.py", "resolve_ca_bundle")),
 
+    ("webhook.py", "_validate_fix_against_tree", "swallowed_except", "OSError", 0): (
+        LEGITIMATE,
+        "Restoring the consumer file after validation, in a finally. If the write "
+        "back fails the tree is left with this fix applied -- which cannot mislead a "
+        "later file, because each consumer is validated against a FRESHLY resolved "
+        "project and the tree is dropped at the end of the webhook by "
+        "_drop_consumer_trees(). Raising here would replace a real verdict with an "
+        "exception about bookkeeping, losing the answer we just paid a compile for. "
+        "The restore exists so consumers do not accumulate each other's patches, not "
+        "as a correctness guarantee about the tree."),
+
     ("webhook.py", "_retry_delay", "swallowed_except",
      "(AttributeError, TypeError, ValueError)", 0): (
         LEGITIMATE,

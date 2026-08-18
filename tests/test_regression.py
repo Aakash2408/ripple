@@ -3611,7 +3611,11 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     for lang in sorted(languages.languages()):
         for contract in sorted(CONTRACT_ENGINES):
             for op in sorted(CANONICAL_OPS):
-                d = pr_level(lang, contract, op, confidence=0.99, min_confidence=0.5)
+                # validated=True: this sweep asks "which cells COULD be AUTO once a
+                # patch compiles", which is the registry question. Whether a given
+                # patch compiled is a separate fact, asserted immediately below.
+                d = pr_level(lang, contract, op, confidence=0.99, min_confidence=0.5,
+                             validated=True)
                 counts[d.level.value] += 1
                 if d.level is Level.AUTO:
                     autos.append((lang, contract, op))
@@ -3619,6 +3623,28 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     # 1. exactly the golden cell, and nothing else
     assert autos == [("typescript", "openapi", "remove_field")], autos
     assert counts["AUTO"] == 1 and counts["REVIEW"] == 1799, counts
+
+    # 1b. AUTO REQUIRES A LIVE VALIDATION OF THIS PATCH. Registry evidence proves the
+    #     CELL works -- that this combination has an end-to-end fixture which
+    #     compiles. It says nothing about whether THIS patch, on THIS repository,
+    #     compiles, and conflating the two is what AUTO used to rest on.
+    golden = ("typescript", "openapi", "remove_field")
+    for validated, expected in ((True, Level.AUTO),
+                                (False, Level.REVIEW),
+                                (None, Level.REVIEW)):
+        d = pr_level(*golden, confidence=0.99, min_confidence=0.5,
+                     validated=validated)
+        assert d.level is expected, (
+            f"validated={validated!r} produced {d.level.value}, wanted "
+            f"{expected.value} -- 'we could not check' must never read as 'it is fine'")
+    assert any("not validated" in r
+               for r in pr_level(*golden, confidence=0.99, min_confidence=0.5,
+                                 validated=None).reasons), \
+        "an unvalidated fix is downgraded without saying why"
+    assert any("did not typecheck" in r
+               for r in pr_level(*golden, confidence=0.99, min_confidence=0.5,
+                                 validated=False).reasons), \
+        "a fix that failed the compiler is downgraded without saying why"
 
     # 2. every AUTO must satisfy the registry AND be mechanical
     for lang, contract, op in autos:
@@ -3631,7 +3657,7 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     for lang, contract, op in [(l, c, o) for l in languages.languages()
                                for c in CONTRACT_ENGINES for o in CANONICAL_OPS
                                if CANONICAL_OPS[o][0] != MECHANICAL]:
-        assert pr_level(lang, contract, op, 0.99, 0.5).level is not Level.AUTO, \
+        assert pr_level(lang, contract, op, 0.99, 0.5, validated=True).level is not Level.AUTO, \
             f"{op} ({CANONICAL_OPS[op][0]}) reached AUTO"
 
     # 4. Removing the e2e evidence must take AUTO away. If it does not, the level is
@@ -3639,24 +3665,28 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     saved = dict(cc.E2E_FIXTURES)
     cc.E2E_FIXTURES.clear()
     try:
-        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5)
+        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5,
+                validated=True)
         assert d.level is Level.REVIEW, d
         assert any("end-to-end" in r for r in d.reasons), d.reasons
     finally:
         cc.E2E_FIXTURES.update(saved)
-    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5).level is Level.AUTO
+    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5,
+                validated=True).level is Level.AUTO
 
     # 5. Same for validation.
     ts = cc.VALIDATORS["typescript"]
     cc.VALIDATORS["typescript"] = cc.ValidatorSpec("typescript", ts.toolchain,
                                                    implemented_by="", note=ts.note)
     try:
-        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5)
+        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5,
+                validated=True)
         assert d.level is Level.REVIEW, d
         assert any("UNABLE_TO_VALIDATE" in r for r in d.reasons), d.reasons
     finally:
         cc.VALIDATORS["typescript"] = ts
-    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5).level is Level.AUTO
+    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5,
+                validated=True).level is Level.AUTO
 
     # 6. Confidence still gates independently -- AUTO is not a bypass.
     low = pr_level("typescript", "openapi", "remove_field", 0.10, 0.5)
@@ -3666,7 +3696,8 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     from app.confidence import format_pr_body
     body = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
                           decision=pr_level("typescript", "openapi",
-                                            "remove_field", 0.95, 0.5))
+                                            "remove_field", 0.95, 0.5,
+                                            validated=True))
     first = body.split("\n")[0]
     assert "Automated fix, validation passed" in first, first
     assert "tsc --noEmit" in body and "byte-compared" in body
@@ -3675,8 +3706,17 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     # and a REVIEW body must never make that claim
     review = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
                             decision=pr_level("swift", "proto", "removed_field",
-                                              0.95, 0.5))
+                                              0.95, 0.5, validated=True))
     assert "validation passed" not in review
+
+    # nor may a body claim it when the patch itself was never compiled -- the
+    # heading is derived from the decision, so an unvalidated fix must read as REVIEW
+    unvalidated = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
+                                 decision=pr_level("typescript", "openapi",
+                                                   "remove_field", 0.95, 0.5,
+                                                   validated=None))
+    assert "validation passed" not in unvalidated, \
+        "a PR body claimed validation passed for a fix that was never compiled"
     assert "human review required" in review.split("\n")[0]
 
 
@@ -4081,9 +4121,18 @@ def test_safety_layers_are_reachable_or_declared_unreachable():
     assert ("validation", "describe_backend") in reach.REPORTING_ONLY, \
         "the reporting-only exemption was removed; a health endpoint would now " \
         "make the validator look wired"
-    assert "validation" not in reachable, \
-        "validation became reachable -- if it is now genuinely wired, update " \
-        "LAYERS and this assertion together, deliberately"
+
+    # ALL FOUR layers are now in the request path. This assertion previously read
+    # `"validation" not in reachable` with the note "if it is now genuinely wired,
+    # update LAYERS and this assertion together, deliberately" -- and it fired when
+    # the wiring landed, which is the gate working. Flipped deliberately, together
+    # with LAYERS, not worked around.
+    for name in ("ts_codemod", "diff_contract", "validation", "repo_workspace"):
+        assert name in reachable, \
+            f"{name} is NOT reachable from production -- a safety layer was " \
+            f"disconnected, which is the regression this gate exists for"
+    assert all(spec["reachable"] for spec in reach.LAYERS.values()), \
+        "a layer is declared unreachable while all four are wired"
 
     # EVERY import form must be visible to the scanner. `from . import x` is an
     # ImportFrom whose node.module is None, and reading node.module skipped the

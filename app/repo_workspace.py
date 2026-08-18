@@ -187,6 +187,38 @@ def _single_root(path: str) -> str:
     return path
 
 
+def fetch_tree(repo: str, ref: str, token: str,
+               limits: Limits = DEFAULT_LIMITS) -> tuple:
+    """(tree_path, cleanup_root) with EXPLICIT cleanup. Prefer checkout().
+
+    checkout() is a context manager and is the right shape for a single use. This
+    exists for the webhook, where one tree serves EVERY consumer file in a repository
+    and a `with` block would mean re-indenting a 150-line loop body -- a large
+    mechanical diff over code with governance guards and a ChangeRun scope, for no
+    behavioural gain.
+
+    The caller MUST rmtree(cleanup_root) in a finally. Returning the two paths
+    separately rather than one is deliberate: the tree is a subdirectory (GitHub wraps
+    it in {owner}-{repo}-{sha}), and deleting the tree while leaving the temp root
+    would leak the parent on every webhook.
+    """
+    if not token:
+        raise WorkspaceUnavailable("no token, so no archive can be fetched")
+
+    tmp = tempfile.mkdtemp(prefix="ripple-tree-")
+    archive = os.path.join(tmp, "repo.tar.gz")
+    extracted = os.path.join(tmp, "tree")
+    os.makedirs(extracted, exist_ok=True)
+    try:
+        _download(_tarball_url(repo, ref), token, limits, archive)
+        _extract(archive, extracted, limits)
+        os.remove(archive)
+        return _single_root(extracted), tmp
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
 @contextmanager
 def checkout(repo: str, ref: str, token: str, limits: Limits = DEFAULT_LIMITS):
     """Yield a path holding the repository tree at `ref`. Always cleaned up.
