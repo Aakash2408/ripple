@@ -3688,7 +3688,7 @@ def test_codemod_reports_every_reference_it_cannot_handle():
     r = remove_field(real, "phoneNumber")
     assert r.changed and not r.complete
     assert len([e for e in r.edits
-                if e["shape"] == "type property declaration"]) == 2, r.edits
+                if e["shape"] == "keyed property (inert value)"]) == 2, r.edits
     assert len(r.refusals) == 2, r.refusals
     assert all("line " in x for x in r.refusals), r.refusals
     assert any("createUser" in x for x in r.refusals)
@@ -3774,17 +3774,102 @@ def test_codemod_coverage_does_not_regress():
 
     # COUNTS, not a percentage. The audit printed 84.6% as "85%" and a floor set from
     # that display then failed against the real value. Integers cannot round.
-    assert handled >= 11, f"handled dropped to {handled} of {total}, was 11"
+    assert handled >= 12, f"handled dropped to {handled} of {total}, was 12"
     assert missed <= 2, f"{missed} unimplemented shapes, was 2"
 
     # Judgment references must stay refused. If this count ever DROPS, a judgment
     # call was silently transformed -- which would raise coverage while making the
     # product less safe, so it is the assertion that matters most here.
-    assert judgment == 4, f"judgment references changed to {judgment}, was 4"
+    # 6 after Stage 3 added the two side-effecting keyed-property cases. If this
+    # count DROPS, a judgment call was silently transformed -- which would raise
+    # coverage while making the product less safe, so it is the assertion that
+    # matters most in this test.
+    assert judgment == 6, f"judgment references changed to {judgment}, was 6"
     assert notes == 4, notes
 
     # And the gate itself is green on the real corpus.
     assert cov.main([]) == 0
+
+
+def test_diff_contract_catches_what_the_compiler_cannot():
+    """A green compiler means well-typed, never correct. MEASURED, not argued.
+
+    Five corrupting mutations were applied to a fix `tsc --noEmit` had accepted:
+
+        delete an unrelated field       VALID   <- compiler blind
+        change the wrong property       VALID   <- compiler blind
+        delete an unrelated function    VALID   <- compiler blind
+        introduce a syntax error        INVALID
+        no-op                           INVALID
+
+    Three of five passed. `{ email: user.email }` -> `{ email: user.fullName }`
+    typechecks perfectly because both are `string`. That is why the diff contract is
+    mandatory rather than nice to have, and why it was designed against these
+    measured failures instead of imagined ones.
+    """
+    from app.diff_contract import check
+    from app.ts_codemod import remove_field
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    orig = open(os.path.join(root, "fixtures", "typescript-openapi", "remove-field",
+                             "consumer", "src", "checkout.ts")).read()
+    good = remove_field(orig, "phoneNumber").code
+
+    # The correct fix passes, and only deletions happened.
+    v = check(orig, good, "phoneNumber")
+    assert v.ok, v.violations
+    assert v.summary["added_lines"] == 0
+
+    # The three the compiler could not see.
+    unrelated_field = good.replace("    email: user.email,\n", "")
+    wrong_property = good.replace("email: user.email", "email: user.fullName")
+    dropped_function = good[:good.index("export function toCrmPayload")]
+    for label, after, expect in [
+        ("deleted an unrelated field", unrelated_field, "collateral damage"),
+        ("changed the wrong property", wrong_property, "INSERTED text"),
+        ("dropped a whole function", dropped_function, "collateral damage"),
+        ("no-op", orig, "still present in CODE"),
+        ("syntax error", good.replace("return {", "return {{"), "INSERTED text"),
+        ("rewrote a comment", good.replace("A display string.", "Whatever."),
+         "INSERTED text"),
+    ]:
+        d = check(orig, after, "phoneNumber")
+        assert not d.ok, f"{label} was accepted by the diff contract"
+        assert any(expect in x for x in d.violations), (label, d.violations)
+
+    # An ADDITION is forbidden outright -- a removal never adds, and a patch that
+    # adds a line produces a diff a reviewer cannot scan.
+    with_addition = good.replace("export function formatContact",
+                                 "// injected\nexport function formatContact")
+    assert not check(orig, with_addition, "phoneNumber").ok
+
+
+def test_keyed_property_with_a_side_effect_is_refused():
+    """`phoneNumber: getPhone(),` must NOT be silently removed.
+
+    The first version of the keyed-property rule deleted it, removing a CALL. Nothing
+    else would have caught that: the compiler is happy, and the diff contract is
+    satisfied because the deleted line DOES reference the field. Whether dropping the
+    call is correct depends on what it does, which makes it judgment, not removal.
+    """
+    from app.ts_codemod import remove_field
+
+    for src in ('const p = {\n  phoneNumber: getPhone(),\n};\n',
+                'const p = {\n  phoneNumber: await fetchPhone(),\n};\n',
+                'const p = {\n  phoneNumber: new Phone(),\n};\n',
+                'const p = {\n  phoneNumber: () => 1,\n};\n'):
+        r = remove_field(src, "phoneNumber")
+        assert not r.edits, f"removed a side-effecting value: {src!r}"
+        assert len(r.refusals) == 1, (src, r.refusals)   # exactly one reason
+        assert r.code == src, "the code must be left alone"
+
+    # Inert values stay removable -- the guard must not over-refuse.
+    for src in ('const p = {\n  phoneNumber: "555",\n};\n',
+                'interface U {\n  phoneNumber: string;\n}\n',
+                'interface U {\n  phoneNumber?: string;\n}\n',
+                'interface U {\n  phoneNumber: "a" | "b";\n}\n'):
+        r = remove_field(src, "phoneNumber")
+        assert len(r.edits) == 1 and not r.refusals, (src, r.refusals)
 
 
 if __name__ == "__main__":

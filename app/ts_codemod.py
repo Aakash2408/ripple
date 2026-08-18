@@ -200,13 +200,49 @@ def remove_field(code: str, field: str) -> CodemodResult:
     out = code
     esc = re.escape(field)
 
-    # 1. Type / interface property DECLARATION on its own line.
-    decl = re.compile(rf"^[ \t]*{esc}\??[ \t]*:[ \t]*[^=\n]*?[;,]?[ \t]*$\n?",
+    # 1. A property whose KEY is the field, on its own line -- either a type
+    #    declaration (`phoneNumber: string;`) or an inert object-literal entry
+    #    (`phoneNumber: "555",`).
+    #
+    #    SIDE-EFFECTING VALUES ARE REFUSED. The first version removed
+    #    `phoneNumber: getPhone(),` and `phoneNumber: await fetchPhone(),` outright,
+    #    deleting a call. Nothing would have caught it: the compiler is happy, and
+    #    the diff contract is satisfied because the deleted line DOES reference the
+    #    field. Whether dropping that call is correct depends on what it does, which
+    #    makes it a judgment call, not a removal.
+    decl = re.compile(rf"^[ \t]*{esc}\??[ \t]*:[ \t]*(?P<value>[^=\n]*?)[;,]?[ \t]*$\n?",
                       re.MULTILINE)
+    SIDE_EFFECTS = ("(", "await ", "=>", "new ", "++", "--", "yield ")
+    keep = []
+    # A reference must produce exactly ONE reason. Without this, a side-effecting
+    # value was refused here AND again by the final classification pass, so the PR
+    # body would say the same thing twice and the counts would double.
+    _refused_lines: set = set()
     for m in list(decl.finditer(out)):
-        edits.append({"shape": "type property declaration",
-                      "removed": m.group(0).strip()})
-    out = decl.sub("", out)
+        value = m.group("value")
+        marker = next((t for t in SIDE_EFFECTS if t in value), None)
+        if marker:
+            line_no = out[:m.start()].count("\n") + 1
+            refusals.append(
+                f"line {line_no}: `{m.group(0).strip()[:70]}` -- the value contains "
+                f"`{marker.strip()}`, so removing the property would also remove "
+                f"something that may have effects. Whether that is correct depends "
+                f"on what it does. A human must decide.")
+            keep.append(m.span())
+            _refused_lines.add(m.group(0).strip())
+        else:
+            edits.append({"shape": "keyed property (inert value)",
+                          "removed": m.group(0).strip()})
+    # Rebuild without the removable matches, preserving the refused ones.
+    if any(m.span() not in keep for m in decl.finditer(out)):
+        pieces, last = [], 0
+        for m in decl.finditer(out):
+            if m.span() in keep:
+                continue
+            pieces.append(out[last:m.start()])
+            last = m.end()
+        pieces.append(out[last:])
+        out = "".join(pieces)
 
     # 2. Object-literal property whose VALUE is a member chain ending in the field.
     prop = re.compile(
@@ -234,6 +270,8 @@ def remove_field(code: str, field: str) -> CodemodResult:
     for m in anywhere.finditer(out):
         line_no = out[:m.start()].count("\n") + 1
         line = out.split("\n")[line_no - 1].strip()
+        if line in _refused_lines:
+            continue                     # already explained by the step-1 guard
         kind = _kind_at(m.start(), regions)
         if kind == "comment":
             notes.append(f"line {line_no}: mentioned in a comment -- left as is, "

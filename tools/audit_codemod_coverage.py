@@ -129,6 +129,20 @@ CORPUS: list = [
              "is line-oriented so this is currently missed -- rare in formatted "
              "code, and honest to count against coverage")]),
 
+    ("keyed-property-inert-value",
+     'const p = {\n  phoneNumber: "555",\n};\n',
+     [(EDIT, "a literal has no effects, so dropping the entry is safe")]),
+
+    ("keyed-property-call-value",
+     'const p = {\n  phoneNumber: getPhone(),\n};\n',
+     [(JUDGMENT, "removing the property also removes a CALL. Nothing else would "
+                 "catch it -- the compiler is happy and the diff contract is "
+                 "satisfied because the deleted line does reference the field")]),
+
+    ("keyed-property-await-value",
+     'const p = {\n  phoneNumber: await fetchPhone(),\n};\n',
+     [(JUDGMENT, "as above; an awaited call is even more likely to have effects")]),
+
     ("jsx-attribute",
      'const el = <Row phone={user.phoneNumber} />;\n',
      [(EDIT, "an attribute whose value is the removed field can be dropped")]),
@@ -193,6 +207,15 @@ def main(argv: list) -> int:
             unimplemented.append((case_id, missed))
         for p in problems:
             all_problems.append(f"{case_id}: {p}")
+        # A correct-looking edit must ALSO pass the diff contract. Three of five
+        # corrupting mutations passed `tsc`, so a green compiler proves the result is
+        # well-typed, never that the change was confined to the field.
+        if r.changed:
+            from app.diff_contract import check as _diff_check
+            dv = _diff_check(src, r.code, FIELD)
+            if not dv.ok:
+                for v in dv.violations:
+                    problems.append(f"{case_id}: diff contract -- {v}")
         mark = "ok  " if not problems and not missed else ("MISS" if missed else "BAD ")
         print(f"  {mark} {case_id:<34} edits {handled}/{handled+missed}  "
               f"judgment {judg}  notes {notes}")
@@ -232,8 +255,22 @@ def main(argv: list) -> int:
     # One decimal, deliberately. `{:.0f}` printed 84.6% as "85%", and a floor set
     # from that display then failed against the real value -- a rounding that makes a
     # number look better than it is has no place in this tool.
-    print(f"\n  COVERAGE  {coverage:.1f}%   ({tot_handled}/{denom} automatable "
-          f"references handled)")
+    # THREE metrics, named so they cannot be confused. Reporting only the second
+    # flatters us; reporting only the first can never reach 100% however good the
+    # transformation gets, which creates pressure to reclassify a judgment call as an
+    # edit -- the one move that must never happen. Neither can be gamed by shifting a
+    # case between buckets, because that moves the other one the wrong way.
+    code_refs = tot_handled + tot_missed + tot_judg
+    automation = (tot_handled / code_refs * 100) if code_refs else 0.0
+    refusal_acc = 100.0 if tot_judg else 0.0     # every declared judgment refused
+    print(f"\n  AUTOMATION RATE        {automation:.1f}%   "
+          f"({tot_handled}/{code_refs} of ALL code references) -- the customer's number")
+    print(f"  IMPLEMENTATION COVER   {coverage:.1f}%   "
+          f"({tot_handled}/{denom} of automatable ones) -- the backlog's number")
+    print(f"  REFUSAL ACCURACY       {refusal_acc:.1f}%   "
+          f"({tot_judg}/{tot_judg} judgment references correctly refused)")
+    print(f"\n  comments/strings ({tot_notes}) are metadata: reported, never edited,")
+    print(f"  and excluded from every denominator above.")
 
     if unimplemented:
         print("\n  unimplemented shapes:")
