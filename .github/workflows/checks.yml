@@ -115,6 +115,20 @@ jobs:
         # gate that leaned on tsc would let it through.
         run: python tools/audit_negative_corpus.py
 
+      - name: Safety layer reachability (blocking)
+        # A safety layer that production cannot reach is not a safety layer. The diff
+        # contract was reported as "wired into the pipeline" while being imported only
+        # by tests/ and tools/ -- built, tested, CI-gated, unreachable, which is the
+        # defect class this repo keeps rediscovering, now at the level of the safety
+        # layers themselves.
+        #
+        # Fails in BOTH directions. A declared-reachable layer going unreachable is a
+        # regression. A declared-unreachable layer BECOMING reachable also fails, on
+        # purpose: the negative corpus and the coverage audit both make claims that
+        # change meaning the moment a layer starts running in the request path, so
+        # that must not land silently.
+        run: python tools/audit_safety_reachability.py
+
       - name: Frozen surface (blocking)
         # The 30-day push has one objective: ONE real breaking change becoming one
         # validated, mergeable PR. Ripple already detects across 10 contract types

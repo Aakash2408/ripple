@@ -72,6 +72,7 @@ GATES=(
     "tools/audit_frozen_surface.py"
     "tools/audit_codemod_coverage.py"
     "tools/audit_negative_corpus.py"
+    "tools/audit_safety_reachability.py"
 )
 
 echo ""
