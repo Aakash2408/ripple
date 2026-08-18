@@ -284,6 +284,54 @@ def _check_disabled() -> list:
     return problems
 
 
+def _terminal_state_wrapping(path: str) -> list:
+    """The per-breaking-change loop must be wrapped in ChangeRun.
+
+    Structural, because "exactly one terminal state per breaking change" is only
+    guaranteed by the context manager. If the loop body is ever unwrapped, or a
+    `return` is added outside the `with`, the guarantee silently disappears and the
+    Autonomous Resolution Rate loses its denominator without anything erroring.
+    """
+    problems = []
+    try:
+        tree = ast.parse(open(path).read())
+    except SyntaxError as exc:
+        return [f"{os.path.basename(path)} does not parse ({exc})"]
+
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == PIPELINE_FN), None)
+    if fn is None:
+        return [f"{PIPELINE_FN} is gone -- this check no longer checks anything"]
+
+    loops = [n for n in ast.walk(fn)
+             if isinstance(n, ast.For) and ast.unparse(n.iter) == "breaking_changes"]
+    if not loops:
+        return ["no `for change in breaking_changes` loop found -- if it was "
+                "renamed, update this check rather than deleting it"]
+
+    for loop in loops:
+        first = loop.body[0]
+        wrapped = (isinstance(first, ast.With)
+                   and any("ChangeRun" in ast.unparse(i.context_expr)
+                           for i in first.items))
+        if not wrapped:
+            problems.append(
+                f"the breaking-change loop at line {loop.lineno} is NOT wrapped in "
+                f"ChangeRun, so a change can be processed without emitting a "
+                f"terminal state")
+            continue
+        # Every statement of the loop body must be inside the with -- a statement
+        # after it runs without the guarantee.
+        if len(loop.body) != 1:
+            extra = [type(s).__name__ for s in loop.body[1:]]
+            problems.append(
+                f"the breaking-change loop has {len(loop.body) - 1} statement(s) "
+                f"OUTSIDE the ChangeRun block ({', '.join(extra)}) -- those run "
+                f"without a terminal state")
+    return problems
+
+
 def main(argv: list) -> int:
     graph = _call_graph()
     entries = _entry_points(graph)
@@ -332,6 +380,13 @@ def main(argv: list) -> int:
           f"{len(ungoverned) - len(DISABLED)} exempt, {len(entries)} total")
 
     # Second half: within the governed pipeline, no decision may exit unrecorded.
+    wrapping = _terminal_state_wrapping(os.path.join(ROOT, "app", "webhook.py"))
+    print(f"\n  per-breaking-change terminal state: "
+          f"{'wrapped in ChangeRun' if not wrapping else 'NOT GUARANTEED'}")
+    for w in wrapping:
+        print(f"      FAIL  {w}")
+    problems.extend(wrapping)
+
     unsignalled = _unsignalled_exits(os.path.join(ROOT, "app", "webhook.py"))
     print(f"\n  unsignalled terminal exits in {PIPELINE_FN}: {len(unsignalled)}")
     for u in unsignalled:

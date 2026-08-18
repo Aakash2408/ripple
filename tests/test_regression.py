@@ -3142,5 +3142,101 @@ def test_experimental_platforms_are_off_across_the_whole_surface():
     assert "/dry-run" in body["what_still_works"]
 
 
+def test_every_breaking_change_ends_in_exactly_one_terminal_state():
+    """One breaking change in, exactly ONE terminal state out.
+
+    app/outcomes.py records EVENT-level outcomes and several fire per change -- one
+    per consumer file. Useful for tracing, useless for counting: you cannot compute
+    "what happened to this change?" from a stream where the same change produced
+    FIX_GENERATED four times and BLOCKED twice. Without a single answer per change,
+    the Autonomous Resolution Rate has no denominator.
+
+    Emission is structural, not remembered: ChangeRun is a context manager, so the
+    state is emitted on return, break, AND exception. Before this, an exception
+    mid-consumer-loop produced a logged process_spec_error and no statement about
+    the change itself.
+
+    Six states, not the five specified. NO_CHANGE_REQUIRED is separate because a
+    wire_only change (a proto field number changed) requires no source edit at all.
+    BLOCKED would report a correct refusal as a failure -- the mistake the registry
+    made when it demanded a transformation from wire_only ops. RESOLVED would be
+    worse: it would inflate the resolution rate with changes where Ripple did
+    nothing, and that number is meant to be the one the company is built on.
+    """
+    from app import activity
+    from app.run_outcome import (ChangeRun, Terminal, COUNTS_AS_RESOLVED,
+                                 EXCLUDED_FROM_RATE)
+
+    def terminal_of(body):
+        before = len([e for e in activity.recent(500)
+                      if e.get("action") == "change_terminal"])
+        try:
+            with ChangeRun(change_type="remove_field", spec="api/user.yaml",
+                           repo="acme/api") as run:
+                body(run)
+        except RuntimeError:
+            pass
+        events = [e for e in activity.recent(500)
+                  if e.get("action") == "change_terminal"]
+        assert len(events) - before == 1, \
+            f"expected exactly 1 terminal state, got {len(events) - before}"
+        return events[-1]["terminal"]
+
+    def raises(run):
+        run.consumer_found("checkout.ts")
+        raise RuntimeError("engine exploded")
+
+    def early(run):
+        run.consumer_found("checkout.ts")
+        return                                    # an early return still emits
+
+    cases = [
+        (lambda r: None, Terminal.NO_CONSUMER),
+        (lambda r: r.refused("checkout.ts", "no typescript handler for this op"),
+         Terminal.BLOCKED),
+        (lambda r: r.pr_created("https://pr/1", "checkout.ts"), Terminal.PARTIAL),
+        (lambda r: r.pr_created("https://pr/1", "checkout.ts", validated=True),
+         Terminal.RESOLVED),
+        (lambda r: (r.pr_created("https://pr/1", "a.ts", validated=True),
+                    r.refused("b.ts", "no handler for this language")),
+         Terminal.PARTIAL),
+        (lambda r: r.requires_no_change(), Terminal.NO_CHANGE_REQUIRED),
+        (raises, Terminal.FAILED),
+        (early, Terminal.BLOCKED),
+    ]
+    for body, expected in cases:
+        assert terminal_of(body) == expected.value, expected
+
+    # A refusal without a reason is the silence this exists to remove.
+    try:
+        ChangeRun("x", "y", "z").refused("a.ts", "")
+        raise AssertionError("an unexplained refusal was accepted")
+    except ValueError:
+        pass
+
+    # No caller may assert a state -- there is no setter, and terminal() is derived.
+    assert not hasattr(ChangeRun("x", "y", "z"), "set_terminal")
+
+    # RESOLVED is unreachable while nothing validates, exactly as AUTO is.
+    unvalidated = ChangeRun("x", "y", "z")
+    unvalidated.pr_created("https://pr/1", "a.ts")          # validated defaults False
+    assert unvalidated.terminal() is Terminal.PARTIAL
+
+    # ARR accounting: wire_only is excluded from the rate rather than counted as a win.
+    assert Terminal.RESOLVED in COUNTS_AS_RESOLVED
+    assert Terminal.NO_CHANGE_REQUIRED in EXCLUDED_FROM_RATE
+    assert Terminal.NO_CHANGE_REQUIRED not in COUNTS_AS_RESOLVED
+
+    # And the loop is still wrapped -- checked with the same helper the CI gate uses,
+    # so the test and the gate cannot disagree about what "wrapped" means.
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    from audit_pipeline_governance import _terminal_state_wrapping
+    webhook_py = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "webhook.py")
+    assert _terminal_state_wrapping(webhook_py) == []
+
+
 if __name__ == "__main__":
     sys.exit(_main())
