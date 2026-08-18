@@ -91,7 +91,13 @@ LAYERS = {
 
 #: Imports that exist only to report state, and cannot gate anything. Counting these
 #: as "reachable" would let a health endpoint make a safety layer look wired.
-REPORTING_ONLY = {("validation", "describe_backend")}
+#:
+#: DEGRADED_OPT_IN was added here after /health/capability began importing it to name
+#: the env var in its hint. That import made `validation` report as REACHABLE and the
+#: gate failed -- correctly. A constant used to compose a sentence is not a call into
+#: the validator, and the distinction is the whole point: REPORTED is not WIRED.
+REPORTING_ONLY = {("validation", "describe_backend"),
+                  ("validation", "DEGRADED_OPT_IN")}
 
 
 def _module_imports(path: str) -> set:
