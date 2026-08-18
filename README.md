@@ -728,7 +728,14 @@ python tools/audit_negative_corpus.py      # 6 historical false VALIDs, all bloc
 python tools/audit_safety_reachability.py  # 1 of 3 safety layers wired to production
 python tools/verify_validation.py          # acceptance, needs docker: not a gate
 python tools/verify_deployed_capability.py # acceptance: can the LIVE image validate?
+python tools/verify_release.py             # acceptance: is prod running the TESTED sha?
 ```
+
+`verify_release.py` reads `tests/.last_run.json`, which the suite writes with the
+revision it ran against. The pre-commit hook runs the suite while changes are staged,
+so that evidence always records `tested_tree_dirty: true` — a dirty tree is not any
+commit and can never legitimately equal a deployed sha. **Release evidence must come
+from a post-commit run:** commit first, re-run the suite, then release.
 
 All eight gate CI. The fail-silent gate does not demand zero silent paths — 25 are
 correct-but-invisible and making them visible is P0.4/P0.5 work. It demands that

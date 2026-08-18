@@ -78,6 +78,21 @@ CORPUS: list = [
      'const s = `${user?.phoneNumber}`;\n',
      [(EDIT, "as above, inside an interpolation")]),
 
+    # The one line that contains BOTH position classes. Inside a template literal the
+    # STATIC TEXT is string content and the `${...}` contents are real code, so this
+    # single line must produce one edit and one note -- not two edits (which would
+    # rewrite the customer's prose) and not two notes (which would leave a dangling
+    # reference that cannot compile).
+    #
+    # A rule as coarse as `if field in line` cannot express this, and the coverage
+    # number would look identical either way. Added because it worked by
+    # implementation and nothing pinned it: the closest existing cases are two
+    # interpolations, or a comment and a string on separate lines.
+    ("template-static-text-and-interpolation-same-line",
+     "const x = `user's phoneNumber: ${user.phoneNumber}`;\n",
+     [(EDIT, "the ${...} contents are code -- TEMPLATE_EXPRESSION"),
+      (NOTE, "the surrounding literal text is prose -- TEMPLATE_LITERAL_STATIC")]),
+
     ("multiple-occurrences-one-file",
      'const a = `${user.phoneNumber}`;\n'
      'const b = {\n  p: user.phoneNumber,\n};\n'

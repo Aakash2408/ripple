@@ -1667,9 +1667,40 @@ def _main() -> int:
         import json as _json
         import time as _t
         _here = _os_path.dirname(_os_path.abspath(__file__))
+
+        # WHICH REVISION THIS RESULT IS ABOUT.
+        #
+        # "122/122 passed" is not evidence about a deployment unless it names the
+        # code it ran. tools/verify_release.py refuses to pass unless the DEPLOYED
+        # sha equals the sha recorded here, which is the whole point: Ripple modifies
+        # other people's code, so which commit produced a PR cannot be a guess.
+        #
+        # `dirty` is recorded rather than hidden. A dirty tree means the tested code
+        # is not any commit, so it can never legitimately match a deployed sha, and
+        # the release gate treats that as a refusal rather than a mismatch.
+        _sha, _dirty = "", None
+        try:
+            import subprocess as _sp
+            _repo = _os_path.dirname(_here)
+            _r = _sp.run(["git", "-C", _repo, "rev-parse", "HEAD"],
+                         capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0:
+                _sha = _r.stdout.strip()
+            _d = _sp.run(["git", "-C", _repo, "status", "--porcelain"],
+                         capture_output=True, text=True, timeout=10)
+            if _d.returncode == 0:
+                _dirty = bool(_d.stdout.strip())
+        except Exception:
+            # Bookkeeping must never fail the suite. sha stays "" and dirty stays
+            # None, which the release gate reads as "unknown" and REFUSES -- it does
+            # not read a missing sha as a match.
+            pass
+
         with open(_os_path.join(_here, ".last_run.json"), "w") as fh:
             _json.dump({
                 "ran_at": _t.time(),
+                "tested_sha": _sha or None,
+                "tested_tree_dirty": _dirty,
                 "total": len(tests),
                 "passed": sorted(n for n, _ in tests
                                  if n not in {f for f, _ in failed}),
@@ -3785,7 +3816,11 @@ def test_codemod_coverage_does_not_regress():
     # coverage while making the product less safe, so it is the assertion that
     # matters most in this test.
     assert judgment == 6, f"judgment references changed to {judgment}, was 6"
-    assert notes == 4, notes
+    # 5 after the same-line template case was added: its static text is a note while
+    # its ${...} contents are an edit. If this DROPS, the position classifier stopped
+    # distinguishing prose from code -- which would either rewrite a customer's
+    # string or leave a reference that cannot compile.
+    assert notes == 5, notes
 
     # And the gate itself is green on the real corpus.
     assert cov.main([]) == 0
