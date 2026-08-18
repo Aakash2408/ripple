@@ -132,6 +132,37 @@ def choose_backend() -> tuple:
     return "", "no usable node and no docker"
 
 
+#: Memoised because `_docker_available()` shells out with a 25s timeout, which has
+#: no business running on a health endpoint. Backend availability is a property of
+#: the container image and cannot change during a process's lifetime, so caching it
+#: is not a staleness risk -- unlike caching a network result, which is the mistake
+#: this codebase has made four times.
+_BACKEND_DESCRIPTION = None
+
+
+def describe_backend() -> dict:
+    """What THIS host can validate with, as JSON.
+
+    Exists so the DEPLOYED service can state its own capability instead of it being
+    inferred from the repository. The repository can claim a cell is AUTO while the
+    running image has no TypeScript toolchain at all -- in which case `validate()`
+    correctly returns UNABLE_TO_VALIDATE and AUTO can never fire in production. That
+    divergence was invisible from either side until this was reported.
+    """
+    global _BACKEND_DESCRIPTION
+    if _BACKEND_DESCRIPTION is None:
+        backend, note = choose_backend()
+        _BACKEND_DESCRIPTION = {
+            "backend": backend or None,
+            "isolation": note,
+            # The NECESSARY condition for AUTO, not the sufficient one. Whether a
+            # given cell reaches AUTO is the registry's decision; this only says
+            # whether the toolchain that decision depends on exists here.
+            "can_validate": bool(backend),
+        }
+    return dict(_BACKEND_DESCRIPTION)
+
+
 # --------------------------------------------------------------------------
 # the runner
 # --------------------------------------------------------------------------

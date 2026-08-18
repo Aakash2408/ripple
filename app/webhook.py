@@ -275,6 +275,47 @@ async def health_storage():
     }
 
 
+@app.get("/health/capability")
+async def health_capability():
+    """Report whether THIS RUNNING IMAGE can validate a fix at all.
+
+    Why this is not inferable from the repository: the capability registry can
+    honestly derive AUTO=1 from the code, while the deployed image is
+    `python:3.11-slim` with no node, no npm and no docker daemon. In that image
+    `choose_backend()` returns "", `validate()` returns UNABLE_TO_VALIDATE, and
+    UNABLE_TO_VALIDATE is correctly not a pass -- so no cell can reach AUTO in
+    production no matter what the registry says.
+
+    Measured in the actual base image rather than assumed:
+
+        node ABSENT   npm ABSENT   npx ABSENT   docker ABSENT
+        backend ''    verdict UNABLE_TO_VALIDATE
+
+    That is the same defect shape as a matcher that is tested and CI-gated but
+    unreachable from production. The gap was invisible from both sides: the repo
+    saw its own docker, and the deployed service was never asked. Now it says so.
+
+    Deliberately factual. It reports whether the TOOLCHAIN exists -- the necessary
+    condition -- and does not re-implement the registry's rule for which cells earn
+    AUTO, because a second copy of that rule is how two surfaces start disagreeing.
+    """
+    from .validation import describe_backend
+
+    described = describe_backend()
+    return {
+        "healthy": True,
+        "validation": {
+            **described,
+            "hint": None if described["can_validate"] else (
+                "This image has no TypeScript toolchain, so every fix will be "
+                "UNABLE_TO_VALIDATE and no cell can reach AUTO here. Add node to "
+                "the image, or accept that production is REVIEW-only."
+            ),
+        },
+        "build": build_info(),
+    }
+
+
 @app.get("/logs/recent")
 async def recent_logs():
     """Return recent activity log for debugging (last 50 events)."""

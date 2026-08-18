@@ -3928,5 +3928,59 @@ def test_every_historical_false_valid_stays_blocked():
     assert half[0]["blocked_by"] == "diff", half[0]["blocked_by"]
 
 
+def test_deployed_capability_is_reported_not_assumed():
+    """The running image must state whether it can validate, and never overstate it.
+
+    The gap this closes: the registry derives AUTO=1 from the code, while the
+    deployed image is `python:3.11-slim` with no node, no npm and no docker daemon.
+    Measured in that base image -- backend "", verdict UNABLE_TO_VALIDATE. So AUTO
+    was simultaneously true in the repository and unreachable in production, and
+    pushing the pending commits would not have changed it: an image problem wearing
+    a deployment problem's clothes.
+
+    Neither side could see it. The repo's audits run on a host that HAS docker; the
+    deployed service was never asked. This is the same defect shape as a matcher
+    that is built, tested and CI-gated but unreachable from production.
+    """
+    import asyncio
+
+    from app import validation as val
+    from app.webhook import health_capability
+
+    original = val.choose_backend
+    try:
+        # No toolchain -- the production condition.
+        val.choose_backend = lambda: ("", "no usable node and no docker")
+        val._BACKEND_DESCRIPTION = None
+        body = asyncio.run(health_capability())
+        v = body["validation"]
+        assert v["backend"] is None, v
+        assert v["can_validate"] is False, \
+            "an image with no node claimed it could validate"
+        assert v["hint"], "a blocked image must say what is wrong, not just report False"
+
+        # Toolchain present -- the hint must disappear rather than linger and mislead.
+        val.choose_backend = lambda: ("docker", "container, pinned image")
+        val._BACKEND_DESCRIPTION = None
+        body = asyncio.run(health_capability())
+        v = body["validation"]
+        assert v["backend"] == "docker" and v["can_validate"] is True, v
+        assert v["hint"] is None, "a working image still showed the failure hint"
+
+        # The description is CACHED (choose_backend shells out with a 25s timeout,
+        # which has no business on a health endpoint). Cached state that ignores the
+        # reset is how a stale answer outlives the thing it described.
+        val.choose_backend = lambda: ("", "changed after caching")
+        body = asyncio.run(health_capability())
+        assert body["validation"]["backend"] == "docker", \
+            "the cache did not hold, so every health check pays a 25s docker probe"
+        val._BACKEND_DESCRIPTION = None
+        assert asyncio.run(health_capability())["validation"]["backend"] is None, \
+            "the cache could not be reset, so the answer can never be corrected"
+    finally:
+        val.choose_backend = original
+        val._BACKEND_DESCRIPTION = None
+
+
 if __name__ == "__main__":
     sys.exit(_main())
