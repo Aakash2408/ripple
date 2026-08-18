@@ -4405,5 +4405,162 @@ def test_python_regions_and_a_language_aware_diff_contract():
         "with no scanner can reach the diff contract and be misjudged"
 
 
+def test_llm_is_briefed_per_operation_and_never_given_contradictory_orders():
+    """The prompt must describe the operation being performed.
+
+    There was ONE hardcoded instruction block, used for every change_type:
+
+        1. Add the new required field "{field}" to the API call.
+        2. Add it as a parameter/argument that callers must provide.
+
+    with no branching. So a REMOVAL asked the model to ADD the field. Measured on a
+    live gemini-flash-latest call: asked to remove `phoneNumber`, it added
+    `phoneNumber: string` to two signatures and explained itself as "Added required
+    field" -- doing exactly what it was told. Only the diff contract stopped it, and
+    it read as model unreliability for a day. It was the prompt.
+
+    The table is an ALLOWLIST. An unlisted operation gets NO LLM attempt and returns
+    to the deterministic path, because the previous shape was the "unknown enum falls
+    through to the weakest path" defect: every unrecognised operation silently
+    inherited add-a-required-field.
+    """
+    from app.diff_engine import BreakingChange
+    from app.fix_generator import _llm_explanation, _llm_instructions
+
+    def change(**kw):
+        base = dict(change_type="", path="/users", method="get", field_name="phone",
+                    field_type="string", location="request_body", severity="breaking",
+                    description="")
+        base.update(kw)
+        return BreakingChange(**base)
+
+    # Each briefed operation must be told to do THAT operation.
+    for change_type, must_contain, must_not in (
+        ("removed_field", "REMOVE every reference", "Add it as a parameter"),
+        ("added_required_field", "now REQUIRED", "REMOVE every reference"),
+        ("renamed_field", "was RENAMED", "REMOVE every reference"),
+        ("field_type_changed", "changed type", "REMOVE every reference"),
+    ):
+        kw = {"change_type": change_type}
+        if change_type == "renamed_field":
+            kw["new_name"] = "phone_no"
+        if change_type == "field_type_changed":
+            kw["new_type"] = "number"
+        text = _llm_instructions(change(**kw))
+        assert text, change_type
+        assert must_contain in text, (change_type, text[:120])
+        assert must_not not in text, \
+            f"{change_type} inherited instructions for a different operation"
+
+    # JUDGMENT operations are absent by design -- REVIEW is the correct answer for
+    # them, not a prompt. The first four are the dialects engines actually emit; the
+    # last two exercise the suffix FALLBACK, where `removed_package` used to degrade
+    # to `remove_field` and would have been briefed as a field removal.
+    for change_type in ("removed_operation", "package_removed", "spec_removed",
+                        "directory_removed", "removed_package", "restrict_schema"):
+        assert _llm_instructions(change(change_type=change_type)) == "", \
+            f"{change_type} is being briefed to the LLM; it is a judgment call"
+
+    # An unknown operation must get NOTHING rather than the nearest match.
+    assert _llm_instructions(change(change_type="%%nonsense%%")) == "", \
+        "an unrecognised change_type received instructions -- the allowlist leaks"
+
+    # Instructions that interpolate a field must refuse when it is empty, or the
+    # model is asked to rename something to "" and will invent a plausible answer.
+    assert _llm_instructions(change(change_type="renamed_field")) == "", \
+        "a rename with no new_name was briefed anyway"
+    assert _llm_instructions(change(change_type="field_type_changed")) == "", \
+        "a type change with no new_type was briefed anyway"
+
+    # The EXPLANATION is what a customer reads in the PR body, and it was hardcoded
+    # to "Added required field" for every operation -- so a removal PR announced
+    # itself as an addition.
+    assert "Removed references" in _llm_explanation(change(change_type="removed_field"))
+    assert "Added" in _llm_explanation(change(change_type="added_required_field"))
+    assert "Renamed" in _llm_explanation(
+        change(change_type="renamed_field", new_name="phone_no"))
+    assert "Added" not in _llm_explanation(change(change_type="removed_field")), \
+        "a removal is still described as an addition"
+
+
+def test_llm_output_keeps_the_files_trailing_newline():
+    """`.strip()` on the response dropped the final newline, and the contract noticed.
+
+    An otherwise CORRECT live fix was rejected with "REMOVED text that does not
+    reference 'phoneNumber': '\\n'". The contract was right -- losing the trailing
+    newline puts "\\ No newline at end of file" in the diff, which is an unrelated
+    change. The loss was ours, not the model's, and I attributed it to the model
+    first.
+
+    Normalising the generator's OUTPUT is the fix. Relaxing the verifier to ignore
+    trailing whitespace would have hidden a real class of unrelated change.
+    """
+    import inspect
+    import tempfile
+
+    from app import fix_generator as fg
+    from app.consumer_finder import ConsumerMatch
+    from app.diff_engine import BreakingChange
+    from app.diff_contract import check
+
+    def _mk(cls, **over):
+        kw = {}
+        for name, p in inspect.signature(cls).parameters.items():
+            if name in over:
+                kw[name] = over[name]
+                continue
+            if p.default is not inspect.Parameter.empty:
+                continue
+            ann = str(p.annotation)
+            kw[name] = (0.9 if "float" in ann else 1 if "int" in ann
+                        else [] if "list" in ann else "")
+        return cls(**kw)
+
+    original = ('import { User } from "./types";\n'
+                "\n"
+                "export function f(user: User): string {\n"
+                "  return `${user.fullName} ${user.phoneNumber}`;\n"
+                "}\n")
+    # A correct removal that has LOST the trailing newline, which is what .strip()
+    # used to produce.
+    stripped = original.replace(" ${user.phoneNumber}", "").rstrip("\n")
+
+    tmp = tempfile.mkdtemp(prefix="ripple-nl-")
+    path = os.path.join(tmp, "f.ts")
+    with open(path, "w") as fh:
+        fh.write(original)
+
+    consumer = _mk(ConsumerMatch, file_path=path, repo="r", language="typescript",
+                   confidence="high")
+    ch = _mk(BreakingChange, change_type="removed_field", field_name="phoneNumber",
+             method="get", path="/users", field_type="string", severity="breaking")
+
+    # Without restoration the contract rejects it -- proving the rule has teeth and
+    # that the restoration below is doing real work rather than being cosmetic.
+    assert not check(original, stripped, "phoneNumber",
+                     language="typescript").ok, \
+        "losing the trailing newline no longer violates the contract, so this " \
+        "normalisation is untested"
+
+    saved = fg._generate_with_llm
+    try:
+        from app import llm_config
+        saved_key = llm_config.api_key
+        llm_config.api_key = lambda: "DUMMY"
+        # The generator hands back the stripped form; generate_fix must still produce
+        # a patch the contract accepts.
+        fg._generate_with_llm = lambda *_a, **_k: (stripped, "removed")
+        got = fg.generate_fix(consumer, ch, use_llm=True)
+        assert got is not None, \
+            "a correct fix was refused only because the trailing newline was lost"
+        assert got.fixed_code.endswith("\n"), got.fixed_code[-20:]
+    finally:
+        fg._generate_with_llm = saved
+        from app import llm_config as _lc
+        _lc.api_key = saved_key
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(_main())

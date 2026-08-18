@@ -261,8 +261,25 @@ CORPUS = [
         # entirely.
         #
         # Byte-exact: the replacements below were verified to reproduce the captured
-        # output. Note the .rstrip("\n") -- the model DROPPED the trailing newline,
-        # which is diff noise a reviewer sees and no correct removal introduces.
+        # output. Note the .rstrip("\n") -- the trailing newline was missing, which
+        # is diff noise a reviewer sees and no correct removal introduces.
+        #
+        # TWO ROOT CAUSES, FOUND LATER THE SAME DAY, AND BOTH WERE OURS
+        #
+        # 1. The wrong CHANGE. _generate_with_llm had one hardcoded instruction
+        #    block used for every change_type: "Add the new required field ... as a
+        #    parameter callers must provide". No branching. The model followed its
+        #    instructions exactly, and its explanation -- "Added required field" --
+        #    was accurate to them. Fixed with an operation allowlist.
+        #
+        # 2. The missing NEWLINE was our `.strip()` on the response, not the model.
+        #
+        # The entry is KEPT: the patch is still a bad fix that must never ship, and
+        # tsc still accepts it, which is what earns it a place here. But it is
+        # evidence about a PROMPT defect, not about model reliability -- reading it
+        # the other way would justify distrusting a component that behaved correctly.
+        # The same live call now produces a correct removal that passes the diff
+        # contract and compiles VALID.
         "id": "known_bad_fix_007_llm_added_a_parameter_instead_of_removing",
         "what_happened": "a live gemini-flash-latest call, asked to remove the "
                          "field, added it as a function parameter in two places",
