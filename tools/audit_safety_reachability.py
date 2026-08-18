@@ -82,10 +82,27 @@ LAYERS = {
         "consequence":
             "no generated fix is ever compiled in the request path; AUTO rests on "
             "build-time e2e evidence for the CELL, not on validating THIS customer's "
-            "fix. Wiring it is currently moot in any case: the deployed image is "
-            "python:3.11-slim with no node and no docker, so validate() there returns "
-            "UNABLE_TO_VALIDATE -- see tools/verify_deployed_capability.py. The image "
-            "must gain a toolchain before wiring this changes any outcome.",
+            "fix. Wiring it needs repo_workspace wired FIRST -- tsc cannot typecheck "
+            "a file without its project, which is the whole reason Stage 1 exists. "
+            "The image now has a toolchain (see tools/verify_deployed_capability.py) "
+            "but RIPPLE_ALLOW_DEGRADED_VALIDATION is unset in production, so the "
+            "backend resolves to '' and every fix would be UNABLE_TO_VALIDATE.",
+    },
+    "repo_workspace": {
+        "role": "fetches the repository TREE, so a compiler sees a project rather "
+                "than an orphan file. Prerequisite for validation, for monorepo "
+                "package resolution, and for an accepted-fix corpus",
+        "reachable": False,
+        "consequence":
+            "the webhook still reads consumer files one at a time via "
+            "GET /repos/{repo}/contents/{path}, so tsc/mypy/go build have no project "
+            "to work with and AUTO is unreachable in production for EVERY language -- "
+            "not only the ones with no codemod. Monorepos are impossible for the same "
+            "reason: the owning package of a file cannot be known without the tree. "
+            "Registered the DAY it was written, unwired, because diff_contract sat in "
+            "exactly this state for three stages while a commit message claimed it "
+            "was 'wired into the pipeline'. Being able to see the gap is the point; "
+            "wiring is Stage 2, and needs project resolution to be useful.",
     },
 }
 
@@ -110,9 +127,22 @@ def _module_imports(path: str) -> set:
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             mod = (node.module or "").split(".")[-1]
-            if not mod:
-                continue
             names = {a.name for a in node.names}
+            if not mod:
+                # `from . import activity` -- node.module is None and the NAMES are
+                # the modules. The first version read node.module, got "", and
+                # skipped the statement, so this entire import form was INVISIBLE to
+                # the gate -- and app/webhook.py uses it (`from . import activity as
+                # _activity`), so the blind spot was in the file being scanned.
+                #
+                # Found by mutation: wiring repo_workspace with this form did NOT
+                # fail the gate. A gate that cannot see a real import is worse than
+                # no gate, because it reports "unreachable" with confidence.
+                #
+                # No reporting-only exemption applies here: importing a whole module
+                # grants access to everything in it, which is wiring by any measure.
+                found.update(names)
+                continue
             if all((mod, n) in REPORTING_ONLY for n in names):
                 continue
             found.add(mod)

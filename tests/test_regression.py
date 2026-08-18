@@ -4085,6 +4085,40 @@ def test_safety_layers_are_reachable_or_declared_unreachable():
         "validation became reachable -- if it is now genuinely wired, update " \
         "LAYERS and this assertion together, deliberately"
 
+    # EVERY import form must be visible to the scanner. `from . import x` is an
+    # ImportFrom whose node.module is None, and reading node.module skipped the
+    # statement entirely -- so that form was INVISIBLE, in a scanner whose own entry
+    # point (app/webhook.py) uses it. Found by mutation: wiring repo_workspace that
+    # way did not fail the gate. A gate that cannot see a real import is worse than
+    # no gate, because it reports "unreachable" with confidence.
+    import ast
+    import tempfile
+
+    probe = tempfile.mkdtemp(prefix="ripple-imp-")
+    try:
+        for form in ("from . import ts_codemod",
+                     "from . import ts_codemod as _t",
+                     "from .ts_codemod import remove_field",
+                     "from app.ts_codemod import remove_field",
+                     "import app.ts_codemod"):
+            path = os.path.join(probe, "probe.py")
+            with open(path, "w") as fh:
+                fh.write(form + "\n")
+            ast.parse(form)                      # the form must be valid Python
+            assert "ts_codemod" in reach._module_imports(path), \
+                f"the scanner cannot see this import form: {form!r}"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(probe, ignore_errors=True)
+
+    # repo_workspace must be REGISTERED even while unwired. It was built, tested and
+    # CI-gated on the same day, imported by nothing -- the exact state diff_contract
+    # sat in for three stages while a commit message claimed it was wired. Being
+    # able to SEE the gap is the point.
+    assert "repo_workspace" in reach.LAYERS, \
+        "repo_workspace is not registered, so nothing reports that the tree fetch " \
+        "is unreachable from production"
+
 
 def test_a_partial_removal_returns_the_original_not_broken_code():
     """The diff contract now runs in the request path, so half-fixes never ship.

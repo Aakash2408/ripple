@@ -725,7 +725,7 @@ python tools/audit_pipeline_governance.py  # 1 of 5 entry points governed
 python tools/audit_frozen_surface.py       # 6 frozen modules, 747 statements
 python tools/audit_codemod_coverage.py     # automation 68.0%, implementation 94.4%
 python tools/audit_negative_corpus.py      # 7 bad fixes (6 historical + 1 observed)
-python tools/audit_safety_reachability.py  # 2 of 3 safety layers wired to production
+python tools/audit_safety_reachability.py  # 2 of 4 safety layers wired to production
 python tools/verify_archive_safety.py      # hostile archives: 8 cases, containment
 python tools/verify_validation.py          # acceptance, needs docker: not a gate
 python tools/verify_deployed_capability.py # acceptance: can the LIVE image validate?
