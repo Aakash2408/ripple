@@ -4065,5 +4065,60 @@ def test_safety_layers_are_reachable_or_declared_unreachable():
         "LAYERS and this assertion together, deliberately"
 
 
+def test_a_partial_removal_returns_the_original_not_broken_code():
+    """The diff contract now runs in the request path, so half-fixes never ship.
+
+    Behaviour before this: a file with two removable references and two judgment
+    references returned CHANGED code with the judgment references still in it. That
+    compiles nowhere -- the type declaration is gone and the parameter still demands
+    the field -- so it opened as REVIEW carrying a compile error for a human to
+    discover. The residue was flagged in Stage 2 and belonged here.
+
+    Now the diff contract sees `field still present in CODE`, the patch is refused
+    outright, and the ORIGINAL is returned. A patch that changed something it should
+    not have is worse than no patch, and unchanged code is already what
+    apply_fix_template turns into a truthful "could not remove" and what the outcome
+    derivation turns into BLOCKED.
+
+    This is the real billing-api shape, which is why it is this shape.
+    """
+    from app.fix_templates import apply_fix_template, _LAST_TS_RESULT
+
+    partial = (
+        "interface CreateUserRequest {\n"
+        "  name: string;\n"
+        "  phoneNumber: string;\n"
+        "}\n"
+        "async function createUser(name: string, phoneNumber: string) {\n"
+        "  const request: CreateUserRequest = { name, phoneNumber };\n"
+        "  return request;\n"
+        "}\n"
+    )
+    out, _explanation = apply_fix_template(
+        code=partial, language="typescript", change_type="removed_field",
+        field_name="phoneNumber")
+
+    assert out == partial, \
+        "a partial removal returned CHANGED code -- it would open a PR that cannot " \
+        "compile, which is what wiring the diff contract was meant to stop"
+    assert not (_LAST_TS_RESULT.get("edits") or []), \
+        "edits were reported for a patch that was refused"
+    assert any("diff contract" in str(r) for r in _LAST_TS_RESULT.get("refusals") or []), \
+        "the refusal does not say the diff contract rejected it, so the PR body " \
+        "could not explain why nothing happened"
+
+    # And the complete case must be UNAFFECTED -- if this breaks, AUTO is lost.
+    complete = (
+        "interface U {\n  phoneNumber: string;\n}\n"
+        "const p = { a: 1 };\n"
+    )
+    out2, _ = apply_fix_template(
+        code=complete, language="typescript", change_type="removed_field",
+        field_name="phoneNumber")
+    assert out2 != complete and "phoneNumber" not in out2, \
+        "the diff contract rejected a CORRECT complete removal -- it is now " \
+        "over-refusing, which silently costs every fix"
+
+
 if __name__ == "__main__":
     sys.exit(_main())

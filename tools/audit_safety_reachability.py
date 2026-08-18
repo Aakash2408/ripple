@@ -70,14 +70,11 @@ LAYERS = {
     },
     "diff_contract": {
         "role": "diff correctness -- did the change touch ONLY references to the "
-                "removed field",
-        "reachable": False,
-        "consequence":
-            "known_bad_fix_003 in the negative corpus (a half-fix that keeps a "
-            "function parameter) is accepted by tsc as VALID and is blocked ONLY by "
-            "this layer. Unwired, that class of bad fix can reach AUTO in production. "
-            "The other five corpus cases are independently rejected by the compiler, "
-            "so this is one escaping class, not six.",
+                "removed field. Wired at fix_templates._remove_field_typescript, "
+                "immediately after the codemod; on violation the ORIGINAL code is "
+                "returned so a bad patch cannot propagate",
+        "reachable": True,
+        "consequence": None,
     },
     "validation": {
         "role": "the compiler -- does the patched project typecheck",

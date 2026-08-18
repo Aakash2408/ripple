@@ -83,6 +83,11 @@ def check(before: str, after: str, field: str) -> DiffVerdict:
 
     violations = []
     deleted = modified = added = 0
+    #: Every piece of text this change removed. Used only to decide whether a
+    #: vanished string/comment vanished LEGITIMATELY -- each chunk is separately
+    #: checked above for referencing the field, so exempting them cannot launder a
+    #: collateral deletion.
+    removed_chunks = []
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
@@ -96,6 +101,7 @@ def check(before: str, after: str, field: str) -> DiffVerdict:
         elif tag == "delete":
             deleted += i2 - i1
             for line in b_lines[i1:i2]:
+                removed_chunks.append(line)
                 if not re.search(rf"\b{re.escape(field)}\b", line):
                     violations.append(
                         f"DELETED a line that does not reference {field!r} -- "
@@ -117,12 +123,15 @@ def check(before: str, after: str, field: str) -> DiffVerdict:
                     violations.append(
                         f"INSERTED text into a line, which a removal never does: "
                         f"{ins!r} in `{al.strip()[:60]}`")
+                if dele:
+                    removed_chunks.append(dele)
                 if dele and not re.search(rf"\b{re.escape(field)}\b", dele):
                     violations.append(
                         f"REMOVED text that does not reference {field!r}: "
                         f"{dele!r}")
             for bl in b_block[len(a_block):]:
                 deleted += 1
+                removed_chunks.append(bl)
                 if not re.search(rf"\b{re.escape(field)}\b", bl):
                     violations.append(
                         f"DELETED a line that does not reference {field!r}: "
@@ -141,10 +150,20 @@ def check(before: str, after: str, field: str) -> DiffVerdict:
 
     # Comments and strings must survive. Rewriting a customer's prose or a log
     # message is not this transformation's business.
+    #
+    # EXCEPT when the literal was INSIDE text this change legitimately deleted. For
+    #     const p = { phoneNumber: "555" };
+    # removing the property necessarily removes the string that was its value, and
+    # every deletion has already been checked above to reference the field. The first
+    # version of this rule compared survival GLOBALLY and so rejected that correct
+    # fix -- found by trying to wire the contract into the pipeline, which is the
+    # only place the two rules meet.
+    removed_text = "".join(removed_chunks)
     survived = {t for _k, t in _comments_and_strings(after)}
     for kind, text in _comments_and_strings(before):
-        if text not in survived:
-            violations.append(f"a {kind} did not survive the change: {text[:60]!r}")
+        if text in survived or text in removed_text:
+            continue
+        violations.append(f"a {kind} did not survive the change: {text[:60]!r}")
 
     if not deleted and not modified:
         violations.append("nothing changed -- a no-op is not a fix")
