@@ -1,0 +1,12 @@
+{
+  "name": "ripple-fixture-consumer-ts-openapi-remove-field",
+  "private": true,
+  "version": "0.0.0",
+  "description": "A deliberately broken consumer. See ../README.md.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.3.3"
+  }
+}

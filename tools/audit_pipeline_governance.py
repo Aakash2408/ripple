@@ -65,19 +65,33 @@ REQUIRED = {
 
 # Entry points known to be ungoverned, each with the reason. An ungoverned entry
 # point NOT listed here fails the build. Deleting a line here is progress.
-EXEMPT = {
+# Entry points that are SWITCHED OFF, and must stay off. Distinct from EXEMPT: an
+# exemption TOLERATES an ungoverned path, whereas this asserts the path cannot be
+# reached at all. Both webhooks moved here in Stage 2.
+#
+# The check is structural, not a label: the route must call experimental_disabled()
+# BEFORE any PR-creating call. A guard placed after the pipeline would read as
+# "disabled" while still opening merge requests.
+DISABLED = {
     "app/webhook.py:gitlab_webhook":
-        "154 lines of pipeline inlined in the route handler: its own engine "
-        "dispatch, its own fix generation, its own MR creation. A breaking change "
-        "on GitLab can still produce silence.",
+        "154 lines of pipeline inlined in the route handler, bypassing both the "
+        "routing decision and the outcome funnel. Switched off rather than left "
+        "exempt, because an exemption becomes permanent and a breaking change on "
+        "this path could still terminate in silence.",
     "app/webhook.py:bitbucket_webhook":
         "154 lines inlined, same shape as gitlab_webhook.",
+}
+
+EXEMPT = {
     "app/cli.py:main":
         "app/cli.py calls pr_engine.create_prs, which has its OWN _format_pr_body "
-        "and no routing decision. The CLI states no safety level.",
+        "and no routing decision. The CLI states no safety level. Left live "
+        "because it is developer-invoked and opens nothing without an explicit "
+        "command.",
     "agent/core.py:main":
         "drives the self-hosted adapters (Phabricator, Gerrit, CRUX, "
-        "generic git). Separate package; imports nothing from app.routing.",
+        "generic git). Separate package; imports nothing from app.routing. "
+        "Self-hosted, so it cannot be switched off centrally.",
 }
 
 
@@ -220,6 +234,104 @@ def _unsignalled_exits(path: str) -> list:
     return found
 
 
+def _guard_position(entry: str) -> tuple:
+    """(guard_line, first_pr_call_line) for a route, or (None, None) if absent.
+
+    Positions, not just presence: a guard added AFTER the pipeline would read as
+    "disabled" while still opening merge requests. Line numbers are compared inside
+    a single parse, so there is no persistence and nothing to drift -- unlike the
+    line-keyed triage that detached the moment webhook.py grew.
+    """
+    module, func = entry.rsplit(":", 1)
+    path = os.path.join(ROOT, module)
+    if not os.path.exists(path):
+        return None, None
+    tree = ast.parse(open(path).read())
+    node = next((n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and n.name == func), None)
+    if node is None:
+        return None, None
+    guard = pr_call = None
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        name = (sub.func.id if isinstance(sub.func, ast.Name)
+                else getattr(sub.func, "attr", ""))
+        if name == "experimental_disabled" and guard is None:
+            guard = sub.lineno
+        if name in PR_CREATORS and (pr_call is None or sub.lineno < pr_call):
+            pr_call = sub.lineno
+    return guard, pr_call
+
+
+def _check_disabled() -> list:
+    problems = []
+    for entry, why in sorted(DISABLED.items()):
+        guard, pr_call = _guard_position(entry)
+        if guard is None:
+            problems.append(
+                f"{entry} is listed DISABLED but has no experimental_disabled() "
+                f"guard. It is switched off because: {why}")
+            print(f"  FAIL   {entry:<40} no guard")
+        elif pr_call is not None and guard > pr_call:
+            problems.append(
+                f"{entry} guards at line {guard} but can open a PR at line "
+                f"{pr_call} -- the guard runs too late to stop anything.")
+            print(f"  FAIL   {entry:<40} guard after the PR call")
+        else:
+            print(f"  off    {entry:<40} guarded at line {guard}")
+    return problems
+
+
+def _terminal_state_wrapping(path: str) -> list:
+    """The per-breaking-change loop must be wrapped in ChangeRun.
+
+    Structural, because "exactly one terminal state per breaking change" is only
+    guaranteed by the context manager. If the loop body is ever unwrapped, or a
+    `return` is added outside the `with`, the guarantee silently disappears and the
+    Autonomous Resolution Rate loses its denominator without anything erroring.
+    """
+    problems = []
+    try:
+        tree = ast.parse(open(path).read())
+    except SyntaxError as exc:
+        return [f"{os.path.basename(path)} does not parse ({exc})"]
+
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == PIPELINE_FN), None)
+    if fn is None:
+        return [f"{PIPELINE_FN} is gone -- this check no longer checks anything"]
+
+    loops = [n for n in ast.walk(fn)
+             if isinstance(n, ast.For) and ast.unparse(n.iter) == "breaking_changes"]
+    if not loops:
+        return ["no `for change in breaking_changes` loop found -- if it was "
+                "renamed, update this check rather than deleting it"]
+
+    for loop in loops:
+        first = loop.body[0]
+        wrapped = (isinstance(first, ast.With)
+                   and any("ChangeRun" in ast.unparse(i.context_expr)
+                           for i in first.items))
+        if not wrapped:
+            problems.append(
+                f"the breaking-change loop at line {loop.lineno} is NOT wrapped in "
+                f"ChangeRun, so a change can be processed without emitting a "
+                f"terminal state")
+            continue
+        # Every statement of the loop body must be inside the with -- a statement
+        # after it runs without the guarantee.
+        if len(loop.body) != 1:
+            extra = [type(s).__name__ for s in loop.body[1:]]
+            problems.append(
+                f"the breaking-change loop has {len(loop.body) - 1} statement(s) "
+                f"OUTSIDE the ChangeRun block ({', '.join(extra)}) -- those run "
+                f"without a terminal state")
+    return problems
+
+
 def main(argv: list) -> int:
     graph = _call_graph()
     entries = _entry_points(graph)
@@ -238,6 +350,8 @@ def main(argv: list) -> int:
         via = ", ".join(PR_CREATORS[c] for c in creators) or "?"
         if missing:
             ungoverned.append(fn)
+            if fn in DISABLED:
+                continue        # reported separately by _check_disabled()
             mark = "EXEMPT " if fn in EXEMPT else "FAIL   "
             print(f"  {mark}{fn:22} via {via}")
             for k in missing:
@@ -259,10 +373,20 @@ def main(argv: list) -> int:
                 f"point. Remove the exemption -- it is now claiming a gap that "
                 f"does not exist.")
 
-    print(f"\n  {len(governed)} governed, {len(ungoverned)} exempt, "
-          f"{len(entries)} total")
+    print("\n  entry points SWITCHED OFF (must stay off):\n")
+    problems.extend(_check_disabled())
+
+    print(f"\n  {len(governed)} governed, {len(DISABLED)} disabled, "
+          f"{len(ungoverned) - len(DISABLED)} exempt, {len(entries)} total")
 
     # Second half: within the governed pipeline, no decision may exit unrecorded.
+    wrapping = _terminal_state_wrapping(os.path.join(ROOT, "app", "webhook.py"))
+    print(f"\n  per-breaking-change terminal state: "
+          f"{'wrapped in ChangeRun' if not wrapping else 'NOT GUARANTEED'}")
+    for w in wrapping:
+        print(f"      FAIL  {w}")
+    problems.extend(wrapping)
+
     unsignalled = _unsignalled_exits(os.path.join(ROOT, "app", "webhook.py"))
     print(f"\n  unsignalled terminal exits in {PIPELINE_FN}: {len(unsignalled)}")
     for u in unsignalled:

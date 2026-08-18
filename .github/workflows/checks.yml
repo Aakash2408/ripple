@@ -93,6 +93,55 @@ jobs:
         # corrected to a number, because there is no single right one.
         run: python tools/audit_public_claims.py
 
+      - name: Codemod coverage (blocking on correctness, not on coverage)
+        # Reports what fraction of automatable references the one AUTO cell can
+        # actually transform. Exits 1 only on CORRECTNESS problems -- an unexpected
+        # edit, a judgment call that got transformed, a missed note -- because those
+        # are bugs. A coverage gap is a task, not a failure, and failing the build on
+        # it would pressure someone into reclassifying a judgment call as an edit,
+        # which is the one outcome that must never happen.
+        run: python tools/audit_codemod_coverage.py
+
+      - name: Negative fix corpus (blocking)
+        # Six fixes that the deleted app/validated_fix.py once called VALID. Each is
+        # replayed against a frozen reproduction of that old logic to prove it really
+        # did pass -- so the corpus cannot be padded with cases that were never a
+        # problem -- and then run through the current stack, which must block it.
+        #
+        # Runs WITHOUT docker on purpose: every case is stopped by the diff contract
+        # or the no-op check, both pure functions over text. The compiler is consulted
+        # only by `--compiler`, and its verdict is reported, never depended on. One
+        # case (a half-fix that keeps a function parameter) compiles cleanly, so a
+        # gate that leaned on tsc would let it through.
+        run: python tools/audit_negative_corpus.py
+
+      - name: Safety layer reachability (blocking)
+        # A safety layer that production cannot reach is not a safety layer. The diff
+        # contract was reported as "wired into the pipeline" while being imported only
+        # by tests/ and tools/ -- built, tested, CI-gated, unreachable, which is the
+        # defect class this repo keeps rediscovering, now at the level of the safety
+        # layers themselves.
+        #
+        # Fails in BOTH directions. A declared-reachable layer going unreachable is a
+        # regression. A declared-unreachable layer BECOMING reachable also fails, on
+        # purpose: the negative corpus and the coverage audit both make claims that
+        # change meaning the moment a layer starts running in the request path, so
+        # that must not land silently.
+        run: python tools/audit_safety_reachability.py
+
+      - name: Frozen surface (blocking)
+        # The 30-day push has one objective: ONE real breaking change becoming one
+        # validated, mergeable PR. Ripple already detects across 10 contract types
+        # and 15 languages and has PROVEN zero fix-generating cells -- breadth is
+        # not the gap. So 7 unreachable modules (2,293 lines, 861 statements) are
+        # frozen: they may shrink, be documented, or be deleted; they may not grow
+        # and may not be wired up.
+        #
+        # Measured by AST statement count, not lines, so documenting the freeze
+        # does not fail the build while adding behaviour does. A freeze nobody
+        # enforces lasts about four days.
+        run: python tools/audit_frozen_surface.py
+
       - name: Pipeline governance (blocking)
         # Stage 7 found that pr_level was reachable from ONE of five PR-creating
         # entry points. gitlab_webhook and bitbucket_webhook each inline ~154 lines

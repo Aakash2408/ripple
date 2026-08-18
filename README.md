@@ -305,11 +305,30 @@ the capability registry, not by confidence:
 | 🟡 `REVIEW` | A fix was produced but something is unproven. The PR opens, states the reasons, and asks for a human. |
 | 🔴 `BLOCKED` | No PR. |
 
-**Today every PR is `REVIEW`.** Real toolchain validation is not built and
-`E2E_FIXTURES` is empty, so no cell can satisfy `AUTO` — `python tools/audit_capabilities.py`
-reports 0 of 48 fixable cells production-ready. Ripple therefore never claims a fix
-is automatic. `app/routing.py` derives the level by asking
+**Exactly one cell is `AUTO`: `typescript × openapi × remove_field`.** It earned it
+— a syntax-aware transformation that refuses shapes it cannot remove safely,
+`tsc --noEmit` in a container against the generated code, and an end-to-end fixture
+whose named test runs the whole path. `python tools/audit_capabilities.py` reports
+1 of 48 fixable cells production-ready and recomputes that from the code.
+
+The other 1,799 combinations are `REVIEW`. Removing either the validation or the
+end-to-end evidence takes `AUTO` away, which is asserted in the suite.
+
+**Measured against a real repository, the golden path does not complete.**
+`python tools/verify_real_repo.py` clones `billing-api`, finds its one TypeScript
+consumer, removes the two dead interface declarations, and then **refuses** the
+remaining two references: a function parameter (removing it breaks every caller) and
+a shorthand object property. Terminal state `BLOCKED`, with both refusals named by
+line. The cell is production-ready for the shapes it handles; real code contains
+shapes it correctly declines. Widening it is a decision about safety, not a bug fix. `app/routing.py` derives the level by asking
 `app/capability_claims.py`; it keeps no list of its own, and CI fails if it grows one.
+
+**GitHub is the only live surface.** The GitLab and Bitbucket integrations are
+switched off — all 11 of their routes (webhooks, OAuth, setup) return `501` with
+a stated reason, because they bypass the routing decision and the outcome funnel,
+so a breaking change on those paths could terminate in silence. Re-enable with
+`RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS=1`. `/dry-run` and the GitHub App are
+unaffected.
 
 **Scope, stated honestly: safety levels currently apply to the GitHub path only.**
 `pr_level()` is reachable from `github_webhook` and not from the other four
@@ -688,7 +707,7 @@ own hooks path):
 git config core.hooksPath .githooks
 ```
 
-It runs every gate below and **refuses the commit** if any is red — because the
+It runs every gate below, plus the suite a second time with `GITHUB_SHA` set as CI sets it (~55s), and **refuses the commit** if any is red — because the
 recurring mistake was not too many commits, it was committing and then repairing
 the same change in a follow-up commit (`c6b60af`'s message literally names the
 commit it should have been part of). Escape with `git commit --no-verify`.
@@ -697,15 +716,28 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 109 tests
+python tests/test_regression.py            # 122 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
 python tools/audit_fail_silent.py --check  # 42 sites, every one classified
 python tools/audit_pipeline_governance.py  # 1 of 5 entry points governed
+python tools/audit_frozen_surface.py       # 6 frozen modules, 747 statements
+python tools/audit_codemod_coverage.py     # automation 60.0%, implementation 85.7%
+python tools/audit_negative_corpus.py      # 6 historical false VALIDs, all blocked
+python tools/audit_safety_reachability.py  # 1 of 3 safety layers wired to production
+python tools/verify_validation.py          # acceptance, needs docker: not a gate
+python tools/verify_deployed_capability.py # acceptance: can the LIVE image validate?
+python tools/verify_release.py             # acceptance: is prod running the TESTED sha?
 ```
 
-All seven gate CI. The fail-silent gate does not demand zero silent paths — 25 are
+`verify_release.py` reads `tests/.last_run.json`, which the suite writes with the
+revision it ran against. The pre-commit hook runs the suite while changes are staged,
+so that evidence always records `tested_tree_dirty: true` — a dirty tree is not any
+commit and can never legitimately equal a deployed sha. **Release evidence must come
+from a post-commit run:** commit first, re-run the suite, then release.
+
+All eight gate CI. The fail-silent gate does not demand zero silent paths — 25 are
 correct-but-invisible and making them visible is P0.4/P0.5 work. It demands that
 none is *unexplained*: classified in `tools/fail_silent_triage.py`, no `REAL_BUG`
 left standing, and no function that was fixed allowed to go silent again.

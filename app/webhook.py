@@ -79,6 +79,8 @@ from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLAT
 from .confidence import format_pr_body, classify_confidence
 from .routing import pr_level, Decision
 from .build_info import build_info
+from .experimental import experimental_enabled, experimental_disabled
+from .run_outcome import ChangeRun, Terminal
 from .expand_contract import advise as expand_contract_advise, analyze_changes as ec_analyze
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .retry_queue import get_retry_queue, should_retry, should_retry_error
@@ -270,6 +272,47 @@ async def health_storage():
             ),
         },
         "tls": _tls_describe(),
+    }
+
+
+@app.get("/health/capability")
+async def health_capability():
+    """Report whether THIS RUNNING IMAGE can validate a fix at all.
+
+    Why this is not inferable from the repository: the capability registry can
+    honestly derive AUTO=1 from the code, while the deployed image is
+    `python:3.11-slim` with no node, no npm and no docker daemon. In that image
+    `choose_backend()` returns "", `validate()` returns UNABLE_TO_VALIDATE, and
+    UNABLE_TO_VALIDATE is correctly not a pass -- so no cell can reach AUTO in
+    production no matter what the registry says.
+
+    Measured in the actual base image rather than assumed:
+
+        node ABSENT   npm ABSENT   npx ABSENT   docker ABSENT
+        backend ''    verdict UNABLE_TO_VALIDATE
+
+    That is the same defect shape as a matcher that is tested and CI-gated but
+    unreachable from production. The gap was invisible from both sides: the repo
+    saw its own docker, and the deployed service was never asked. Now it says so.
+
+    Deliberately factual. It reports whether the TOOLCHAIN exists -- the necessary
+    condition -- and does not re-implement the registry's rule for which cells earn
+    AUTO, because a second copy of that rule is how two surfaces start disagreeing.
+    """
+    from .validation import describe_backend
+
+    described = describe_backend()
+    return {
+        "healthy": True,
+        "validation": {
+            **described,
+            "hint": None if described["can_validate"] else (
+                "This image has no TypeScript toolchain, so every fix will be "
+                "UNABLE_TO_VALIDATE and no cell can reach AUTO here. Add node to "
+                "the image, or accept that production is REVIEW-only."
+            ),
+        },
+        "build": build_info(),
     }
 
 
@@ -559,6 +602,9 @@ async def bitbucket_webhook(request: FastAPIRequest):
     URL: https://your-server/webhook/bitbucket
     Triggers: Repository Push
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("bitbucket", "webhook")
     body = await request.body()
     payload = json.loads(body)
     
@@ -718,6 +764,9 @@ async def gitlab_webhook(request: FastAPIRequest):
     URL: https://your-server/webhook/gitlab
     Trigger: Push events
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "webhook")
     body = await request.body()
     payload = json.loads(body)
     
@@ -1311,258 +1360,271 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
     wire_only_changes = []
     for change in breaking_changes:
         # Determine contract type from spec file
-        contract_type = _detect_contract_type(spec_path)
-        change_type = _map_change_type(change)
+        # ONE terminal state per breaking change, emitted on every exit path --
+        # return, break, or exception. Before this, an exception mid-consumer-loop
+        # produced a logged error and no statement about the change itself.
+        with ChangeRun(change_type=_map_change_type(change),
+                       spec=spec_path, repo=repo) as run:
+            contract_type = _detect_contract_type(spec_path)
+            change_type = _map_change_type(change)
 
-        # A changed proto field number / thrift field id breaks the WIRE
-        # contract, not the source contract. No consumer edit can fix it, so
-        # searching every repo for consumers would burn hundreds of API calls
-        # to reach a guaranteed no-op. Report it and move on -- reporting
-        # matters because old and new peers silently misinterpret the field.
-        if is_wire_only(change.change_type):
-            wire_only_changes.append(change.field_name)
-            _log_activity("wire_only_change", {
-                "spec": spec_path,
+            # A changed proto field number / thrift field id breaks the WIRE
+            # contract, not the source contract. No consumer edit can fix it, so
+            # searching every repo for consumers would burn hundreds of API calls
+            # to reach a guaranteed no-op. Report it and move on -- reporting
+            # matters because old and new peers silently misinterpret the field.
+            if is_wire_only(change.change_type):
+                wire_only_changes.append(change.field_name)
+                run.requires_no_change()
+                _log_activity("wire_only_change", {
+                    "spec": spec_path,
+                    "field": change.field_name,
+                    "change_type": change.change_type,
+                    "action": "no source fix exists -- consumers not searched",
+                    "impact": "old/new peers misinterpret this field; restore the "
+                              "original number or redeploy producers and consumers together",
+                })
+                continue
+
+            # --- ENSEMBLE CONSUMER FINDING ---
+            # Step 1: Grep-based search across repos.
+            # Searched ONCE and cached -- this used to run twice (once here,
+            # once in the fix loop below), doubling GitHub API calls.
+            consumer_files_by_repo = {}
+            grep_results = []
+            # Shared API-call budget for this change. The tree fallback costs one
+            # call per candidate file, so without a ceiling a wide installation
+            # scope issues hundreds of rapid requests and GitHub drops the
+            # connection mid-run.
+            tree_budget = {"remaining": int(os.environ.get("RIPPLE_TREE_CALL_BUDGET", "150"))}
+            for consumer_repo in consumer_repos:
+                consumer_files = _search_repo_for_consumers(
+                    consumer_repo, change, token, exclude_path=spec_path, budget=tree_budget
+                )
+                consumer_files_by_repo[consumer_repo] = consumer_files
+                for file_path, content, _detect_conf in consumer_files:
+                    grep_results.append(file_path)
+        
+            _log_activity("consumer_search_complete", {
                 "field": change.field_name,
-                "change_type": change.change_type,
-                "action": "no source fix exists -- consumers not searched",
-                "impact": "old/new peers misinterpret this field; restore the "
-                          "original number or redeploy producers and consumers together",
+                "repos_searched": len(consumer_repos),
+                "files_found": len(grep_results),
+                "files": grep_results[:5],
             })
-            continue
-
-        # --- ENSEMBLE CONSUMER FINDING ---
-        # Step 1: Grep-based search across repos.
-        # Searched ONCE and cached -- this used to run twice (once here,
-        # once in the fix loop below), doubling GitHub API calls.
-        consumer_files_by_repo = {}
-        grep_results = []
-        # Shared API-call budget for this change. The tree fallback costs one
-        # call per candidate file, so without a ceiling a wide installation
-        # scope issues hundreds of rapid requests and GitHub drops the
-        # connection mid-run.
-        tree_budget = {"remaining": int(os.environ.get("RIPPLE_TREE_CALL_BUDGET", "150"))}
-        for consumer_repo in consumer_repos:
-            consumer_files = _search_repo_for_consumers(
-                consumer_repo, change, token, exclude_path=spec_path, budget=tree_budget
+        
+            # Step 2: Ensemble prediction (grep + playbook + history + multi-invoker)
+            ensemble_predictions = ensemble.find_all_consumers(
+                changed_file=spec_path,
+                contract_type=contract_type,
+                change_type=change_type,
+                grep_results=grep_results,
             )
-            consumer_files_by_repo[consumer_repo] = consumer_files
-            for file_path, content, _detect_conf in consumer_files:
-                grep_results.append(file_path)
         
-        _log_activity("consumer_search_complete", {
-            "field": change.field_name,
-            "repos_searched": len(consumer_repos),
-            "files_found": len(grep_results),
-            "files": grep_results[:5],
-        })
+            # Step 3: Custom playbook predictions
+            custom_predictions = config.get_predictions_for_change(spec_path, change_type)
+            for cp in custom_predictions:
+                ensemble_stats["custom"] += 1
         
-        # Step 2: Ensemble prediction (grep + playbook + history + multi-invoker)
-        ensemble_predictions = ensemble.find_all_consumers(
-            changed_file=spec_path,
-            contract_type=contract_type,
-            change_type=change_type,
-            grep_results=grep_results,
-        )
+            # Step 4: Multi-invoker warning
+            detector = MultiInvokerDetector(learner=get_learner(org))
+            mi_warning = detector.check(spec_path)
+            if mi_warning and mi_warning.risk_level in ("high", "medium"):
+                warnings.append({
+                    "type": "multi_invoker",
+                    "file": spec_path,
+                    "risk": mi_warning.risk_level,
+                    "message": mi_warning.message,
+                    "consumers": len(mi_warning.invokers),
+                })
         
-        # Step 3: Custom playbook predictions
-        custom_predictions = config.get_predictions_for_change(spec_path, change_type)
-        for cp in custom_predictions:
-            ensemble_stats["custom"] += 1
+            # Track sources for stats
+            for pred in ensemble_predictions:
+                for source in pred.get("sources", []):
+                    if source in ensemble_stats:
+                        ensemble_stats[source] += 1
         
-        # Step 4: Multi-invoker warning
-        detector = MultiInvokerDetector(learner=get_learner(org))
-        mi_warning = detector.check(spec_path)
-        if mi_warning and mi_warning.risk_level in ("high", "medium"):
-            warnings.append({
-                "type": "multi_invoker",
-                "file": spec_path,
-                "risk": mi_warning.risk_level,
-                "message": mi_warning.message,
-                "consumers": len(mi_warning.invokers),
-            })
+            # Step 5: Generate fixes for high-confidence consumers
+            min_confidence = config.min_confidence
+            high_confidence = [
+                p for p in ensemble_predictions
+                if p["confidence"] >= min_confidence and not p["file"].startswith("*")
+            ]
         
-        # Track sources for stats
-        for pred in ensemble_predictions:
-            for source in pred.get("sources", []):
-                if source in ensemble_stats:
-                    ensemble_stats[source] += 1
-        
-        # Step 5: Generate fixes for high-confidence consumers
-        min_confidence = config.min_confidence
-        high_confidence = [
-            p for p in ensemble_predictions
-            if p["confidence"] >= min_confidence and not p["file"].startswith("*")
-        ]
-        
-        for consumer_repo in consumer_repos:
-            consumer_files = consumer_files_by_repo.get(consumer_repo, [])
+            for consumer_repo in consumer_repos:
+                consumer_files = consumer_files_by_repo.get(consumer_repo, [])
             
-            for consumer_file, consumer_content, detector_confidence in consumer_files:
-                # Check ignore patterns
-                if config.should_ignore(consumer_file):
-                    # Previously a bare `continue`. A consumer dropped by the
-                    # CUSTOMER'S OWN .ripple.yaml produced no signal at all, so an
-                    # over-broad glob looked identical to "no consumers found" --
-                    # and parse_ripple_config already falls back to defaults on a
-                    # malformed file without saying so, so their config could both
-                    # fail to load and silently drop work.
-                    _log_activity("consumer_ignored", {
-                        "repo": consumer_repo,
-                        "file": consumer_file,
-                        "reason": "matched an ignore pattern in .ripple.yaml",
-                    })
-                    continue
-
-                # Check PR limit
-                if len(prs_created) >= config.max_prs_per_push:
-                    # Previously a bare `break`. Hitting the cap abandoned every
-                    # remaining consumer with no record, so a partially-propagated
-                    # change was indistinguishable from a fully-propagated one.
-                    _log_activity("pr_cap_reached", {
-                        "repo": consumer_repo,
-                        "cap": config.max_prs_per_push,
-                        "prs_created": len(prs_created),
-                        "stopped_at": consumer_file,
-                        "reason": "max_prs_per_push reached -- remaining consumers "
-                                  "in this repo were not processed",
-                    })
-                    break
-                
-                consumer = ConsumerMatch(
-                    file_path=consumer_file,
-                    line_number=0,
-                    code_snippet="",
-                    confidence="high",
-                    match_reason="Ensemble prediction",
-                    language=_detect_lang(consumer_file),
-                )
-                
-                fixed_code, explanation = _generate_fix_with_rag_fallback(
-                    consumer_content, consumer, change, org
-                )
-                
-                _log_fix_generated(
-                    consumer_repo, consumer_file,
-                    fixed_code != consumer_content,
-                    explanation[:60] if explanation else "",
-                    change_type=change.change_type,
-                    original_code=consumer_content,
-                    fixed_code=fixed_code,
-                    explanation=explanation or "",
-                )
-                
-                if fixed_code != consumer_content:
-                    # Find this file's confidence from ensemble predictions
-                    # Start from the confidence the consumer detector actually
-                    # computed for THIS file (0.95 for a struct-field match,
-                    # 0.70 for a weaker reference). This used to be a hardcoded
-                    # 0.7 because the detector's score was discarded, so every
-                    # PR claimed the same number regardless of match strength.
-                    file_confidence = detector_confidence
-                    # Record how the fix was actually produced, so the PR body
-                    # does not mislabel a deterministic template fix as
-                    # LLM-generated. Order matters: RAG's own fallback chain
-                    # returns "[RAG/template]" when it found no learned
-                    # pattern, and that is a TEMPLATE fix -- checking for
-                    # "[RAG" first would claim learned-pattern provenance for
-                    # a purely deterministic transform.
-                    if "template" in explanation.lower():
-                        fix_source = "template"
-                    elif "[RAG" in explanation:
-                        fix_source = "rag"
-                    else:
-                        fix_source = "llm"
-                    file_sources = ["grep", fix_source]
-                    file_reasons = [
-                        f"Field reference detected in {_detect_lang(consumer_file)} "
-                        f"source (detector confidence {detector_confidence:.2f})"
-                    ]
-                    for pred in ensemble_predictions:
-                        if pred.get("file") == consumer_file or consumer_file.endswith(pred.get("file", "")):
-                            # Ensemble carries co-change history, which is a
-                            # stronger signal than a static match -- prefer it.
-                            file_confidence = max(pred["confidence"], detector_confidence)
-                            file_sources = pred.get("sources", ["grep"]) + [fix_source]
-                            file_reasons = pred.get("reasons", file_reasons)
-                            break
-                    
-                    # THE ROUTING DECISION. Previously this consulted confidence
-                    # and nothing else, so a cell the registry knew had four
-                    # blockers opened a PR titled "Automated Fix" exactly like a
-                    # validated one. The registry could answer that question the
-                    # whole time and nothing asked it.
-                    decision = pr_level(
-                        language=_detect_lang(consumer_file),
-                        contract=contract_type,
-                        change_type=change.change_type,
-                        confidence=file_confidence,
-                        min_confidence=min_confidence,
-                    )
-                    if not decision.opens_pr:
-                        _log_activity("pr_skipped", {
+                for consumer_file, consumer_content, detector_confidence in consumer_files:
+                    # Check ignore patterns
+                    run.consumer_found(consumer_file)
+                    if config.should_ignore(consumer_file):
+                        # Previously a bare `continue`. A consumer dropped by the
+                        # CUSTOMER'S OWN .ripple.yaml produced no signal at all, so an
+                        # over-broad glob looked identical to "no consumers found" --
+                        # and parse_ripple_config already falls back to defaults on a
+                        # malformed file without saying so, so their config could both
+                        # fail to load and silently drop work.
+                        run.refused(consumer_file, "matched an ignore pattern in .ripple.yaml")
+                        _log_activity("consumer_ignored", {
+                            "repo": consumer_repo,
                             "file": consumer_file,
-                            "confidence": file_confidence,
-                            "min_required": min_confidence,
-                            **decision.as_detail(),
+                            "reason": "matched an ignore pattern in .ripple.yaml",
                         })
                         continue
-                    _log_activity("pr_routing", {
-                        "file": consumer_file,
-                        "contract": contract_type,
-                        "change_type": change.change_type,
-                        **decision.as_detail(),
-                    })
 
-                    pr_url = _create_fix_pr(
-                        consumer_repo, consumer_file,
-                        fixed_code, change, repo, token,
-                        confidence=file_confidence,
-                        sources=file_sources,
-                        reasons=file_reasons,
-                        all_predictions=ensemble_predictions[:5],
-                        decision=decision,
+                    # Check PR limit
+                    if len(prs_created) >= config.max_prs_per_push:
+                        # Previously a bare `break`. Hitting the cap abandoned every
+                        # remaining consumer with no record, so a partially-propagated
+                        # change was indistinguishable from a fully-propagated one.
+                        run.refused(consumer_file, f"max_prs_per_push ({config.max_prs_per_push}) reached")
+                        _log_activity("pr_cap_reached", {
+                            "repo": consumer_repo,
+                            "cap": config.max_prs_per_push,
+                            "prs_created": len(prs_created),
+                            "stopped_at": consumer_file,
+                            "reason": "max_prs_per_push reached -- remaining consumers "
+                                      "in this repo were not processed",
+                        })
+                        break
+                
+                    consumer = ConsumerMatch(
+                        file_path=consumer_file,
+                        line_number=0,
+                        code_snippet="",
+                        confidence="high",
+                        match_reason="Ensemble prediction",
+                        language=_detect_lang(consumer_file),
                     )
-                    _log_activity("pr_result", {
-                        "repo": consumer_repo,
-                        "file": consumer_file,
-                        "url": pr_url or "FAILED",
-                    })
-                    if pr_url:
-                        prs_created.append(pr_url)
-                        # Track for lifecycle (pending -> merged -> reverted)
-                        try:
-                            from .pr_lifecycle import (
-                                SourceChange, TrackedFixPR, UpstreamStatus,
-                                track_fix_pr, LABEL_PENDING, LABEL_AUTO_FIX
-                            )
-                            source = SourceChange(
-                                repo=repo,
-                                commit_sha=(after_sha or "")[:12],
-                                pr_number=None,
-                                pr_url=None,
-                                title=f"{change.change_type}: {change.field_name}",
-                                status=UpstreamStatus.PENDING,
-                            )
-                            fix = TrackedFixPR(
-                                repo=consumer_repo,
-                                pr_number=0,  # extracted from URL if needed
-                                pr_url=pr_url,
-                                source=source,
-                                labels=[LABEL_AUTO_FIX, LABEL_PENDING],
-                            )
-                            track_fix_pr(source, fix)
-                        except Exception as e:
-                            # Lifecycle tracking is optional, but it must not
-                            # be INVISIBLE: an undefined `event` reference
-                            # lived in this exact block for weeks, so the
-                            # pending -> merged -> reverted state machine had
-                            # never once run and nothing reported it.
-                            _log_activity("lifecycle_tracking_failed", {
-                                "repo": consumer_repo,
-                                "pr": pr_url,
-                                "err": f"{type(e).__name__}: {str(e)[:160]}",
+                
+                    fixed_code, explanation = _generate_fix_with_rag_fallback(
+                        consumer_content, consumer, change, org
+                    )
+                
+                    _log_fix_generated(
+                        consumer_repo, consumer_file,
+                        fixed_code != consumer_content,
+                        explanation[:60] if explanation else "",
+                        change_type=change.change_type,
+                        original_code=consumer_content,
+                        fixed_code=fixed_code,
+                        explanation=explanation or "",
+                    )
+                
+                    if fixed_code != consumer_content:
+                        # Find this file's confidence from ensemble predictions
+                        # Start from the confidence the consumer detector actually
+                        # computed for THIS file (0.95 for a struct-field match,
+                        # 0.70 for a weaker reference). This used to be a hardcoded
+                        # 0.7 because the detector's score was discarded, so every
+                        # PR claimed the same number regardless of match strength.
+                        file_confidence = detector_confidence
+                        # Record how the fix was actually produced, so the PR body
+                        # does not mislabel a deterministic template fix as
+                        # LLM-generated. Order matters: RAG's own fallback chain
+                        # returns "[RAG/template]" when it found no learned
+                        # pattern, and that is a TEMPLATE fix -- checking for
+                        # "[RAG" first would claim learned-pattern provenance for
+                        # a purely deterministic transform.
+                        if "template" in explanation.lower():
+                            fix_source = "template"
+                        elif "[RAG" in explanation:
+                            fix_source = "rag"
+                        else:
+                            fix_source = "llm"
+                        file_sources = ["grep", fix_source]
+                        file_reasons = [
+                            f"Field reference detected in {_detect_lang(consumer_file)} "
+                            f"source (detector confidence {detector_confidence:.2f})"
+                        ]
+                        for pred in ensemble_predictions:
+                            if pred.get("file") == consumer_file or consumer_file.endswith(pred.get("file", "")):
+                                # Ensemble carries co-change history, which is a
+                                # stronger signal than a static match -- prefer it.
+                                file_confidence = max(pred["confidence"], detector_confidence)
+                                file_sources = pred.get("sources", ["grep"]) + [fix_source]
+                                file_reasons = pred.get("reasons", file_reasons)
+                                break
+                    
+                        # THE ROUTING DECISION. Previously this consulted confidence
+                        # and nothing else, so a cell the registry knew had four
+                        # blockers opened a PR titled "Automated Fix" exactly like a
+                        # validated one. The registry could answer that question the
+                        # whole time and nothing asked it.
+                        decision = pr_level(
+                            language=_detect_lang(consumer_file),
+                            contract=contract_type,
+                            change_type=change.change_type,
+                            confidence=file_confidence,
+                            min_confidence=min_confidence,
+                        )
+                        if not decision.opens_pr:
+                            run.refused(consumer_file, "; ".join(decision.reasons) or "below confidence threshold")
+                            _log_activity("pr_skipped", {
+                                "file": consumer_file,
+                                "confidence": file_confidence,
+                                "min_required": min_confidence,
+                                **decision.as_detail(),
                             })
+                            continue
+                        _log_activity("pr_routing", {
+                            "file": consumer_file,
+                            "contract": contract_type,
+                            "change_type": change.change_type,
+                            **decision.as_detail(),
+                        })
+
+                        pr_url = _create_fix_pr(
+                            consumer_repo, consumer_file,
+                            fixed_code, change, repo, token,
+                            confidence=file_confidence,
+                            sources=file_sources,
+                            reasons=file_reasons,
+                            all_predictions=ensemble_predictions[:5],
+                            decision=decision,
+                        )
+                        _log_activity("pr_result", {
+                            "repo": consumer_repo,
+                            "file": consumer_file,
+                            "url": pr_url or "FAILED",
+                        })
+                        if pr_url:
+                            prs_created.append(pr_url)
+                            # validated=False until Stage 5 exists: an unvalidated fix is a proposal,
+                            # so RESOLVED stays unreachable for the same reason AUTO does.
+                            run.pr_created(pr_url, consumer_file, validated=False)
+                            # Track for lifecycle (pending -> merged -> reverted)
+                            try:
+                                from .pr_lifecycle import (
+                                    SourceChange, TrackedFixPR, UpstreamStatus,
+                                    track_fix_pr, LABEL_PENDING, LABEL_AUTO_FIX
+                                )
+                                source = SourceChange(
+                                    repo=repo,
+                                    commit_sha=(after_sha or "")[:12],
+                                    pr_number=None,
+                                    pr_url=None,
+                                    title=f"{change.change_type}: {change.field_name}",
+                                    status=UpstreamStatus.PENDING,
+                                )
+                                fix = TrackedFixPR(
+                                    repo=consumer_repo,
+                                    pr_number=0,  # extracted from URL if needed
+                                    pr_url=pr_url,
+                                    source=source,
+                                    labels=[LABEL_AUTO_FIX, LABEL_PENDING],
+                                )
+                                track_fix_pr(source, fix)
+                            except Exception as e:
+                                # Lifecycle tracking is optional, but it must not
+                                # be INVISIBLE: an undefined `event` reference
+                                # lived in this exact block for weeks, so the
+                                # pending -> merged -> reverted state machine had
+                                # never once run and nothing reported it.
+                                _log_activity("lifecycle_tracking_failed", {
+                                    "repo": consumer_repo,
+                                    "pr": pr_url,
+                                    "err": f"{type(e).__name__}: {str(e)[:160]}",
+                                })
     
     # Update consumer graph with observations
     graph = get_graph(org)

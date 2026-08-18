@@ -119,25 +119,29 @@ def _remove_field_go(code: str, variants: dict[str, str]) -> str:
 
 
 def _remove_field_typescript(code: str, variants: dict[str, str]) -> str:
-    camel = variants['camel']
-    snake = variants['snake']
-    names = {camel, snake}
-    # Remove interface/type property: fieldName: Type;  or  fieldName?: Type;
-    code = re.sub(rf'^\s*{camel}\??\s*:.*[;,]?\s*$\n?', '', code, flags=re.MULTILINE)
-    # Remove from object literals: fieldName: value,
-    code = re.sub(rf'^\s*{camel}\s*:.*,?\s*$\n?', '', code, flags=re.MULTILINE)
-    # Remove destructuring: { ..., fieldName, ... } -> remove fieldName
-    for n in names:
-        code = re.sub(rf'\b{n}\s*,\s*', '', code)
-        code = re.sub(rf',\s*{n}\b', '', code)
-        code = re.sub(rf'\{{\s*{n}\s*\}}', '{}', code)
-    # Remove .fieldName access (entire line if standalone assignment/call)
-    for n in names:
-        code = re.sub(rf'^\s*\S*\.{n}\b.*$\n?', '', code, flags=re.MULTILINE)
-    # Remove function param
-    for n in names:
-        code = re.sub(rf'\b{n}\s*(\?\s*)?:\s*\w+\s*,?\s*', '', code)
-    return code
+    """Delegates to app/ts_codemod.py, which is syntax-aware and REFUSES shapes it
+    cannot remove safely.
+
+    The regex version measured against the golden fixture produced
+    `phone: user.};` -- unparseable -- because `\\b{field}\\s*,\\s*` stripped
+    `phoneNumber,` as the tail of a member expression, and it left a
+    template-literal interpolation untouched because its access pattern only
+    matched a line whose first token was the access.
+
+    Returns the code unchanged when the codemod refuses, which apply_fix_template
+    turns into a truthful "could not remove" explanation and Stage 3's outcome
+    derivation turns into BLOCKED with a reason.
+    """
+    from .ts_codemod import remove_field as _codemod
+    result = _codemod(code, variants['camel'])
+    # Stash the reasons so apply_fix_template can put them in the explanation, and
+    # from there into the PR body. A refusal or a stale comment that nobody is told
+    # about is the silence this whole effort exists to remove -- and the handler
+    # signature returns only code, so there is nowhere else to carry it.
+    _LAST_TS_RESULT.clear()
+    _LAST_TS_RESULT.update(refusals=result.refusals, notes=result.notes,
+                           edits=[e["shape"] for e in result.edits])
+    return result.code
 
 
 def _remove_field_python(code: str, variants: dict[str, str]) -> str:
@@ -227,6 +231,13 @@ def _remove_field_csharp(code: str, variants: dict[str, str]) -> str:
     # Remove this.field = param
     code = re.sub(rf'^\s*(this\.)?{pascal}\s*=.*$\n?', '', code, flags=re.MULTILINE)
     return code
+
+
+#: Reasons from the most recent TypeScript codemod run. Not elegant -- the handler
+#: contract is (code, variants) -> str, so there is no return channel for them --
+#: but losing them is worse: a PR that removes two references and silently declines
+#: a third tells the reviewer nothing about the third.
+_LAST_TS_RESULT: dict = {}
 
 
 REMOVE_HANDLERS: dict[str, Callable[[str, dict[str, str]], str]] = {
@@ -858,11 +869,26 @@ def apply_fix_template(
             result = handler(code, variants)
         result = _postprocess(result)
         lines_removed = len(code.split('\n')) - len(result.split('\n'))
-        explanation = (
-            f"Removed all references to field '{field_name}' ({lines_removed} lines affected). "
-            f"Cleaned: struct/class declarations, accessor methods, function params, object literals, "
-            f"and direct field access patterns for {lang}."
-        )
+        if result == code:
+            # "Removed all references ... (0 lines affected)" was a false claim in a
+            # user-facing string, and it read identically whether the handler had
+            # done nothing or corrupted the file. Say what happened instead.
+            explanation = (
+                f"Could NOT remove references to field '{field_name}' in {lang}: no "
+                f"reference matched a shape this transformation can remove safely. "
+                f"The code is unchanged."
+            )
+        else:
+            explanation = (
+                f"Removed references to field '{field_name}' ({lines_removed} lines affected). "
+                f"Cleaned: struct/class declarations, accessor methods, function params, object literals, "
+                f"and direct field access patterns for {lang}."
+            )
+        if lang == "typescript" and _LAST_TS_RESULT:
+            for note in _LAST_TS_RESULT.get("notes", []):
+                explanation += f"\nNOTE: {note}"
+            for refusal in _LAST_TS_RESULT.get("refusals", []):
+                explanation += f"\nNEEDS A HUMAN: {refusal}"
         return result, explanation
 
     elif op == 'rename_field':

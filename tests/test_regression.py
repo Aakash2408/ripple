@@ -20,7 +20,9 @@ Run:  python3.12 -m pytest tests/test_regression.py -q
   or: python3.12 tests/test_regression.py     (no pytest needed)
 """
 
+import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1665,9 +1667,40 @@ def _main() -> int:
         import json as _json
         import time as _t
         _here = _os_path.dirname(_os_path.abspath(__file__))
+
+        # WHICH REVISION THIS RESULT IS ABOUT.
+        #
+        # "122/122 passed" is not evidence about a deployment unless it names the
+        # code it ran. tools/verify_release.py refuses to pass unless the DEPLOYED
+        # sha equals the sha recorded here, which is the whole point: Ripple modifies
+        # other people's code, so which commit produced a PR cannot be a guess.
+        #
+        # `dirty` is recorded rather than hidden. A dirty tree means the tested code
+        # is not any commit, so it can never legitimately match a deployed sha, and
+        # the release gate treats that as a refusal rather than a mismatch.
+        _sha, _dirty = "", None
+        try:
+            import subprocess as _sp
+            _repo = _os_path.dirname(_here)
+            _r = _sp.run(["git", "-C", _repo, "rev-parse", "HEAD"],
+                         capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0:
+                _sha = _r.stdout.strip()
+            _d = _sp.run(["git", "-C", _repo, "status", "--porcelain"],
+                         capture_output=True, text=True, timeout=10)
+            if _d.returncode == 0:
+                _dirty = bool(_d.stdout.strip())
+        except Exception:
+            # Bookkeeping must never fail the suite. sha stays "" and dirty stays
+            # None, which the release gate reads as "unknown" and REFUSES -- it does
+            # not read a missing sha as a match.
+            pass
+
         with open(_os_path.join(_here, ".last_run.json"), "w") as fh:
             _json.dump({
                 "ran_at": _t.time(),
+                "tested_sha": _sha or None,
+                "tested_tree_dirty": _dirty,
                 "total": len(tests),
                 "passed": sorted(n for n, _ in tests
                                  if n not in {f for f, _ in failed}),
@@ -2502,16 +2535,27 @@ def test_production_readiness_cannot_be_declared():
     assert not offenders, (
         f"production must be COMPUTED, not declared: {offenders}")
 
-    # Today: nothing FIXABLE is production-ready, and the blocker is validation.
-    # wire_only and non_breaking ARE ready on detection alone -- changing code
-    # would be wrong for them, so requiring a transformation would demand
-    # something the category forbids.
+    # Stage 5 changed this. `validate_ok` is no longer 0: TypeScript has a real
+    # container-backed runner, so 63 cells now validate. But `e2e_ok` is still 0,
+    # so no FIXABLE cell is production-ready -- the blocker moved from two facts to
+    # one rather than disappearing.
+    #
+    # This assertion deliberately does NOT hardcode 63. Pinning the number would
+    # make adding a second language's validator a test failure, which punishes
+    # progress; what must hold is that validation is real AND that real validation
+    # alone does not confer readiness.
     s = cc.summary()
-    assert s["validate_ok"] == 0 and s["e2e_ok"] == 0
+    assert s["validate_ok"] > 0, \
+        "TypeScript validation is wired -- if this is 0 again, is_wired stopped resolving"
+    assert s["e2e_ok"] > 0, \
+        "Stage 6 registered one end-to-end fixture; if this is 0 the evidence was lost"
     fixable = [r for r in cc.claim_matrix()
                if "generate_fix" in cc.required_facts(r["operation"])]
-    assert not any(r["production"] for r in fixable), (
-        "a fixable cell claims production with 0 validated and 0 e2e-tested")
+    ready = [(r["language"], r["contract"], r["operation"])
+             for r in fixable if r["production"]]
+    # EXACTLY one. Not zero (the mechanism must be able to say yes) and not many
+    # (breadth without proof is the thing being refused).
+    assert ready == [("typescript", "openapi", "remove_field")], ready
     wire = [r for r in cc.claim_matrix()
             if cc.required_facts(r["operation"]) == ("detect",)]
     assert wire and all(r["production"] for r in wire), (
@@ -2519,12 +2563,25 @@ def test_production_readiness_cannot_be_declared():
     # Detection and fix generation are NOT the blockers -- both are mostly true.
     assert s["generate_fix_ok"] > s["cells"] // 2, s["generate_fix_ok"]
 
-    # The verdict must respond to its inputs: a cell that fails ONLY on
-    # validation + e2e becomes ready when both are satisfied.
+    # The verdict must respond to its inputs. Before Stage 5 this cell was blocked
+    # on TWO facts; TypeScript validation is now real, so exactly one remains. That
+    # the count MOVED is the point -- a predicate whose output never changes when a
+    # fact changes is not computing anything.
+    # Stage 6: this cell now has BOTH facts, so there are no blocking reasons left.
+    # That the list went 2 -> 1 -> 0 as each fact landed is how you can tell the
+    # predicate computes over inputs rather than reciting a constant.
     reasons = cc.blocking_reasons("typescript", "openapi", "remove_field")
-    assert len(reasons) == 2, reasons
-    assert any("UNABLE_TO_VALIDATE" in r for r in reasons)
-    assert any("end-to-end" in r for r in reasons)
+    assert reasons == [], reasons
+
+    # A sibling cell differing in ONE dimension must still be blocked, otherwise
+    # readiness leaked across the matrix.
+    assert cc.blocking_reasons("typescript", "proto", "remove_field")
+    assert cc.blocking_reasons("python", "openapi", "remove_field")
+    assert cc.blocking_reasons("typescript", "openapi", "rename_field")
+
+    # And a language WITHOUT a runner still reports both.
+    unwired = cc.blocking_reasons("go", "openapi", "remove_field")
+    assert any("UNABLE_TO_VALIDATE" in r for r in unwired), unwired
 
 
 def test_every_e2e_claim_names_the_test_that_proves_it():
@@ -2547,7 +2604,14 @@ def test_every_e2e_claim_names_the_test_that_proves_it():
         assert callable(getattr(self_mod, test_name))
 
     # And an unclaimed cell must not read as tested.
-    assert not e2e_tested("typescript", "openapi", "remove_field")
+    # Stage 6: this cell IS now claimed, and the invariant above proves the named
+    # test exists and is callable. What must still hold is that a cell WITHOUT a
+    # fixture is not silently credited.
+    assert e2e_tested("typescript", "openapi", "remove_field")
+    assert E2E_FIXTURES[("typescript", "openapi", "remove_field")] == \
+        "test_e2e_typescript_openapi_remove_field"
+    assert not e2e_tested("python", "openapi", "remove_field")
+    assert not e2e_tested("typescript", "proto", "remove_field")
 
 
 def test_cli_and_production_discover_the_same_consumers():
@@ -2944,23 +3008,35 @@ def test_governance_scope_is_exactly_what_was_verified():
                 if not [k for k in G.REQUIRED if k not in G._reachable(graph, e)]]
     assert governed == ["app/webhook.py:github_webhook"], governed
 
-    # Every ungoverned entry point is named with a reason, and every named
-    # exemption is still real.
+    # Every ungoverned entry point is either SWITCHED OFF or a named exemption,
+    # and every named exemption is still real. The three-way split replaced a
+    # two-way one in Stage 2: gitlab/bitbucket moved from "tolerated gap" to
+    # "actively closed", which is a stronger claim and a different assertion.
     ungoverned = sorted(set(entries) - set(governed))
-    assert ungoverned == sorted(G.EXEMPT), (ungoverned, sorted(G.EXEMPT))
-    for fn, reason in G.EXEMPT.items():
+    accounted = sorted(set(G.EXEMPT) | set(G.DISABLED))
+    assert ungoverned == accounted, (ungoverned, accounted)
+    assert not (set(G.EXEMPT) & set(G.DISABLED)), "an entry cannot be both"
+    for fn, reason in {**G.EXEMPT, **G.DISABLED}.items():
         assert len(reason) > 40, fn
+
+    # A disabled route must guard BEFORE it can open a PR, not merely contain a
+    # guard somewhere.
+    for entry in G.DISABLED:
+        guard, pr_call = G._guard_position(entry)
+        assert guard is not None, f"{entry} has no guard"
+        assert pr_call is None or guard < pr_call, (entry, guard, pr_call)
 
     # The gate is green on the real tree, and is not vacuous.
     assert G.main([]) == 0
-    G.EXEMPT.pop("app/webhook.py:gitlab_webhook")
+    G.EXEMPT.pop("app/cli.py:main")
     try:
         assert G.main([]) == 1, "an unlisted ungoverned entry point must fail"
     finally:
-        G.EXEMPT["app/webhook.py:gitlab_webhook"] = (
-            "154 lines of pipeline inlined in the route handler: its own engine "
-            "dispatch, its own fix generation, its own MR creation. A breaking "
-            "change on GitLab can still produce silence.")
+        G.EXEMPT["app/cli.py:main"] = (
+            "app/cli.py calls pr_engine.create_prs, which has its OWN "
+            "_format_pr_body and no routing decision. The CLI states no safety "
+            "level. Left live because it is developer-invoked and opens nothing "
+            "without an explicit command.")
     assert G.main([]) == 0
 
 
@@ -2999,10 +3075,25 @@ def test_running_revision_is_reported_or_explicitly_unknown():
         del os.environ["RAILWAY_GIT_BRANCH"]
 
     # 2. Local checkout: reported, but tagged as the working tree, and flagged
-    #    dirty when it is -- a dirty tree does not correspond to any commit.
-    importlib.reload(bi)
-    info = bi.build_info()
-    assert info["source"].startswith("git:working-tree"), info
+    #    dirty when it is -- a dirty tree corresponds to no commit at all.
+    #
+    #    The env keys MUST be cleared first. The first version of this assertion
+    #    did not, and it passed locally and failed in CI: GitHub Actions always
+    #    sets GITHUB_SHA, which is in _ENV_KEYS, so _from_env() correctly won and
+    #    reported "env:GITHUB_SHA". The code was right; the test had assumed an
+    #    environment rather than establishing one. A test that only holds on one
+    #    machine is the same defect as a gate that cannot run.
+    saved = {k: os.environ.pop(k, None) for k in bi._ENV_KEYS}
+    try:
+        importlib.reload(bi)
+        info = bi.build_info()
+        assert info["source"].startswith("git:working-tree"), info
+        assert info["sha"], info
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+        importlib.reload(bi)
 
     # 3. THE CASE THAT MATTERS: nothing to go on. Must refuse, not guess.
     real_run = bi.subprocess.run
@@ -3011,9 +3102,8 @@ def test_running_revision_is_reported_or_explicitly_unknown():
         raise OSError("no git here")
 
     bi.subprocess.run = no_git
+    saved3 = {k: os.environ.pop(k, None) for k in bi._ENV_KEYS}
     try:
-        for key in bi._ENV_KEYS:
-            os.environ.pop(key, None)
         importlib.reload(bi)
         bi.subprocess.run = no_git          # reload restored the real one
         resolved = bi._resolve()
@@ -3023,7 +3113,14 @@ def test_running_revision_is_reported_or_explicitly_unknown():
         # No plausible-looking fallback anywhere in the payload.
         assert "0.1.0" not in json.dumps(resolved)
     finally:
+        # Restore BOTH the patched call and the environment. The first version
+        # popped the env keys and never put them back, so under CI (where
+        # GITHUB_SHA is set) this test silently changed the environment for every
+        # test that ran after it.
         bi.subprocess.run = real_run
+        for k, v in saved3.items():
+            if v is not None:
+                os.environ[k] = v
         importlib.reload(bi)
 
     # 4. Both surfaces render the SAME function's output -- a second assembly is
@@ -3034,6 +3131,938 @@ def test_running_revision_is_reported_or_explicitly_unknown():
     health_body = asyncio.run(webhook.health())
     assert root_body["build"] == health_body["build"], (root_body, health_body)
     assert set(root_body["build"]) == set(webhook.build_info())
+
+
+def test_experimental_platforms_are_off_across_the_whole_surface():
+    """All ELEVEN gitlab/bitbucket routes are switched off, not just the webhooks.
+
+    Disabling only /webhook/gitlab and /webhook/bitbucket would have introduced a
+    NEW silent failure: a user could still complete /auth/gitlab, see
+    /auth/gitlab/status report a connection, register via /setup/gitlab/register --
+    and then nothing would ever happen, with nothing saying why. A half-disabled
+    platform is worse than a live one, because the product appears to work.
+
+    The governance audit covers the two webhooks (they can open PRs). The other
+    nine are pinned here, because nothing else would notice their guard being
+    removed.
+    """
+    import ast
+    import importlib
+
+    GUARDED = {
+        "app/webhook.py": ["gitlab_webhook", "bitbucket_webhook"],
+        "app/gitlab_oauth.py": ["gitlab_auth_start", "gitlab_auth_callback",
+                                "gitlab_auth_status"],
+        "app/bitbucket_oauth.py": ["bitbucket_auth_start", "bitbucket_auth_callback",
+                                   "bitbucket_auth_status"],
+        "app/gitlab_setup.py": ["gitlab_setup_page", "register_gitlab_token",
+                                "list_registered_projects"],
+    }
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    checked = 0
+    for rel, funcs in GUARDED.items():
+        tree = ast.parse(open(os.path.join(root, rel)).read())
+        found = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for name in funcs:
+            assert name in found, f"{rel}: {name} is gone -- was the route renamed?"
+            calls = [c for c in ast.walk(found[name]) if isinstance(c, ast.Call)]
+            guards = [c for c in calls
+                      if (c.func.id if isinstance(c.func, ast.Name)
+                          else getattr(c.func, "attr", "")) == "experimental_disabled"]
+            assert guards, f"{rel}:{name} has no experimental_disabled() guard"
+            checked += 1
+    assert checked == 11, checked
+
+    # Default is OFF, and turning it on must be explicit -- a flag defaulting to ON
+    # that someone must remember to clear is how a temporary decision becomes
+    # permanent.
+    from app import experimental
+    saved = os.environ.pop("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", None)
+    try:
+        importlib.reload(experimental)
+        assert experimental.experimental_enabled() is False
+        os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = "1"
+        assert experimental.experimental_enabled() is True
+        os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = "true"   # only "1" counts
+        assert experimental.experimental_enabled() is False
+    finally:
+        os.environ.pop("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", None)
+        if saved is not None:
+            os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = saved
+        importlib.reload(experimental)
+
+    # The refusal STATES a reason and how to reverse it -- 501 with an empty body
+    # would be the same silence in a different costume.
+    resp = experimental.experimental_disabled("gitlab", "webhook")
+    assert resp.status_code == 501, resp.status_code
+    body = json.loads(resp.body)
+    assert body["error"] == "platform_disabled"
+    assert body["platform"] == "gitlab"
+    assert "RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS" in body["to_re_enable"]
+    assert "silence" in body["reason"]
+    assert "/dry-run" in body["what_still_works"]
+
+
+def test_every_breaking_change_ends_in_exactly_one_terminal_state():
+    """One breaking change in, exactly ONE terminal state out.
+
+    app/outcomes.py records EVENT-level outcomes and several fire per change -- one
+    per consumer file. Useful for tracing, useless for counting: you cannot compute
+    "what happened to this change?" from a stream where the same change produced
+    FIX_GENERATED four times and BLOCKED twice. Without a single answer per change,
+    the Autonomous Resolution Rate has no denominator.
+
+    Emission is structural, not remembered: ChangeRun is a context manager, so the
+    state is emitted on return, break, AND exception. Before this, an exception
+    mid-consumer-loop produced a logged process_spec_error and no statement about
+    the change itself.
+
+    Six states, not the five specified. NO_CHANGE_REQUIRED is separate because a
+    wire_only change (a proto field number changed) requires no source edit at all.
+    BLOCKED would report a correct refusal as a failure -- the mistake the registry
+    made when it demanded a transformation from wire_only ops. RESOLVED would be
+    worse: it would inflate the resolution rate with changes where Ripple did
+    nothing, and that number is meant to be the one the company is built on.
+    """
+    from app import activity
+    from app.run_outcome import (ChangeRun, Terminal, COUNTS_AS_RESOLVED,
+                                 EXCLUDED_FROM_RATE)
+
+    def terminal_of(body):
+        before = len([e for e in activity.recent(500)
+                      if e.get("action") == "change_terminal"])
+        try:
+            with ChangeRun(change_type="remove_field", spec="api/user.yaml",
+                           repo="acme/api") as run:
+                body(run)
+        except RuntimeError:
+            pass
+        events = [e for e in activity.recent(500)
+                  if e.get("action") == "change_terminal"]
+        assert len(events) - before == 1, \
+            f"expected exactly 1 terminal state, got {len(events) - before}"
+        return events[-1]["terminal"]
+
+    def raises(run):
+        run.consumer_found("checkout.ts")
+        raise RuntimeError("engine exploded")
+
+    def early(run):
+        run.consumer_found("checkout.ts")
+        return                                    # an early return still emits
+
+    cases = [
+        (lambda r: None, Terminal.NO_CONSUMER),
+        (lambda r: r.refused("checkout.ts", "no typescript handler for this op"),
+         Terminal.BLOCKED),
+        (lambda r: r.pr_created("https://pr/1", "checkout.ts"), Terminal.PARTIAL),
+        (lambda r: r.pr_created("https://pr/1", "checkout.ts", validated=True),
+         Terminal.RESOLVED),
+        (lambda r: (r.pr_created("https://pr/1", "a.ts", validated=True),
+                    r.refused("b.ts", "no handler for this language")),
+         Terminal.PARTIAL),
+        (lambda r: r.requires_no_change(), Terminal.NO_CHANGE_REQUIRED),
+        (raises, Terminal.FAILED),
+        (early, Terminal.BLOCKED),
+    ]
+    for body, expected in cases:
+        assert terminal_of(body) == expected.value, expected
+
+    # A refusal without a reason is the silence this exists to remove.
+    try:
+        ChangeRun("x", "y", "z").refused("a.ts", "")
+        raise AssertionError("an unexplained refusal was accepted")
+    except ValueError:
+        pass
+
+    # No caller may assert a state -- there is no setter, and terminal() is derived.
+    assert not hasattr(ChangeRun("x", "y", "z"), "set_terminal")
+
+    # RESOLVED is unreachable while nothing validates, exactly as AUTO is.
+    unvalidated = ChangeRun("x", "y", "z")
+    unvalidated.pr_created("https://pr/1", "a.ts")          # validated defaults False
+    assert unvalidated.terminal() is Terminal.PARTIAL
+
+    # ARR accounting: wire_only is excluded from the rate rather than counted as a win.
+    assert Terminal.RESOLVED in COUNTS_AS_RESOLVED
+    assert Terminal.NO_CHANGE_REQUIRED in EXCLUDED_FROM_RATE
+    assert Terminal.NO_CHANGE_REQUIRED not in COUNTS_AS_RESOLVED
+
+    # And the loop is still wrapped -- checked with the same helper the CI gate uses,
+    # so the test and the gate cannot disagree about what "wrapped" means.
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    from audit_pipeline_governance import _terminal_state_wrapping
+    webhook_py = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "webhook.py")
+    assert _terminal_state_wrapping(webhook_py) == []
+
+
+def test_golden_fixture_is_broken_satisfiable_and_claims_nothing_yet():
+    """The golden fixture must FAIL to compile, be fixable, and claim nothing.
+
+    A fixture that compiles in its broken state proves nothing. This one does not:
+    `src/types.ts` is already regenerated from the after-spec, so every remaining
+    reference to `phoneNumber` is a type error -- verified with a real `tsc`, 2
+    errors, exit 2, and exit 0 after a correct two-edit fix.
+
+    Three things this test enforces, none of which need node to check:
+
+    1. The declared contract exists and is internally consistent.
+    2. The MEASURED baseline is recorded rather than glossed. Ripple's TypeScript
+       remove_field handler is currently a no-op on this fixture while reporting
+       "Removed all references to field 'phoneNumber' (0 lines affected)" -- a
+       false claim in a user-facing string. That is written down in expected.json
+       so Stage 6 cannot quietly assume the transformation works.
+    3. The claim now EXISTS and is earned: test_e2e_typescript_openapi_remove_field
+       runs the whole path against a real compiler, so the registry cites a test
+       rather than a boolean. A fixture existing was never evidence; a fixture a
+       named test satisfies is.
+    """
+    import json as _json
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "typescript-openapi", "remove-field")
+    spec = _json.load(open(os.path.join(base, "expected.json")))
+
+    # 1. the contract is coherent
+    assert spec["cell"] == {"language": "typescript", "contract": "openapi",
+                            "operation": "remove_field"}
+    assert spec["change"]["field"] == "phoneNumber"
+    assert spec["expect"]["typecheck_before_fix"] == "FAIL"
+    assert spec["expect"]["typecheck_after_fix"] == "PASS"
+    assert spec["expect"]["consumers_found"] == ["src/checkout.ts"]
+    assert spec["expect"]["pr_files"] == ["src/checkout.ts"]
+    for t in spec["expect"]["transformation"]:
+        assert t["mechanical"] is True and t["why"], t
+
+    # every file the contract mentions actually exists
+    for rel in (spec["change"]["spec_before"], spec["change"]["spec_after"]):
+        assert os.path.exists(os.path.join(base, rel)), rel
+    for rel in spec["expect"]["consumers_found"] + spec["expect"]["untouched"]:
+        assert os.path.exists(os.path.join(base, "consumer", rel)), rel
+
+    # the removed field is gone from the after-spec and the regenerated type, and
+    # still present in the consumer -- which is precisely why it does not compile
+    after = open(os.path.join(base, spec["change"]["spec_after"])).read()
+    types = open(os.path.join(base, "consumer", "src", "types.ts")).read()
+    consumer = open(os.path.join(base, "consumer", "src", "checkout.ts")).read()
+    untouched = open(os.path.join(base, "consumer", "src", "orders.ts")).read()
+    assert "phoneNumber" not in after
+    # Check the DECLARATION, not the word: types.ts documents in its header comment
+    # why the field is absent, and a bare substring test fails on that comment. The
+    # same text-vs-structure mistake as the gate that matched KNOWN_LANGUAGES inside
+    # a docstring.
+    assert not re.search(r"^\s*phoneNumber\??\s*:", types, re.MULTILINE), types
+    assert "phoneNumber" in types, "the header should explain why it is absent"
+    assert consumer.count("user.phoneNumber") == 2
+    assert "phoneNumber" not in untouched     # so "untouched" is falsifiable
+
+    # 2. the measured baseline is recorded, including the false claim
+    m = spec["measured"]
+    assert m["fixture_fails_without_a_fix"] is True
+    assert m["fixture_is_satisfiable"] is True
+    # Stage 6 re-measured: the codemod replaced the regex, so the output now parses
+    # and validates. The Stage 4 record is KEPT under stage_4_baseline because it is
+    # the reason the codemod exists -- deleting it would erase why.
+    assert m["ripple_output_parses"] is True
+    assert m["ripple_typecheck_after"] == "VALID"
+    assert m["production_ready"] is True
+    assert m["evidence_test"] == "test_e2e_typescript_openapi_remove_field"
+    baseline = m["stage_4_baseline"]
+    assert baseline["ripple_output_parses"] is False
+    assert "user.};" in baseline["ripple_diff"]
+    assert baseline["verdict"].startswith("BROKEN FIX")
+
+    # Measured here, not trusted from the file. Stage 6 replaced the regex with
+    # app/ts_codemod.py, so the handler now produces the CORRECT fix -- identical to
+    # the hand-written reference -- and refuses shapes it cannot remove safely.
+    from app.fix_templates import apply_fix_template
+    fixed, explanation = apply_fix_template(
+        code=consumer, language="typescript", change_type="removed_field",
+        field_name="phoneNumber")
+    assert fixed != consumer
+    assert "user.}" not in fixed, "the corrupting substitution is back"
+    assert "${user.phoneNumber}" not in fixed, "the template reference must be gone"
+    assert "phone: user.phoneNumber" not in fixed, "the payload key must be gone"
+    assert "user.email" in fixed and "user.fullName" in fixed, \
+        "unrelated references must survive"
+    assert "Removed references" in explanation
+
+    # And a shape it cannot handle is REFUSED, with the code left alone -- the
+    # explanation must not claim success. "Removed all references ... (0 lines
+    # affected)" was a false claim that read identically to a corruption.
+    judgment = ("const phone = user.phoneNumber;\n"
+                "export const t = phone ? phone : user.email;\n")
+    unchanged, why = apply_fix_template(
+        code=judgment, language="typescript", change_type="removed_field",
+        field_name="phoneNumber")
+    assert unchanged == judgment
+    assert "Could NOT remove" in why, why
+
+    # 3. nothing is claimed yet
+    from app.capability_claims import E2E_FIXTURES, e2e_tested
+    assert e2e_tested("typescript", "openapi", "remove_field"), \
+        "Stage 6 earned this claim; losing it means the evidence was dropped"
+    assert len(E2E_FIXTURES) == 1, \
+        f"one cell has end-to-end evidence, not {len(E2E_FIXTURES)}"
+
+
+def test_validation_never_turns_unknown_into_valid():
+    """Three states, and UNABLE_TO_VALIDATE is not a pass.
+
+    app/validated_fix.py -- deleted in Stage 5 -- got this wrong in the most
+    expensive way available: it ended `else: return True, ''`, and its TypeScript
+    check was brace-matching, so it returned VALID for `phoneNumber: int32` AND for
+    `!!! not rust`. A validator that cannot fail converts "unproven" into "proven".
+
+    Hermetic on purpose: no docker, no network, no node. The real three-case proof
+    lives in tools/verify_validation.py, which is an acceptance check rather than a
+    gate because it needs a container runtime -- and a gate that cannot run is the
+    same defect as a matcher that cannot be reached.
+    """
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.validation import (Verdict, validate, validate_typescript,
+                                choose_backend, RUNNERS)
+
+    # 1. A language with no runner makes no claim.
+    for lang in ("python", "go", "rust", "cobol"):
+        v = validate(lang, "/nonexistent")
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE, lang
+        assert not v.is_valid
+        assert "no validation runner" in v.reason
+
+    # 2. An unrecognised backend REFUSES rather than silently taking the weakest
+    #    path. The first version branched `if docker ... else host`, so any unknown
+    #    string ran with the least isolation -- the same shape as canonical_op()
+    #    returning "" for input it did not recognise.
+    v = validate_typescript(".", backend="bogus-backend")
+    assert v.state is ValidationState.UNABLE_TO_VALIDATE, v.state
+    assert "unknown validation backend" in v.reason
+
+    # 3. A workspace without the project files cannot be typechecked meaningfully.
+    empty = tempfile.mkdtemp()
+    try:
+        v = validate_typescript(empty, backend="host")
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE
+        assert "package.json" in v.reason
+    finally:
+        import shutil as _sh
+        _sh.rmtree(empty, ignore_errors=True)
+
+    # 4. is_valid is True for exactly one state -- no truthiness accidents.
+    for state in ValidationState:
+        verdict = Verdict(state, "x")
+        assert verdict.is_valid is (state is ValidationState.VALID), state
+
+    # 5. The evidence names the backend, so a reader can tell how much isolation
+    #    actually applied. "VALID" without provenance is the claim-without-evidence
+    #    problem the capability registry exists to prevent.
+    detail = Verdict(ValidationState.VALID, "ok",
+                     evidence={"backend": "docker"}).as_detail()
+    assert detail["validation"] == "VALID"
+    assert detail["evidence_backend"] == "docker"
+
+    # 6. `validate` is now a DERIVED fact: the dotted path must resolve to a
+    #    callable. A declared path that does not import is a lie -- exactly what
+    #    app/impact_prediction.py was before it was deleted.
+    from app.capability_claims import VALIDATORS, validates, validation_state
+    ts = VALIDATORS["typescript"]
+    assert ts.implemented_by == "app.validation:validate_typescript"
+    assert ts.is_wired and validates("typescript")
+    assert validation_state("typescript") is ValidationState.VALID
+
+    for unwired in ("python", "go"):
+        assert not VALIDATORS[unwired].is_wired, unwired
+        assert not validates(unwired)
+        assert validation_state(unwired) is ValidationState.UNABLE_TO_VALIDATE
+
+    # A path that does not resolve must NOT count as wired.
+    from app.capability_claims import ValidatorSpec
+    assert not ValidatorSpec("x", "t", implemented_by="app.nope:missing").is_wired
+    assert not ValidatorSpec("x", "t", implemented_by="app.validation:not_a_func").is_wired
+    assert not ValidatorSpec("x", "t", implemented_by="no_colon_here").is_wired
+
+    # 7. The superseded stub is gone, not merely frozen.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert not os.path.exists(os.path.join(root, "app", "validated_fix.py"))
+    assert "typescript" in RUNNERS and len(RUNNERS) == 1, \
+        "only TypeScript has a real runner; adding a key here is a capability claim"
+
+    # 8. choose_backend never invents one.
+    backend, note = choose_backend()
+    assert backend in ("", "docker", "host"), backend
+    assert note
+
+
+def test_e2e_typescript_openapi_remove_field():
+    """THE golden path, end to end, against the real toolchain.
+
+    detect -> canonical op -> fix -> APPLY -> tsc --noEmit -> minimal diff
+
+    This is the test named in E2E_FIXTURES, so it is the evidence that makes
+    typescript x openapi x remove_field production-ready. It must therefore run the
+    real thing: no stubs, no monkeypatching, a real container, a real compiler.
+
+    It SKIPS rather than passes when no validation backend exists. A test that
+    quietly passes without a compiler would be the same defect as validated_fix.py
+    returning True from absence of evidence -- and the capability registry would
+    then be citing a test that proved nothing. Skipping is visible; a false pass is
+    not.
+    """
+    import filecmp
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.change_types import canonical_op, category, MECHANICAL
+    from app.fix_templates import apply_fix_template
+    from app.validation import validate, choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "typescript-openapi", "remove-field")
+    consumer = os.path.join(base, "consumer")
+
+    evidence_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 ".e2e_evidence.json")
+    backend, note = choose_backend()
+    if not backend:
+        # Record NOTHING. tests/.last_run.json counts a skip as "passed", so without
+        # a separate proof file the capability registry would honour this cell's e2e
+        # claim on a runner with no docker -- AUTO fired by a test that did nothing.
+        # That is the absence-of-evidence-as-proof defect, one layer up.
+        print(f"      SKIP: no validation backend ({note}) -- no e2e evidence written")
+        return
+
+    # 1. the operation is mechanical, so a transformation is legitimate at all
+    assert canonical_op("removed_field") == "remove_field"
+    assert category("removed_field") == MECHANICAL
+
+    work_root = tempfile.mkdtemp(prefix="ripple-e2e-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns("node_modules", ".git"))
+        target = os.path.join(work, "src", "checkout.ts")
+
+        # 2. the consumer genuinely does not compile first -- otherwise the rest of
+        #    this test would prove nothing
+        before = validate("typescript", work)
+        assert before.state is ValidationState.INVALID, before.reason
+        assert len(before.errors) == 2, before.errors
+
+        # 3. generate and APPLY the fix (read before write -- the inverted order
+        #    silently produced empty files and two false VALIDs in Stage 5)
+        with open(target) as fh:
+            original = fh.read()
+        fixed, explanation = apply_fix_template(
+            code=original, language="typescript", change_type="removed_field",
+            field_name="phoneNumber")
+        assert fixed != original, "the transformation did nothing"
+        assert "user.}" not in fixed, "the transformation corrupted the file"
+        with open(target, "w") as fh:
+            fh.write(fixed)
+        assert open(target).read() == fixed
+
+        # 4. the real compiler accepts it
+        after = validate("typescript", work)
+        assert after.state is ValidationState.VALID, \
+            f"{after.reason} :: {after.errors[:3]}"
+        assert after.evidence["typecheck_exit"] == 0
+
+        # 5. the diff is MINIMAL -- everything else byte-identical
+        for untouched in ("src/orders.ts", "src/types.ts", "tsconfig.json",
+                          "package.json"):
+            assert filecmp.cmp(os.path.join(consumer, untouched),
+                               os.path.join(work, untouched), shallow=False), \
+                f"{untouched} was modified -- the PR would not be reviewable"
+
+        # 6. Only now, having actually compiled, write the proof. audit_capabilities
+        #    requires this for every E2E_FIXTURES claim, so a skipped run cannot
+        #    stand in for a real one.
+        with open(evidence_path, "w") as fh:
+            json.dump({"ran_at": __import__("time").time(),
+                       "cell": ["typescript", "openapi", "remove_field"],
+                       "backend": after.evidence["backend"],
+                       "typecheck_exit": after.evidence["typecheck_exit"],
+                       "validated": True}, fh, indent=2)
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
+    """AUTO exists now. It must remain impossible to obtain without earning it.
+
+    Before Stage 6 this was easy to guarantee, because AUTO was unreachable for all
+    1800 cells -- nothing validated. Now exactly one cell reaches it, which is the
+    first time the mechanism has had to distinguish rather than simply refuse. That
+    makes this the load-bearing test of the whole plan.
+    """
+    from app import capability_claims as cc
+    from app.capabilities import CONTRACT_ENGINES
+    from app.change_types import CANONICAL_OPS, MECHANICAL
+    from app.routing import pr_level, Level
+    from app import languages
+
+    autos, counts = [], {"AUTO": 0, "REVIEW": 0, "BLOCKED": 0}
+    for lang in sorted(languages.languages()):
+        for contract in sorted(CONTRACT_ENGINES):
+            for op in sorted(CANONICAL_OPS):
+                d = pr_level(lang, contract, op, confidence=0.99, min_confidence=0.5)
+                counts[d.level.value] += 1
+                if d.level is Level.AUTO:
+                    autos.append((lang, contract, op))
+
+    # 1. exactly the golden cell, and nothing else
+    assert autos == [("typescript", "openapi", "remove_field")], autos
+    assert counts["AUTO"] == 1 and counts["REVIEW"] == 1799, counts
+
+    # 2. every AUTO must satisfy the registry AND be mechanical
+    for lang, contract, op in autos:
+        assert cc.production_ready(lang, contract, op), (lang, contract, op)
+        assert not cc.blocking_reasons(lang, contract, op)
+        assert CANONICAL_OPS[op][0] == MECHANICAL, \
+            f"{op} is not mechanical -- a judgment operation must never be AUTO"
+
+    # 3. NO judgment / wire_only / non_breaking operation is AUTO, in any language
+    for lang, contract, op in [(l, c, o) for l in languages.languages()
+                               for c in CONTRACT_ENGINES for o in CANONICAL_OPS
+                               if CANONICAL_OPS[o][0] != MECHANICAL]:
+        assert pr_level(lang, contract, op, 0.99, 0.5).level is not Level.AUTO, \
+            f"{op} ({CANONICAL_OPS[op][0]}) reached AUTO"
+
+    # 4. Removing the e2e evidence must take AUTO away. If it does not, the level is
+    #    decoration rather than a computation over facts.
+    saved = dict(cc.E2E_FIXTURES)
+    cc.E2E_FIXTURES.clear()
+    try:
+        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5)
+        assert d.level is Level.REVIEW, d
+        assert any("end-to-end" in r for r in d.reasons), d.reasons
+    finally:
+        cc.E2E_FIXTURES.update(saved)
+    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5).level is Level.AUTO
+
+    # 5. Same for validation.
+    ts = cc.VALIDATORS["typescript"]
+    cc.VALIDATORS["typescript"] = cc.ValidatorSpec("typescript", ts.toolchain,
+                                                   implemented_by="", note=ts.note)
+    try:
+        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5)
+        assert d.level is Level.REVIEW, d
+        assert any("UNABLE_TO_VALIDATE" in r for r in d.reasons), d.reasons
+    finally:
+        cc.VALIDATORS["typescript"] = ts
+    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5).level is Level.AUTO
+
+    # 6. Confidence still gates independently -- AUTO is not a bypass.
+    low = pr_level("typescript", "openapi", "remove_field", 0.10, 0.5)
+    assert low.level is Level.BLOCKED and not low.opens_pr
+
+    # 7. The PR body for AUTO must SHOW the evidence, not merely assert it.
+    from app.confidence import format_pr_body
+    body = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
+                          decision=pr_level("typescript", "openapi",
+                                            "remove_field", 0.95, 0.5))
+    first = body.split("\n")[0]
+    assert "Automated fix, validation passed" in first, first
+    assert "tsc --noEmit" in body and "byte-compared" in body
+    assert "audit_capabilities" in body, "the claim must point at what recomputes it"
+
+    # and a REVIEW body must never make that claim
+    review = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
+                            decision=pr_level("swift", "proto", "removed_field",
+                                              0.95, 0.5))
+    assert "validation passed" not in review
+    assert "human review required" in review.split("\n")[0]
+
+
+def test_codemod_reports_every_reference_it_cannot_handle():
+    """A reference the codemod cannot see is worse than one it refuses.
+
+    Stage 7 measured the first version against a REAL repository -- the billing-api
+    demo consumer -- and it returned changed=False, edits=0, REFUSALS=0 while the
+    file contained FOUR references: two interface property declarations, a function
+    parameter, and a shorthand object property. Detection searched only for
+    `.field`, so none of those four were member accesses and none were seen.
+
+    "Nothing to do" and "four things I cannot do" are different answers. Reporting
+    the first for the second is the silent-gap defect this project keeps finding, and
+    it is worse here than elsewhere: `complete` would have been False with no reason
+    attached, so the PR body could not say why.
+
+    Detection is now by word boundary. Three shapes are transformed; everything else
+    is named individually with a line number.
+    """
+    from app.ts_codemod import remove_field
+
+    # 1. THE REAL-REPOSITORY SHAPE. Two declarations are removed (a mirror of a
+    #    field that no longer exists upstream is dead), and the parameter and
+    #    shorthand are REFUSED -- removing a parameter breaks every caller, which is
+    #    a change Ripple is not making in this PR.
+    real = (
+        "export interface User {\n"
+        "  id: string;\n"
+        "  phoneNumber: string;\n"
+        "}\n"
+        "export interface CreateUserRequest {\n"
+        "  phoneNumber: string;\n"
+        "}\n"
+        "async function createUser(email: string, phoneNumber: string) {\n"
+        "  const request: CreateUserRequest = { email, phoneNumber };\n"
+        "  return request;\n"
+        "}\n"
+    )
+    r = remove_field(real, "phoneNumber")
+    assert r.changed and not r.complete
+    assert len([e for e in r.edits
+                if e["shape"] == "keyed property (inert value)"]) == 2, r.edits
+    assert len(r.refusals) == 2, r.refusals
+    assert all("line " in x for x in r.refusals), r.refusals
+    assert any("createUser" in x for x in r.refusals)
+    assert any("{ email, phoneNumber }" in x for x in r.refusals)
+
+    # 2. Every refusal carries a REASON, not just a location.
+    for x in r.refusals:
+        assert "human must decide" in x, x
+
+    # 3. A file with no reference at all is not a refusal.
+    clean = remove_field("export const x = 1;\n", "phoneNumber")
+    assert not clean.changed and not clean.refusals
+
+    # 4. A reference in a COMMENT or STRING is a NOTE, not a refusal. Refusing it
+    #    set complete=False, so a stale comment vetoed the whole file -- and nearly
+    #    every real consumer has one, which is why the one real repository tested
+    #    came back BLOCKED. Reported, never edited, never blocking.
+    only_comment = remove_field("// phoneNumber was removed upstream\nexport const y = 2;\n",
+                                "phoneNumber")
+    assert not only_comment.changed
+    assert not only_comment.refusals, "a comment must not block"
+    assert len(only_comment.notes) == 1, only_comment.notes
+
+    only_string = remove_field('console.log("phoneNumber");\n', "phoneNumber")
+    assert not only_string.refusals and len(only_string.notes) == 1
+
+    # An edit ALONGSIDE a comment and a string must still complete -- this is the
+    # case that unblocked real consumers.
+    mixed = remove_field(
+        "// phoneNumber removed upstream\n"
+        "const p = {\n  a: user?.phoneNumber,\n};\n"
+        'console.log("phoneNumber gone");\n', "phoneNumber")
+    assert mixed.complete, (mixed.refusals, mixed.notes)
+    assert len(mixed.edits) == 1 and len(mixed.notes) == 2
+    assert "user?.phoneNumber" not in mixed.code
+    assert "// phoneNumber removed upstream" in mixed.code, "the comment must survive"
+    assert 'console.log("phoneNumber gone")' in mixed.code, "the string must survive"
+
+    # 4b. Optional chaining is a handled shape -- `?.` changes nothing about whether
+    #     the reference is removable, and treating it as unhandled was an oversight.
+    for src in ('const p = {\n  a: user?.phoneNumber,\n};\n',
+                'const s = `${user?.phoneNumber}`;\n'):
+        r_opt = remove_field(src, "phoneNumber")
+        assert r_opt.complete, (src, r_opt.refusals)
+
+    # 5. The golden fixture is UNAFFECTED by the broadened detection -- the two
+    #    mechanical shapes still resolve completely, which is what keeps AUTO earned.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fixture = os.path.join(root, "fixtures", "typescript-openapi", "remove-field",
+                           "consumer", "src", "checkout.ts")
+    g = remove_field(open(fixture).read(), "phoneNumber")
+    assert g.complete and len(g.edits) == 2 and not g.refusals, (g.edits, g.refusals)
+    assert "phoneNumber" not in g.code
+    assert "user.}" not in g.code
+
+
+def test_codemod_coverage_does_not_regress():
+    """Coverage is a number that must not fall, and correctness must not break.
+
+    The coverage audit exits 0 on a coverage gap deliberately -- a gap is a task, and
+    failing the build on it would pressure someone into reclassifying a judgment call
+    as an edit to make the number go up. That is the one outcome that must never
+    happen, so the ratchet lives here instead.
+
+    Measured per REFERENCE, not per case: a file with four references and one bad
+    shape is three automatable references plus one that needs a human, and the ratio
+    is what predicts whether a design partner ever sees an automated fix. The AUTO
+    flag was already true while the one real repository tested came back BLOCKED.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_codemod_coverage as cov
+    from app.ts_codemod import remove_field
+
+    handled = missed = judgment = notes = 0
+    for case_id, src, expected in cov.CORPUS:
+        r = remove_field(src, cov.FIELD)
+        h, m, j, n, problems = cov._classify(r, expected)
+        assert not problems, f"{case_id}: {problems}"
+        handled += h; missed += m; judgment += j; notes += n
+
+    total = handled + missed
+
+    # COUNTS, not a percentage. The audit printed 84.6% as "85%" and a floor set from
+    # that display then failed against the real value. Integers cannot round.
+    assert handled >= 12, f"handled dropped to {handled} of {total}, was 12"
+    assert missed <= 2, f"{missed} unimplemented shapes, was 2"
+
+    # Judgment references must stay refused. If this count ever DROPS, a judgment
+    # call was silently transformed -- which would raise coverage while making the
+    # product less safe, so it is the assertion that matters most here.
+    # 6 after Stage 3 added the two side-effecting keyed-property cases. If this
+    # count DROPS, a judgment call was silently transformed -- which would raise
+    # coverage while making the product less safe, so it is the assertion that
+    # matters most in this test.
+    assert judgment == 6, f"judgment references changed to {judgment}, was 6"
+    # 5 after the same-line template case was added: its static text is a note while
+    # its ${...} contents are an edit. If this DROPS, the position classifier stopped
+    # distinguishing prose from code -- which would either rewrite a customer's
+    # string or leave a reference that cannot compile.
+    assert notes == 5, notes
+
+    # And the gate itself is green on the real corpus.
+    assert cov.main([]) == 0
+
+
+def test_diff_contract_catches_what_the_compiler_cannot():
+    """A green compiler means well-typed, never correct. MEASURED, not argued.
+
+    Five corrupting mutations were applied to a fix `tsc --noEmit` had accepted:
+
+        delete an unrelated field       VALID   <- compiler blind
+        change the wrong property       VALID   <- compiler blind
+        delete an unrelated function    VALID   <- compiler blind
+        introduce a syntax error        INVALID
+        no-op                           INVALID
+
+    Three of five passed. `{ email: user.email }` -> `{ email: user.fullName }`
+    typechecks perfectly because both are `string`. That is why the diff contract is
+    mandatory rather than nice to have, and why it was designed against these
+    measured failures instead of imagined ones.
+    """
+    from app.diff_contract import check
+    from app.ts_codemod import remove_field
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    orig = open(os.path.join(root, "fixtures", "typescript-openapi", "remove-field",
+                             "consumer", "src", "checkout.ts")).read()
+    good = remove_field(orig, "phoneNumber").code
+
+    # The correct fix passes, and only deletions happened.
+    v = check(orig, good, "phoneNumber")
+    assert v.ok, v.violations
+    assert v.summary["added_lines"] == 0
+
+    # The three the compiler could not see.
+    unrelated_field = good.replace("    email: user.email,\n", "")
+    wrong_property = good.replace("email: user.email", "email: user.fullName")
+    dropped_function = good[:good.index("export function toCrmPayload")]
+    for label, after, expect in [
+        ("deleted an unrelated field", unrelated_field, "collateral damage"),
+        ("changed the wrong property", wrong_property, "INSERTED text"),
+        ("dropped a whole function", dropped_function, "collateral damage"),
+        ("no-op", orig, "still present in CODE"),
+        ("syntax error", good.replace("return {", "return {{"), "INSERTED text"),
+        ("rewrote a comment", good.replace("A display string.", "Whatever."),
+         "INSERTED text"),
+    ]:
+        d = check(orig, after, "phoneNumber")
+        assert not d.ok, f"{label} was accepted by the diff contract"
+        assert any(expect in x for x in d.violations), (label, d.violations)
+
+    # An ADDITION is forbidden outright -- a removal never adds, and a patch that
+    # adds a line produces a diff a reviewer cannot scan.
+    with_addition = good.replace("export function formatContact",
+                                 "// injected\nexport function formatContact")
+    assert not check(orig, with_addition, "phoneNumber").ok
+
+
+def test_keyed_property_with_a_side_effect_is_refused():
+    """`phoneNumber: getPhone(),` must NOT be silently removed.
+
+    The first version of the keyed-property rule deleted it, removing a CALL. Nothing
+    else would have caught that: the compiler is happy, and the diff contract is
+    satisfied because the deleted line DOES reference the field. Whether dropping the
+    call is correct depends on what it does, which makes it judgment, not removal.
+    """
+    from app.ts_codemod import remove_field
+
+    for src in ('const p = {\n  phoneNumber: getPhone(),\n};\n',
+                'const p = {\n  phoneNumber: await fetchPhone(),\n};\n',
+                'const p = {\n  phoneNumber: new Phone(),\n};\n',
+                'const p = {\n  phoneNumber: () => 1,\n};\n'):
+        r = remove_field(src, "phoneNumber")
+        assert not r.edits, f"removed a side-effecting value: {src!r}"
+        assert len(r.refusals) == 1, (src, r.refusals)   # exactly one reason
+        assert r.code == src, "the code must be left alone"
+
+    # Inert values stay removable -- the guard must not over-refuse.
+    for src in ('const p = {\n  phoneNumber: "555",\n};\n',
+                'interface U {\n  phoneNumber: string;\n}\n',
+                'interface U {\n  phoneNumber?: string;\n}\n',
+                'interface U {\n  phoneNumber: "a" | "b";\n}\n'):
+        r = remove_field(src, "phoneNumber")
+        assert len(r.edits) == 1 and not r.refusals, (src, r.refusals)
+
+
+def test_every_historical_false_valid_stays_blocked():
+    """The six fixes that were once called VALID must never be called VALID again.
+
+    Two assertions, and the second is the one that stops this decaying into
+    decoration:
+
+      1. every case is blocked by the current stack, by the layer it declares;
+      2. every case is GENUINELY historical -- replayed against a frozen copy of
+         the deleted validator's logic, which must accept it.
+
+    Without (2) the corpus can be padded with inputs that were never a problem, and
+    the count grows while the safety boundary does not. Without the size floor the
+    corpus can be emptied and still pass, which is the same defect one level up.
+
+    Note what this does NOT assert: that `tsc` rejects all six. It does not.
+    `known_bad_fix_003` keeps an unused function parameter, which is legal
+    TypeScript, so the compiler returns VALID and the diff contract is the only
+    thing standing between it and an automatically opened PR. A gate written around
+    the compiler would ship it.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_negative_corpus as neg
+
+    assert len(neg.CORPUS) >= 6, \
+        f"the negative corpus shrank to {len(neg.CORPUS)} -- entries are permanent"
+
+    ids = [c["id"] for c in neg.CORPUS]
+    assert len(set(ids)) == len(ids), f"duplicate case ids: {ids}"
+
+    layers = {}
+    for case in neg.CORPUS:
+        was_valid, err = neg._historical_validate(case["after"], case["language"])
+        assert was_valid, (
+            f"{case['id']}: the deleted validator REJECTED this ({err}), so it is "
+            f"not one of the false VALIDs and does not belong in the corpus")
+
+        result = neg._run_stack(case)
+        assert result["blocked"], f"{case['id']} ESCAPED: {result['detail']}"
+        assert result["layer"] == case["blocked_by"], (
+            f"{case['id']}: declared blocked_by={case['blocked_by']!r} but "
+            f"{result['layer']!r} stopped it -- a layer changed behaviour and "
+            f"another covered for it")
+        layers[result["layer"]] = layers.get(result["layer"], 0) + 1
+
+    # At least two DIFFERENT layers must be doing work. If every case collapsed onto
+    # one layer, the corpus would stop being evidence that the stack has depth.
+    assert len(layers) >= 2, f"all cases blocked by one layer only: {layers}"
+
+    # The half-fix is the reason the diff layer exists. Losing it would leave the
+    # corpus unable to show the compiler is insufficient.
+    half = [c for c in neg.CORPUS if "half_fix" in c["id"]]
+    assert half, "the half-fix case was removed -- it is the one tsc lets through"
+    assert half[0]["blocked_by"] == "diff", half[0]["blocked_by"]
+
+
+def test_deployed_capability_is_reported_not_assumed():
+    """The running image must state whether it can validate, and never overstate it.
+
+    The gap this closes: the registry derives AUTO=1 from the code, while the
+    deployed image is `python:3.11-slim` with no node, no npm and no docker daemon.
+    Measured in that base image -- backend "", verdict UNABLE_TO_VALIDATE. So AUTO
+    was simultaneously true in the repository and unreachable in production, and
+    pushing the pending commits would not have changed it: an image problem wearing
+    a deployment problem's clothes.
+
+    Neither side could see it. The repo's audits run on a host that HAS docker; the
+    deployed service was never asked. This is the same defect shape as a matcher
+    that is built, tested and CI-gated but unreachable from production.
+    """
+    import asyncio
+
+    from app import validation as val
+    from app.webhook import health_capability
+
+    original = val.choose_backend
+    try:
+        # No toolchain -- the production condition.
+        val.choose_backend = lambda: ("", "no usable node and no docker")
+        val._BACKEND_DESCRIPTION = None
+        body = asyncio.run(health_capability())
+        v = body["validation"]
+        assert v["backend"] is None, v
+        assert v["can_validate"] is False, \
+            "an image with no node claimed it could validate"
+        assert v["hint"], "a blocked image must say what is wrong, not just report False"
+
+        # Toolchain present -- the hint must disappear rather than linger and mislead.
+        val.choose_backend = lambda: ("docker", "container, pinned image")
+        val._BACKEND_DESCRIPTION = None
+        body = asyncio.run(health_capability())
+        v = body["validation"]
+        assert v["backend"] == "docker" and v["can_validate"] is True, v
+        assert v["hint"] is None, "a working image still showed the failure hint"
+
+        # The description is CACHED (choose_backend shells out with a 25s timeout,
+        # which has no business on a health endpoint). Cached state that ignores the
+        # reset is how a stale answer outlives the thing it described.
+        val.choose_backend = lambda: ("", "changed after caching")
+        body = asyncio.run(health_capability())
+        assert body["validation"]["backend"] == "docker", \
+            "the cache did not hold, so every health check pays a 25s docker probe"
+        val._BACKEND_DESCRIPTION = None
+        assert asyncio.run(health_capability())["validation"]["backend"] is None, \
+            "the cache could not be reset, so the answer can never be corrected"
+    finally:
+        val.choose_backend = original
+        val._BACKEND_DESCRIPTION = None
+
+
+def test_safety_layers_are_reachable_or_declared_unreachable():
+    """A safety layer that production cannot reach is not a safety layer.
+
+    Found in Stage 6, in Stage 3's and Stage 4's own work. Stage 3 reported wiring
+    the diff contract "into the pipeline so it gates AUTO"; Stage 4 built a corpus
+    asserting no historical bad fix can reach AUTO. Both were true of a harness.
+    `app/diff_contract.py` was imported by tests/ and tools/ and by nothing in app/.
+
+    The exact cost, not a vague one: five of the six corpus cases are independently
+    rejected by tsc, so production would catch them regardless. The sixth --
+    known_bad_fix_003, the half-fix tsc accepts -- is blocked ONLY by the diff
+    contract. The one case that justified building the layer is the one case the
+    layer cannot catch where it matters.
+
+    A REPORTING import must not count as wiring. app/webhook.py imports
+    validation.describe_backend for the /health/capability endpoint, which can gate
+    nothing; without that exemption this gate would have reported "2 of 3 layers
+    wired" and hidden the gap it exists to expose.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_safety_reachability as reach
+
+    reachable = reach._reachable_from_entry()
+
+    for name, spec in reach.LAYERS.items():
+        assert (name in reachable) == spec["reachable"], (
+            f"app/{name}.py is {'reachable' if name in reachable else 'unreachable'} "
+            f"but declared {spec['reachable']} -- reachability and its declaration "
+            f"diverged, in whichever direction")
+        if not spec["reachable"]:
+            assert spec["consequence"], \
+                f"{name} is declared unreachable without stating what that costs"
+
+    # The transformation must always be wired. If this ever fails, fixes are being
+    # generated by something other than the codemod that refuses unsafe shapes.
+    assert "ts_codemod" in reachable, \
+        "the codemod is unreachable from production -- fixes come from elsewhere"
+
+    # The reporting-only exemption is load-bearing, asserted rather than trusted.
+    assert ("validation", "describe_backend") in reach.REPORTING_ONLY, \
+        "the reporting-only exemption was removed; a health endpoint would now " \
+        "make the validator look wired"
+    assert "validation" not in reachable, \
+        "validation became reachable -- if it is now genuinely wired, update " \
+        "LAYERS and this assertion together, deliberately"
 
 
 if __name__ == "__main__":

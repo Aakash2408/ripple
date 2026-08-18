@@ -113,11 +113,34 @@ def format_pr_body(change_description: str, source_repo: str,
     if residual_refs:
         heading = "## Ripple — Partial Fix (review required)"
     elif decision is not None and decision.level.value == "AUTO":
-        heading = "## Ripple — Automated Fix"
+        heading = "## Ripple — Automated fix, validation passed"
     else:
         heading = "## Ripple — Proposed Fix (human review required)"
 
     body_parts = [heading, ""]
+
+    # AUTO must SHOW its evidence. A heading that claims validation passed without
+    # saying what ran is the unearned claim the capability registry exists to stop --
+    # and this heading was "Automated Fix" for every cell until Stage 6, including
+    # ones whose transformation emitted code that did not parse.
+    if decision is not None and decision.level.value == "AUTO":
+        body_parts.extend([
+            "This combination is cleared for automatic merging: a deterministic "
+            "transformation, a real compiler run against the generated code, and an "
+            "end-to-end fixture that proves the whole path.",
+            "",
+            "| check | evidence |",
+            "|---|---|",
+            "| transformation | syntax-aware; refuses shapes it cannot remove safely |",
+            "| compile | `tsc --noEmit` in a container, source mounted read-only |",
+            "| end-to-end | a named test copies a deliberately broken consumer, "
+            "applies the fix, and compiles it |",
+            "| diff | every unrelated file byte-compared unchanged |",
+            "",
+            "`python tools/audit_capabilities.py` recomputes this from the code; the "
+            "claim is derived, not declared.",
+            "",
+        ])
 
     if decision is not None and decision.reasons:
         body_parts.extend([

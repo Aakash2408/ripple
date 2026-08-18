@@ -69,10 +69,14 @@ GATES=(
     "tools/audit_public_claims.py"
     "tools/audit_fail_silent.py --check"
     "tools/audit_pipeline_governance.py"
+    "tools/audit_frozen_surface.py"
+    "tools/audit_codemod_coverage.py"
+    "tools/audit_negative_corpus.py"
+    "tools/audit_safety_reachability.py"
 )
 
 echo ""
-echo "  pre-commit: ${#GATES[@]} gates (~30s). Skip with --no-verify."
+echo "  pre-commit: ${#GATES[@]} gates + the suite under CI env (~55s). Skip with --no-verify."
 
 failed=()
 for gate in "${GATES[@]}"; do
@@ -85,6 +89,23 @@ for gate in "${GATES[@]}"; do
         LAST_OUT="$out"
     fi
 done
+
+# The suite AGAIN, in the environment CI actually runs in.
+#
+# This exists because the hook's first version only tested THIS machine, and that
+# is precisely how 75d70a6 went green locally and red in CI: the build_info test
+# asserted the "git:working-tree" path, but GitHub Actions always sets GITHUB_SHA,
+# which build_info correctly prefers. The code was right and the test had assumed
+# an environment. A gate that only checks one environment cannot catch a test that
+# depends on the environment.
+if out="$(GITHUB_SHA=0000000000000000000000000000000000000000 \
+          GITHUB_REF_NAME=main CI=true "$PY" tests/test_regression.py 2>&1)"; then
+    printf "    ok    tests/test_regression.py [CI env]\n"
+else
+    printf "    FAIL  tests/test_regression.py [CI env]\n"
+    failed+=("tests/test_regression.py (with GITHUB_SHA set, as CI does)")
+    LAST_OUT="$out"
+fi
 
 if [ ${#failed[@]} -ne 0 ]; then
     echo ""

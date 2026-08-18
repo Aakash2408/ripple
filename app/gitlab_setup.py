@@ -15,6 +15,7 @@ Steps:
 import json
 import os
 from typing import Optional
+from .experimental import experimental_enabled, experimental_disabled
 
 try:
     from fastapi import APIRouter, Request as FastAPIRequest
@@ -31,6 +32,9 @@ _gitlab_tokens: dict[str, str] = {}  # org/project → token
 @router.get("/setup/gitlab", response_class=HTMLResponse)
 async def gitlab_setup_page():
     """Render the GitLab setup page."""
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "setup page")
     return HTMLResponse(content=GITLAB_SETUP_HTML)
 
 
@@ -40,6 +44,9 @@ async def register_gitlab_token(request: FastAPIRequest):
     Register a GitLab token for a project.
     Body: {"project": "org/repo", "token": "glpat-xxx"}
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "setup register")
     body = await request.body()
     data = json.loads(body)
     
@@ -74,6 +81,9 @@ async def register_gitlab_token(request: FastAPIRequest):
 @router.get("/setup/gitlab/tokens")
 async def list_registered_projects():
     """List registered GitLab projects (without exposing tokens)."""
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "setup tokens")
     return {
         "registered_projects": [
             {"project": p, "token_prefix": t[:10] + "..."} 

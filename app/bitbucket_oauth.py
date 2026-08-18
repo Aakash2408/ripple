@@ -44,6 +44,7 @@ SSL_CTX.verify_mode = ssl.CERT_NONE
 _oauth_states: dict[str, dict] = {}
 
 from . import token_store
+from .experimental import experimental_enabled, experimental_disabled
 
 # Config
 BITBUCKET_CLIENT_ID = os.environ.get("BITBUCKET_CLIENT_ID", "")
@@ -70,6 +71,9 @@ def _bb_api(method: str, url: str, token: str, data: dict = None) -> dict:
 @router.get("/auth/bitbucket")
 async def bitbucket_auth_start():
     """Redirect user to Bitbucket OAuth authorization page."""
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("bitbucket", "oauth start")
     if not BITBUCKET_CLIENT_ID:
         return HTMLResponse(content=NO_CREDENTIALS_HTML)
     
@@ -88,6 +92,9 @@ async def bitbucket_auth_start():
 @router.get("/auth/bitbucket/callback")
 async def bitbucket_auth_callback(code: str = "", state: str = "", error: str = ""):
     """Handle OAuth callback — exchange code for token, install webhooks."""
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("bitbucket", "oauth callback")
     if error:
         return HTMLResponse(content=f"<h1>Authorization failed</h1><p>{error}</p>")
     
@@ -133,6 +140,9 @@ async def bitbucket_auth_callback(code: str = "", state: str = "", error: str = 
 @router.get("/auth/bitbucket/status")
 async def bitbucket_auth_status():
     """Check connected Bitbucket repos."""
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("bitbucket", "status")
     users = token_store.get_bitbucket_users()
     repos = token_store.get_bitbucket_repos()
     return {

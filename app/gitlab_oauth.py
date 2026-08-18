@@ -40,6 +40,7 @@ except ImportError:
     pass
 
 from . import token_store
+from .experimental import experimental_enabled, experimental_disabled
 
 router = APIRouter()
 
@@ -84,6 +85,9 @@ async def gitlab_auth_start():
     Step 1: Redirect user to GitLab authorization page.
     User clicks "Install on GitLab" → lands here → redirected to GitLab.
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "oauth start")
     if not GITLAB_APP_ID:
         return HTMLResponse(content=NO_CREDENTIALS_HTML, status_code=200)
     
@@ -107,6 +111,9 @@ async def gitlab_auth_callback(code: str = "", state: str = "", error: str = "")
     Step 2: GitLab redirects back with auth code.
     Exchange code for token, then auto-install webhooks.
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "oauth callback")
     if error:
         return HTMLResponse(content=f"<h1>Authorization failed</h1><p>{error}</p>")
     
@@ -154,6 +161,9 @@ async def gitlab_auth_callback(code: str = "", state: str = "", error: str = "")
 @router.get("/auth/gitlab/status")
 async def gitlab_auth_status():
     """Check how many GitLab projects are connected."""
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "status")
     users = token_store.get_gitlab_users()
     projects = token_store.get_gitlab_projects()
     return {

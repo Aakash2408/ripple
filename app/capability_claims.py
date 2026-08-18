@@ -68,17 +68,37 @@ class ValidatorSpec:
 
     @property
     def is_wired(self) -> bool:
-        return bool(self.implemented_by)
+        """DERIVED: the dotted path must actually resolve to a callable.
+
+        `bool(self.implemented_by)` was not enough. A declared path that does not
+        import is a lie of exactly the kind this codebase keeps producing --
+        app/impact_prediction.py was referenced, unimportable, and counted as real
+        until someone tried to import it. Resolving the path makes the claim
+        falsifiable at audit time rather than at runtime.
+        """
+        if not self.implemented_by:
+            return False
+        module, _, attr = self.implemented_by.partition(":")
+        if not module or not attr:
+            return False
+        try:
+            import importlib
+            return callable(getattr(importlib.import_module(module), attr, None))
+        except Exception:
+            return False
 
 
-# The toolchain each language WOULD need. Declaring intent, not capability:
-# every implemented_by is empty, so every language is UNABLE_TO_VALIDATE today.
+# The toolchain each language WOULD need. TypeScript is now WIRED -- its
+# implemented_by resolves to a real container-backed runner. python and go remain
+# declarations: the toolchain is named, nothing runs it, and is_wired proves that by
+# failing to resolve rather than by trusting an empty string.
 #
 # Deliberately not listing a validator for the other 11 languages. An entry here
 # with no implementation is a plan; silence is the same state and makes no claim.
 VALIDATORS: dict[str, ValidatorSpec] = {
     "typescript": ValidatorSpec(
         "typescript", "tsc --noEmit",
+        implemented_by="app.validation:validate_typescript",
         note="Type errors are the failure mode that shipped -- `phoneNumber: "
              "int32` is syntactically fine and semantically impossible, so brace "
              "matching cannot catch it."),
@@ -102,9 +122,15 @@ VALIDATORS: dict[str, ValidatorSpec] = {
 # diff -> fix, and one that posts a synthetic push payload, but none reach a
 # validated PR because validation does not exist yet.
 #
-# Empty is therefore the correct content, not an oversight. It becomes non-empty
-# when the sandboxed validation runner exists.
-E2E_FIXTURES: dict[tuple, str] = {}
+# It became non-empty in Stage 6, with ONE entry. The named test copies the golden
+# fixture, asserts it does not compile, generates and APPLIES the fix, runs
+# `tsc --noEmit` in a container, and byte-compares every other file to prove the
+# diff is minimal. It SKIPS when no backend exists rather than passing, because a
+# test that passes without a compiler is evidence of nothing.
+E2E_FIXTURES: dict[tuple, str] = {
+    ("typescript", "openapi", "remove_field"):
+        "test_e2e_typescript_openapi_remove_field",
+}
 
 
 # --------------------------------------------------------------------------
