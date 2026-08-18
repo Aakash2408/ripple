@@ -250,7 +250,8 @@ def _parse_tsc(output: str) -> list:
     return out
 
 
-def validate_typescript(workspace: str, backend: str = "") -> Verdict:
+def validate_typescript(workspace: str, backend: str = "",
+                        project_subdir: str = "") -> Verdict:
     """Typecheck a TypeScript workspace. The workspace is COPIED, never mutated.
 
     `workspace` must contain package.json and tsconfig.json -- i.e. a real project,
@@ -277,12 +278,39 @@ def validate_typescript(workspace: str, backend: str = "") -> Verdict:
                        f"or 'host'. Refusing rather than guessing which isolation "
                        f"level was intended", evidence=ev)
 
-    for required in ("package.json", "tsconfig.json"):
-        if not os.path.exists(os.path.join(workspace, required)):
+    # WHERE THE MANIFESTS HAVE TO BE, AND WHY THEY ARE NOT ALWAYS TOGETHER.
+    #
+    # This required package.json AND tsconfig.json in ONE directory. pnpm and yarn
+    # workspaces routinely violate that: the package holds tsconfig.json while
+    # node_modules and the lockfile sit at the workspace root. Stage 2 measured the
+    # consequence -- resolution correctly returned packages/api, and this function
+    # then said "package.json is missing", so the most common real monorepo layout
+    # was UNABLE_TO_VALIDATE.
+    #
+    # `workspace` is now where dependencies install (the workspace root) and
+    # `project_subdir` is the relative path to the compiler config. Verified in
+    # node:16-alpine that this is all it takes, because node's own resolution walks
+    # UP from a file looking for node_modules:
+    #
+    #   npm install                       at the workspace root
+    #   ./node_modules/.bin/tsc -p packages/api --noEmit
+    #     -> packages/api/src/user.ts(1,14): error TS2322 ...
+    #
+    # Error paths come back relative to the workspace root, which is what a PR body
+    # wants anyway.
+    project_dir = os.path.join(workspace, project_subdir) if project_subdir \
+        else workspace
+    ev["project_subdir"] = project_subdir or "."
+    for required, where in (("package.json", workspace),
+                            ("tsconfig.json", project_dir)):
+        if not os.path.exists(os.path.join(where, required)):
+            rel = os.path.relpath(where, workspace)
             return Verdict(ValidationState.UNABLE_TO_VALIDATE,
-                           f"{required} is missing, so tsc cannot resolve imports "
-                           f"or compiler options -- typechecking a file without its "
-                           f"project proves nothing", evidence=ev)
+                           f"{required} is missing from "
+                           f"{'the workspace root' if rel == '.' else rel}, so tsc "
+                           f"cannot resolve imports or compiler options -- "
+                           f"typechecking a file without its project proves nothing",
+                           evidence=ev)
 
     tmp = tempfile.mkdtemp(prefix="ripple-validate-")
     work = os.path.join(tmp, "w")
@@ -319,6 +347,11 @@ def validate_typescript(workspace: str, backend: str = "") -> Verdict:
                            f"so the toolchain never ran: {out.strip()[-300:]}",
                            evidence=ev)
 
+        # -p targets the project rather than the cwd. Without it tsc reads the
+        # cwd's tsconfig, which in a hoisted workspace is the ROOT one -- and
+        # that either excludes the changed package or drags in every package.
+        _project_arg = ["-p", project_subdir] if project_subdir else []
+
         if backend == "docker":
             # Second container: no network at all, source read-only.
             check = ["docker", "run", "--rm", "--network", "none",
@@ -326,12 +359,12 @@ def validate_typescript(workspace: str, backend: str = "") -> Verdict:
                      "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
                      "--security-opt", "no-new-privileges",
                      DOCKER_IMAGE,
-                     "./node_modules/.bin/tsc", "--noEmit", "--skipLibCheck"]
+                     "./node_modules/.bin/tsc", "--noEmit", "--skipLibCheck"] + _project_arg
         else:
             node_dir = os.path.dirname(_host_node())
             check = ["env", f"PATH={node_dir}:{os.environ.get('PATH','')}",
-                     "./node_modules/.bin/tsc", "--noEmit", "--skipLibCheck"]
-        ev["typecheck"] = "tsc --noEmit --skipLibCheck"
+                     "./node_modules/.bin/tsc", "--noEmit", "--skipLibCheck"] + _project_arg
+        ev["typecheck"] = "tsc --noEmit --skipLibCheck " + " ".join(_project_arg)
 
         code, out, err = _run(check, work, TYPECHECK_TIMEOUT, host_limits)
         ev["typecheck_exit"] = code
@@ -361,11 +394,13 @@ RUNNERS = {
 }
 
 
-def validate(language: str, workspace: str, backend: str = "") -> Verdict:
+def validate(language: str, workspace: str, backend: str = "",
+             project_subdir: str = "") -> Verdict:
     runner = RUNNERS.get(language)
     if runner is None:
         return Verdict(
             ValidationState.UNABLE_TO_VALIDATE,
             f"no validation runner for {language} -- see app/validation.py RUNNERS",
             evidence={"backend": "none", "language": language})
-    return runner(workspace, backend=backend)
+    return runner(workspace, backend=backend,
+                  project_subdir=project_subdir)

@@ -4758,5 +4758,187 @@ def test_an_extracted_tree_is_a_project_a_compiler_can_read():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_project_resolution_never_falls_back_to_the_repo_root():
+    """A monorepo is a repo where "which project owns this file" is not "the root".
+
+    Getting that answer right IS the monorepo feature; workspace manifests and project
+    references are refinements on top of it.
+
+    WHY THE ROOT IS ALWAYS THE WRONG FALLBACK. `tsc` at a monorepo root either
+    EXCLUDES the changed file -- so a broken fix validates clean -- or INCLUDES
+    thousands of unrelated ones and reports errors the fix never caused. Both are
+    confident verdicts about the wrong thing, which is worse than admitting we cannot
+    validate. So an unowned file resolves to None and the caller degrades to REVIEW.
+
+    THREE SHAPES THAT BREAK "nearest manifest wins", all real:
+
+        hoisted workspace   tsconfig in the package, package.json at the root.
+                            app/validation.py wants both in ONE directory, so this
+                            silently becomes UNABLE_TO_VALIDATE unless it is reported
+        polyglot repo       a .ts file under a go.mod -- resolving by nearest manifest
+                            alone hands a TypeScript file to a Go project
+        no owning project   a loose file with no config above it
+    """
+    import tempfile
+
+    from app.project_resolution import group, resolve
+
+    tree = tempfile.mkdtemp(prefix="ripple-resolve-")
+
+    def w(rel, body="{}"):
+        path = os.path.join(tree, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(body)
+
+    try:
+        w("flat/package.json"); w("flat/tsconfig.json"); w("flat/src/a.ts", "x")
+        w("mono/package.json"); w("mono/tsconfig.base.json")
+        w("mono/packages/api/package.json"); w("mono/packages/api/tsconfig.json")
+        w("mono/packages/api/src/user.ts", "x")
+        w("mono/packages/web/package.json"); w("mono/packages/web/tsconfig.json")
+        w("mono/packages/web/src/page.tsx", "x")
+        w("hoist/package.json"); w("hoist/packages/api/tsconfig.json")
+        w("hoist/packages/api/src/user.ts", "x")
+        w("poly/go.mod", "module x\n"); w("poly/scripts/tool.ts", "x")
+        w("loose/src/orphan.ts", "x")
+        w("nested/package.json"); w("nested/tsconfig.json")
+        w("nested/inner/package.json"); w("nested/inner/tsconfig.json")
+        w("nested/inner/src/deep.ts", "x")
+        w("py/pyproject.toml", "[project]\n"); w("py/pkg/mod.py", "x = 1\n")
+
+        for label, rel, want in (
+            ("flat", "flat/src/a.ts", "flat"),
+            ("monorepo package", "mono/packages/api/src/user.ts",
+             "mono/packages/api"),
+            ("sibling not chosen", "mono/packages/web/src/page.tsx",
+             "mono/packages/web"),
+            ("hoisted", "hoist/packages/api/src/user.ts", "hoist/packages/api"),
+            ("nested inner wins", "nested/inner/src/deep.ts", "nested/inner"),
+            ("python", "py/pkg/mod.py", "py"),
+        ):
+            project = resolve(tree, rel)
+            assert project is not None, f"{label}: resolved to nothing"
+            assert project.rel_root == want, (label, project.rel_root, want)
+
+        # A .ts file under a go.mod must NOT become a Go project.
+        assert resolve(tree, "poly/scripts/tool.ts") is None, \
+            "a TypeScript file resolved against a Go module -- resolution is not " \
+            "language-driven"
+        # And an unowned file must NOT fall back to the tree root.
+        assert resolve(tree, "loose/src/orphan.ts") is None, \
+            "an unowned file fell back to a project; the root is never the answer"
+
+        # The hoisted split must be VISIBLE. app/validation.py requires package.json
+        # and tsconfig.json in one directory, so a caller that cannot see the split
+        # meets it later as an unexplained UNABLE_TO_VALIDATE.
+        hoisted = resolve(tree, "hoist/packages/api/src/user.ts")
+        assert hoisted.deps_root and \
+            os.path.normpath(hoisted.deps_root) != os.path.normpath(hoisted.root), \
+            "the hoisted workspace was not reported as hoisted"
+        assert "hoisted" in hoisted.reason, hoisted.reason
+        assert hoisted.as_detail()["deps_root_differs"] is True
+
+        # A self-contained package must NOT be flagged as hoisted.
+        contained = resolve(tree, "mono/packages/api/src/user.ts")
+        assert contained.as_detail()["deps_root_differs"] is False, contained.reason
+
+        # Grouping keeps packages APART -- one change touching two packages must be
+        # validated twice, in two projects. Collapsing them is the bug.
+        grouped, unresolved = group(tree, [
+            "mono/packages/api/src/user.ts",
+            "mono/packages/web/src/page.tsx",
+            "loose/src/orphan.ts",
+        ])
+        assert len(grouped) == 2, f"two packages collapsed into {len(grouped)}"
+        assert unresolved == ["loose/src/orphan.ts"], unresolved
+
+        # Resolution must never read above the tree, whatever the path claims.
+        assert resolve(tree, "../../../etc/passwd") is None
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tree, ignore_errors=True)
+
+
+def test_a_hoisted_workspace_validates_at_the_package_not_the_root():
+    """pnpm/yarn workspaces put tsconfig in the package and node_modules at the root.
+
+    The validator required both manifests in ONE directory, so Stage 2 measured this:
+    resolution correctly returned packages/api, and validate() then answered
+    "package.json is missing" -- the most common real monorepo layout was
+    UNABLE_TO_VALIDATE.
+
+    `workspace` is now where dependencies install and `project_subdir` is the path to
+    the compiler config. That is all it takes, because node's own resolution walks UP
+    from a file looking for node_modules.
+
+    THE SECOND ASSERTION IS THE IMPORTANT ONE. A SIBLING package contains a
+    deliberate type error. If the correct target came back INVALID, we would be
+    typechecking the whole workspace rather than the changed project -- which is the
+    failure the root tsconfig causes, and it would report errors from code the fix
+    never touched.
+
+    Needs a validation backend and SKIPS without one.
+    """
+    import json as _json
+    import tempfile
+
+    from app.project_resolution import resolve
+    from app.validation import choose_backend, validate
+
+    backend, note = choose_backend()
+    if not backend:
+        print(f"      SKIP: no validation backend ({note})")
+        return
+
+    def build(body):
+        tree = tempfile.mkdtemp(prefix="ripple-hoisted-")
+
+        def w(rel, text):
+            path = os.path.join(tree, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+
+        w("package.json", _json.dumps({
+            "name": "ws", "private": True, "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "5.3.3"}}))
+        w("packages/api/tsconfig.json", _json.dumps({
+            "compilerOptions": {"strict": True, "noEmit": True},
+            "include": ["src"]}))
+        w("packages/api/src/user.ts", body)
+        # A sibling with a deliberate error. It must NOT affect the target's verdict.
+        w("packages/web/tsconfig.json", _json.dumps({
+            "compilerOptions": {"strict": True}, "include": ["src"]}))
+        w("packages/web/src/broken.ts", "export const b: string = 42;\n")
+        return tree
+
+    for label, body, want in (
+        ("broken target", "export const u: string = 1;\n", "INVALID"),
+        ("correct target", 'export const u: string = "ok";\n', "VALID"),
+    ):
+        tree = build(body)
+        try:
+            project = resolve(tree, "packages/api/src/user.ts")
+            assert project is not None and project.deps_root, project
+            subdir = os.path.relpath(project.root, project.deps_root)
+            assert subdir == os.path.join("packages", "api"), subdir
+
+            verdict = validate("typescript", project.deps_root,
+                               project_subdir=subdir)
+            assert verdict.state.value == want, (
+                f"{label}: got {verdict.state.value}, wanted {want} -- "
+                f"{verdict.reason[:120]}")
+            if want == "INVALID":
+                assert any("packages/api" in e for e in verdict.errors), \
+                    f"errors do not name the target project: {verdict.errors[:2]}"
+                assert not any("packages/web" in e for e in verdict.errors), \
+                    "the sibling package appeared in the errors -- the whole " \
+                    "workspace is being typechecked, not the changed project"
+        finally:
+            import shutil as _sh
+            _sh.rmtree(tree, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(_main())

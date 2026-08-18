@@ -115,6 +115,15 @@ jobs:
         # gate that leaned on tsc would let it through.
         run: python tools/audit_negative_corpus.py
 
+      - name: Project resolution (blocking)
+        # A monorepo is a repository where "which project owns this file" is not
+        # "the root", and getting that right IS the monorepo feature. Builds the
+        # shapes that break "nearest manifest wins" -- hoisted workspace, polyglot
+        # repo, unowned file, nested projects -- and asserts the root CHOSEN, not
+        # merely that something was returned. The root is never a fallback: tsc there
+        # either excludes the changed file or drags in thousands of unrelated ones.
+        run: python tools/verify_project_resolution.py
+
       - name: Archive safety (blocking)
         # app/repo_workspace.py extracts an archive built by whoever owns the
         # repository -- untrusted input. This builds hostile ones (traversal,
