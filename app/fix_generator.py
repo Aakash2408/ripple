@@ -67,7 +67,58 @@ def generate_fix(
     
     if not fixed_code or fixed_code == original_code:
         return None
-    
+
+    # THE DIFF CONTRACT, ON EVERY PATH -- INCLUDING THE LLM.
+    #
+    # It was wired inside fix_templates._remove_field_typescript, which the LLM
+    # branch never reaches: _generate_with_llm returns its output directly and only
+    # falls back to a template on EXCEPTION. So the deterministic generator was
+    # checked and the probabilistic one was not, which is exactly backwards.
+    #
+    # Measured, not hypothesised. Asked to REMOVE `phoneNumber`, a live Gemini call
+    # through the LiteLLM proxy ADDED a parameter instead:
+    #
+    #   - export function formatContact(user: User): string {
+    #   + export function formatContact(user: User, phoneNumber: string): string {
+    #
+    # That breaks every caller. `tsc --noEmit` returned VALID -- adding a parameter
+    # and using it is perfectly well-typed -- and only the diff contract objected,
+    # with "INSERTED text into a line, which a removal never does". Preserved as
+    # known_bad_fix_007 in tools/audit_negative_corpus.py.
+    #
+    # TWO GATES, both of which matter:
+    #
+    #   REMOVALS ONLY. The contract forbids insertions. An add_required fix inserts
+    #   by definition, so applying this to one would reject every correct fix.
+    #
+    #   TS/JS ONLY. diff_contract._regions scans //, /* */, quotes and backticks. In
+    #   Python a `# phoneNumber` comment is not recognised as a comment, so it reads
+    #   as CODE and the "field still present in CODE" rule would fire on a correct
+    #   fix. Widening the language set requires teaching _regions that language, not
+    #   just deleting this condition.
+    from .change_types import canonical_op as _canonical_op
+
+    # Read DECLARED fields directly. `getattr(bc, "field_name", "")` was caught by
+    # test_no_phantom_getattr_on_breaking_change and rightly: a default silently
+    # turns a renamed or missing field into "no field name", which disables this
+    # whole check without anyone noticing. Both attributes are on the dataclass, so
+    # a real absence should raise.
+    field = breaking_change.field_name or ""
+    lang = (consumer.language or "").lower()
+    if (field and lang in ("typescript", "javascript")
+            and _canonical_op(breaking_change.change_type or "") == "remove_field"):
+        from .diff_contract import check as _diff_check
+
+        verdict = _diff_check(original_code, fixed_code, field)
+        if not verdict.ok:
+            # Refuse the whole patch. Returning None is what the caller already
+            # treats as "no fix", and it is the same decision the template path
+            # makes by returning the original code unchanged.
+            _log = ("; ".join(verdict.violations[:3]))[:300]
+            print(f"[fix_generator] diff contract REJECTED the generated fix for "
+                  f"{consumer.file_path}: {_log}")
+            return None
+
     diff = _compute_diff(original_code, fixed_code, consumer.file_path)
     
     return GeneratedFix(

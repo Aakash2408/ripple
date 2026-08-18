@@ -3931,7 +3931,7 @@ def test_every_historical_false_valid_stays_blocked():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
     import audit_negative_corpus as neg
 
-    assert len(neg.CORPUS) >= 6, \
+    assert len(neg.CORPUS) >= 7, \
         f"the negative corpus shrank to {len(neg.CORPUS)} -- entries are permanent"
 
     ids = [c["id"] for c in neg.CORPUS]
@@ -3939,10 +3939,19 @@ def test_every_historical_false_valid_stays_blocked():
 
     layers = {}
     for case in neg.CORPUS:
+        provenance = case.get("provenance", neg.HISTORICAL)
         was_valid, err = neg._historical_validate(case["after"], case["language"])
-        assert was_valid, (
-            f"{case['id']}: the deleted validator REJECTED this ({err}), so it is "
-            f"not one of the false VALIDs and does not belong in the corpus")
+        if provenance == neg.HISTORICAL:
+            assert was_valid, (
+                f"{case['id']}: the deleted validator REJECTED this ({err}), so it is "
+                f"not one of the false VALIDs and does not belong in the corpus")
+        else:
+            # An OBSERVED entry has no old validator to replay against, so its
+            # anti-padding evidence is that what the CURRENT toolchain says about it
+            # is written down. A model failure tsc already rejects needs no memory
+            # here -- production catches it.
+            assert case.get("compiler_note"), \
+                f"{case['id']} is OBSERVED but records no compiler_note"
 
         result = neg._run_stack(case)
         assert result["blocked"], f"{case['id']} ESCAPED: {result['detail']}"
@@ -3961,6 +3970,17 @@ def test_every_historical_false_valid_stays_blocked():
     half = [c for c in neg.CORPUS if "half_fix" in c["id"]]
     assert half, "the half-fix case was removed -- it is the one tsc lets through"
     assert half[0]["blocked_by"] == "diff", half[0]["blocked_by"]
+
+    # And at least one entry must be a REAL model failure rather than a replay.
+    # Synthetic cases prove the layers work; an observed one proves they are needed.
+    observed = [c for c in neg.CORPUS
+                if c.get("provenance") == neg.OBSERVED]
+    assert observed, \
+        "no OBSERVED entry -- the corpus is entirely synthetic, so nothing in it " \
+        "shows a real model producing a fix the compiler accepts"
+    assert all(c["blocked_by"] == "diff" for c in observed), \
+        "an observed model failure is blocked by something other than the diff " \
+        "contract; if that is now true, say so deliberately"
 
 
 def test_deployed_capability_is_reported_not_assumed():
@@ -4118,6 +4138,98 @@ def test_a_partial_removal_returns_the_original_not_broken_code():
     assert out2 != complete and "phoneNumber" not in out2, \
         "the diff contract rejected a CORRECT complete removal -- it is now " \
         "over-refusing, which silently costs every fix"
+
+
+def test_the_llm_branch_is_subject_to_the_diff_contract():
+    """The diff contract must gate EVERY generator path, not just the template.
+
+    It was wired inside fix_templates._remove_field_typescript, which the LLM branch
+    never reaches -- _generate_with_llm returns its output directly and only falls
+    back to a template on exception. So the deterministic generator was checked and
+    the probabilistic one was not, which is backwards.
+
+    The bad output below is the REAL thing, captured from a live gemini-flash-latest
+    call asked to REMOVE phoneNumber: it added the field as a function parameter
+    instead, which breaks every caller. `tsc --noEmit` returns VALID on it -- adding
+    a parameter and using it is well-typed -- so the compiler cannot save us here and
+    the diff contract is the only layer that objects. Preserved as
+    known_bad_fix_007 in the negative corpus.
+
+    Monkeypatched rather than calling a model, so this is deterministic and needs no
+    network -- but the payload is not invented.
+    """
+    import inspect
+    import tempfile
+
+    from app import fix_generator as fg
+    from app.consumer_finder import ConsumerMatch
+    from app.diff_engine import BreakingChange
+
+    def _mk(cls, **over):
+        kw = {}
+        for name, p in inspect.signature(cls).parameters.items():
+            if name in over:
+                kw[name] = over[name]
+                continue
+            if p.default is not inspect.Parameter.empty:
+                continue
+            ann = str(p.annotation)
+            kw[name] = (0.9 if "float" in ann else
+                        1 if "int" in ann else
+                        [] if "list" in ann else "")
+        return cls(**kw)
+
+    original = (
+        'import { User } from "./types";\n'
+        "\n"
+        "export function formatContact(user: User): string {\n"
+        "  return `${user.fullName} <${user.email}> ${user.phoneNumber}`;\n"
+        "}\n"
+    )
+    llm_bad = original.replace(
+        "export function formatContact(user: User): string {",
+        "export function formatContact(user: User, phoneNumber: string): string {"
+    ).replace("> ${user.phoneNumber}`;", "> ${phoneNumber}`;")
+    assert "phoneNumber: string" in llm_bad and llm_bad != original
+
+    tmp = tempfile.mkdtemp(prefix="ripple-llmgate-")
+    path = os.path.join(tmp, "checkout.ts")
+    with open(path, "w") as fh:
+        fh.write(original)
+
+    consumer = _mk(ConsumerMatch, file_path=path, repo="billing-api",
+                   language="typescript", confidence="high")
+    change = _mk(BreakingChange, change_type="removed_field",
+                 field_name="phoneNumber", severity="breaking",
+                 description="phoneNumber removed from User")
+
+    saved_llm = fg._generate_with_llm
+    saved_key = None
+    try:
+        from app import llm_config
+        saved_key = llm_config.api_key
+        llm_config.api_key = lambda: "DUMMY"          # take the LLM branch
+        fg._generate_with_llm = lambda *_a, **_k: (llm_bad, "llm said so")
+
+        assert fg.generate_fix(consumer, change, use_llm=True) is None, (
+            "the LLM branch produced a fix that ADDS a parameter while claiming to "
+            "remove a field, and it was accepted -- the diff contract is not gating "
+            "this path")
+
+        # A CORRECT llm output must still pass, or the gate is simply refusing
+        # everything and proves nothing.
+        good = original.replace(" ${user.phoneNumber}", "")
+        fg._generate_with_llm = lambda *_a, **_k: (good, "llm said so")
+        ok = fg.generate_fix(consumer, change, use_llm=True)
+        assert ok is not None and "user.phoneNumber" not in ok.fixed_code, \
+            "a correct LLM removal was rejected -- the gate over-refuses"
+    finally:
+        fg._generate_with_llm = saved_llm
+        if saved_key is not None:
+            from app import llm_config as _lc
+            _lc.api_key = saved_key
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
