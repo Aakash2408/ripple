@@ -716,7 +716,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 128 tests
+python tests/test_regression.py            # 130 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
@@ -726,6 +726,7 @@ python tools/audit_frozen_surface.py       # 6 frozen modules, 747 statements
 python tools/audit_codemod_coverage.py     # automation 68.0%, implementation 94.4%
 python tools/audit_negative_corpus.py      # 7 bad fixes (6 historical + 1 observed)
 python tools/audit_safety_reachability.py  # 2 of 3 safety layers wired to production
+python tools/verify_archive_safety.py      # hostile archives: 8 cases, containment
 python tools/verify_validation.py          # acceptance, needs docker: not a gate
 python tools/verify_deployed_capability.py # acceptance: can the LIVE image validate?
 python tools/verify_release.py             # acceptance: is prod running the TESTED sha?

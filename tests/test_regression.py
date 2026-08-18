@@ -4562,5 +4562,167 @@ def test_llm_output_keeps_the_files_trailing_newline():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_repo_archive_extraction_is_contained_and_capped():
+    """Extraction takes an archive built by whoever owns the repo. Untrusted input.
+
+    Stage 1 replaced per-file `contents/` fetches with a whole-tree fetch, because a
+    compiler needs a PROJECT and a file in isolation typechecks nothing. The cost of
+    that unlock is that we now extract someone else's archive, and the classic
+    attacks are not theoretical.
+
+    THE INVARIANT IS CONTAINMENT, NOT REFUSAL. Two hostile shapes are ACCEPTED and
+    still safe, which is why asserting "it refused" would assert the wrong thing:
+
+        absolute member path   data_filter STRIPS the leading slash, so `/tmp/x`
+                               lands inside the tree as `tmp/x`
+        symlink member         _extract skips every non-regular member, so the link
+                               is never created and there is nothing to escape through
+
+    Sizes and counts are ours, because a filter cannot know our budget.
+    """
+    import io
+    import tarfile
+    import tempfile
+
+    from app.repo_workspace import Limits, RepoTooLarge, WorkspaceError, _extract
+
+    small = Limits(download_bytes=1 << 20, extracted_bytes=2 << 20, files=50,
+                   file_bytes=1 << 19, timeout_seconds=5)
+
+    def build(path, members):
+        with tarfile.open(path, "w:gz") as tar:
+            for name, data, kind in members:
+                info = tarfile.TarInfo(name)
+                if kind == "link":
+                    info.type, info.linkname = tarfile.SYMTYPE, "/tmp"
+                    tar.addfile(info)
+                    continue
+                if kind == "fifo":
+                    info.type = tarfile.FIFOTYPE
+                    tar.addfile(info)
+                    continue
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+    blank = b"\0" * (1 << 18)
+    cases = [
+        ("traversal", [("../../tmp/ripple-t", b"x", "f")], "refuse"),
+        ("absolute sanitised", [("/tmp/ripple-a", b"x", "f")], "accept"),
+        ("symlink skipped", [("escape", b"", "link"),
+                             ("escape/ripple-l", b"x", "f")], "accept"),
+        ("bomb", [(f"b/{i}.bin", blank, "f") for i in range(12)], "refuse"),
+        ("too many files", [(f"m/{i}", b"", "f") for i in range(60)], "refuse"),
+        ("file over cap", [("big", b"\0" * ((1 << 19) + 1), "f")], "refuse"),
+        ("fifo skipped", [("a.fifo", b"", "fifo"), ("ok", b"y", "f")], "accept"),
+        ("normal repo", [("r-abc/package.json", b"{}", "f")], "accept"),
+    ]
+
+    tmp = tempfile.mkdtemp(prefix="ripple-arch-")
+    try:
+        for label, members, expected in cases:
+            arch = os.path.join(tmp, f"{label.replace(' ', '_')}.tar.gz")
+            build(arch, members)
+            into = tempfile.mkdtemp(dir=tmp)
+            try:
+                _extract(arch, into, small)
+                got = "accept"
+            except (RepoTooLarge, WorkspaceError):
+                got = "refuse"
+            except Exception:                       # noqa: BLE001
+                got = "refuse"                      # the filter's own errors count
+            assert got == expected, f"{label}: expected {expected}, got {got}"
+
+            # Containment, for every case including the accepted ones.
+            real_into = os.path.realpath(into)
+            for base, dirs, names in os.walk(into):
+                for name in names:
+                    full = os.path.realpath(os.path.join(base, name))
+                    assert full.startswith(real_into + os.sep), \
+                        f"{label}: escaped the tree -- {full}"
+                for entry in dirs + names:
+                    assert not os.path.islink(os.path.join(base, entry)), \
+                        f"{label}: a symlink was created -- {entry}"
+
+            for probe in ("/tmp/ripple-t", "/tmp/ripple-a", "/tmp/ripple-l"):
+                assert not os.path.exists(probe), \
+                    f"{label}: wrote outside the tree -- {probe}"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_an_extracted_tree_is_a_project_a_compiler_can_read():
+    """The reason cloning exists: a tree typechecks, a single file does not.
+
+    Asserts the GitHub archive SHAPE is handled -- one `{owner}-{repo}-{sha}` wrapper
+    directory. Returning the temp root instead would put every relative path one
+    level off, and a tsconfig lookup would silently find nothing, which reads as
+    "this repo has no TypeScript project" rather than as a bug here.
+
+    The compiler half needs a validation backend and SKIPS without one, but the shape
+    assertions always run.
+    """
+    import tarfile
+    import tempfile
+
+    from app.repo_workspace import Limits, _extract, _single_root
+    from app.validation import choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fixture = os.path.join(root, "fixtures", "typescript-openapi", "remove-field",
+                           "consumer")
+    tmp = tempfile.mkdtemp(prefix="ripple-tree-")
+    try:
+        arch = os.path.join(tmp, "r.tar.gz")
+        with tarfile.open(arch, "w:gz") as tar:
+            for base, dirs, names in os.walk(fixture):
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+                for name in names:
+                    full = os.path.join(base, name)
+                    tar.add(full, arcname=os.path.join(
+                        "acme-billing-abc1234", os.path.relpath(full, fixture)))
+
+        into = os.path.join(tmp, "tree")
+        os.makedirs(into)
+        files, _written = _extract(arch, into, Limits())
+        assert files >= 3, files
+
+        tree = _single_root(into)
+        assert os.path.basename(tree) == "acme-billing-abc1234", tree
+        for required in ("tsconfig.json", "package.json"):
+            assert os.path.exists(os.path.join(tree, required)), \
+                f"{required} missing from the extracted tree, so tsc cannot resolve " \
+                f"the project -- the single-root unwrap is wrong"
+
+        backend, _note = choose_backend()
+        if not backend:
+            print("      SKIP: no validation backend for the compiler half")
+            return
+
+        from app.fix_templates import apply_fix_template
+        from app.validation import validate
+
+        # Unfixed, the tree must be INVALID -- proof the compiler is really seeing
+        # the project rather than an empty directory.
+        assert validate("typescript", tree).state.value == "INVALID", \
+            "the unfixed tree typechecked, so the compiler is not seeing the project"
+
+        target = os.path.join(tree, "src", "checkout.ts")
+        with open(target) as fh:
+            before = fh.read()
+        fixed, _expl = apply_fix_template(
+            code=before, language="typescript", change_type="removed_field",
+            field_name="phoneNumber")
+        assert fixed != before
+        with open(target, "w") as fh:
+            fh.write(fixed)
+
+        assert validate("typescript", tree).state.value == "VALID", \
+            "the fix did not typecheck against the extracted tree"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(_main())
