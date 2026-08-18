@@ -234,6 +234,16 @@ def canonical_op(change_type: str) -> str:
     if "enum" in lowered and "removed" in lowered:
         return "remove_enum_value"
     if "removed" in lowered:
+        # PACKAGE-ish first. Without this group, a plausible future dialect like
+        # `removed_package` fell through to `remove_field` -- and that is the unsafe
+        # direction: remove_package is JUDGMENT while remove_field is MECHANICAL, so
+        # a deleted directory of contracts would have been routed into an automated
+        # field-removal fix. The four dialects engines actually emit
+        # (package_removed, spec_removed, directory_removed, module_removed) are in
+        # CHANGE_TYPE_MAP and were never affected; this closes the fallback.
+        if any(k in lowered for k in ("package", "module", "directory", "namespace",
+                                      "spec", "schema_file")):
+            return "remove_package"
         return "remove_type" if any(k in lowered for k in
                                     ("type", "table", "message", "struct", "structure")) else "remove_field"
     if "number_changed" in lowered or "id_changed" in lowered:

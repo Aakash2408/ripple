@@ -3805,17 +3805,18 @@ def test_codemod_coverage_does_not_regress():
 
     # COUNTS, not a percentage. The audit printed 84.6% as "85%" and a floor set from
     # that display then failed against the real value. Integers cannot round.
-    assert handled >= 12, f"handled dropped to {handled} of {total}, was 12"
-    assert missed <= 2, f"{missed} unimplemented shapes, was 2"
+    # 17 after the JSX attribute shape landed: React consumers dominate real
+    # TypeScript, so an attribute is plausibly more common than the object literal
+    # that was already handled.
+    assert handled >= 17, f"handled dropped to {handled} of {total}, was 17"
+    assert missed <= 1, f"{missed} unimplemented shapes, was 1"
 
     # Judgment references must stay refused. If this count ever DROPS, a judgment
     # call was silently transformed -- which would raise coverage while making the
     # product less safe, so it is the assertion that matters most here.
-    # 6 after Stage 3 added the two side-effecting keyed-property cases. If this
-    # count DROPS, a judgment call was silently transformed -- which would raise
-    # coverage while making the product less safe, so it is the assertion that
-    # matters most in this test.
-    assert judgment == 6, f"judgment references changed to {judgment}, was 6"
+    # 7 after default-parameter-object-value was added: it is the case that fails if
+    # _inside_jsx_tag is ever deleted, which was measured to destroy a signature.
+    assert judgment == 7, f"judgment references changed to {judgment}, was 7"
     # 5 after the same-line template case was added: its static text is a note while
     # its ${...} contents are an edit. If this DROPS, the position classifier stopped
     # distinguishing prose from code -- which would either rewrite a customer's
@@ -3931,7 +3932,7 @@ def test_every_historical_false_valid_stays_blocked():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
     import audit_negative_corpus as neg
 
-    assert len(neg.CORPUS) >= 6, \
+    assert len(neg.CORPUS) >= 7, \
         f"the negative corpus shrank to {len(neg.CORPUS)} -- entries are permanent"
 
     ids = [c["id"] for c in neg.CORPUS]
@@ -3939,10 +3940,19 @@ def test_every_historical_false_valid_stays_blocked():
 
     layers = {}
     for case in neg.CORPUS:
+        provenance = case.get("provenance", neg.HISTORICAL)
         was_valid, err = neg._historical_validate(case["after"], case["language"])
-        assert was_valid, (
-            f"{case['id']}: the deleted validator REJECTED this ({err}), so it is "
-            f"not one of the false VALIDs and does not belong in the corpus")
+        if provenance == neg.HISTORICAL:
+            assert was_valid, (
+                f"{case['id']}: the deleted validator REJECTED this ({err}), so it is "
+                f"not one of the false VALIDs and does not belong in the corpus")
+        else:
+            # An OBSERVED entry has no old validator to replay against, so its
+            # anti-padding evidence is that what the CURRENT toolchain says about it
+            # is written down. A model failure tsc already rejects needs no memory
+            # here -- production catches it.
+            assert case.get("compiler_note"), \
+                f"{case['id']} is OBSERVED but records no compiler_note"
 
         result = neg._run_stack(case)
         assert result["blocked"], f"{case['id']} ESCAPED: {result['detail']}"
@@ -3961,6 +3971,17 @@ def test_every_historical_false_valid_stays_blocked():
     half = [c for c in neg.CORPUS if "half_fix" in c["id"]]
     assert half, "the half-fix case was removed -- it is the one tsc lets through"
     assert half[0]["blocked_by"] == "diff", half[0]["blocked_by"]
+
+    # And at least one entry must be a REAL model failure rather than a replay.
+    # Synthetic cases prove the layers work; an observed one proves they are needed.
+    observed = [c for c in neg.CORPUS
+                if c.get("provenance") == neg.OBSERVED]
+    assert observed, \
+        "no OBSERVED entry -- the corpus is entirely synthetic, so nothing in it " \
+        "shows a real model producing a fix the compiler accepts"
+    assert all(c["blocked_by"] == "diff" for c in observed), \
+        "an observed model failure is blocked by something other than the diff " \
+        "contract; if that is now true, say so deliberately"
 
 
 def test_deployed_capability_is_reported_not_assumed():
@@ -4064,6 +4085,40 @@ def test_safety_layers_are_reachable_or_declared_unreachable():
         "validation became reachable -- if it is now genuinely wired, update " \
         "LAYERS and this assertion together, deliberately"
 
+    # EVERY import form must be visible to the scanner. `from . import x` is an
+    # ImportFrom whose node.module is None, and reading node.module skipped the
+    # statement entirely -- so that form was INVISIBLE, in a scanner whose own entry
+    # point (app/webhook.py) uses it. Found by mutation: wiring repo_workspace that
+    # way did not fail the gate. A gate that cannot see a real import is worse than
+    # no gate, because it reports "unreachable" with confidence.
+    import ast
+    import tempfile
+
+    probe = tempfile.mkdtemp(prefix="ripple-imp-")
+    try:
+        for form in ("from . import ts_codemod",
+                     "from . import ts_codemod as _t",
+                     "from .ts_codemod import remove_field",
+                     "from app.ts_codemod import remove_field",
+                     "import app.ts_codemod"):
+            path = os.path.join(probe, "probe.py")
+            with open(path, "w") as fh:
+                fh.write(form + "\n")
+            ast.parse(form)                      # the form must be valid Python
+            assert "ts_codemod" in reach._module_imports(path), \
+                f"the scanner cannot see this import form: {form!r}"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(probe, ignore_errors=True)
+
+    # repo_workspace must be REGISTERED even while unwired. It was built, tested and
+    # CI-gated on the same day, imported by nothing -- the exact state diff_contract
+    # sat in for three stages while a commit message claimed it was wired. Being
+    # able to SEE the gap is the point.
+    assert "repo_workspace" in reach.LAYERS, \
+        "repo_workspace is not registered, so nothing reports that the tree fetch " \
+        "is unreachable from production"
+
 
 def test_a_partial_removal_returns_the_original_not_broken_code():
     """The diff contract now runs in the request path, so half-fixes never ship.
@@ -4118,6 +4173,589 @@ def test_a_partial_removal_returns_the_original_not_broken_code():
     assert out2 != complete and "phoneNumber" not in out2, \
         "the diff contract rejected a CORRECT complete removal -- it is now " \
         "over-refusing, which silently costs every fix"
+
+
+def test_the_llm_branch_is_subject_to_the_diff_contract():
+    """The diff contract must gate EVERY generator path, not just the template.
+
+    It was wired inside fix_templates._remove_field_typescript, which the LLM branch
+    never reaches -- _generate_with_llm returns its output directly and only falls
+    back to a template on exception. So the deterministic generator was checked and
+    the probabilistic one was not, which is backwards.
+
+    The bad output below is the REAL thing, captured from a live gemini-flash-latest
+    call asked to REMOVE phoneNumber: it added the field as a function parameter
+    instead, which breaks every caller. `tsc --noEmit` returns VALID on it -- adding
+    a parameter and using it is well-typed -- so the compiler cannot save us here and
+    the diff contract is the only layer that objects. Preserved as
+    known_bad_fix_007 in the negative corpus.
+
+    Monkeypatched rather than calling a model, so this is deterministic and needs no
+    network -- but the payload is not invented.
+    """
+    import inspect
+    import tempfile
+
+    from app import fix_generator as fg
+    from app.consumer_finder import ConsumerMatch
+    from app.diff_engine import BreakingChange
+
+    def _mk(cls, **over):
+        kw = {}
+        for name, p in inspect.signature(cls).parameters.items():
+            if name in over:
+                kw[name] = over[name]
+                continue
+            if p.default is not inspect.Parameter.empty:
+                continue
+            ann = str(p.annotation)
+            kw[name] = (0.9 if "float" in ann else
+                        1 if "int" in ann else
+                        [] if "list" in ann else "")
+        return cls(**kw)
+
+    original = (
+        'import { User } from "./types";\n'
+        "\n"
+        "export function formatContact(user: User): string {\n"
+        "  return `${user.fullName} <${user.email}> ${user.phoneNumber}`;\n"
+        "}\n"
+    )
+    llm_bad = original.replace(
+        "export function formatContact(user: User): string {",
+        "export function formatContact(user: User, phoneNumber: string): string {"
+    ).replace("> ${user.phoneNumber}`;", "> ${phoneNumber}`;")
+    assert "phoneNumber: string" in llm_bad and llm_bad != original
+
+    tmp = tempfile.mkdtemp(prefix="ripple-llmgate-")
+    path = os.path.join(tmp, "checkout.ts")
+    with open(path, "w") as fh:
+        fh.write(original)
+
+    consumer = _mk(ConsumerMatch, file_path=path, repo="billing-api",
+                   language="typescript", confidence="high")
+    change = _mk(BreakingChange, change_type="removed_field",
+                 field_name="phoneNumber", severity="breaking",
+                 description="phoneNumber removed from User")
+
+    saved_llm = fg._generate_with_llm
+    saved_key = None
+    try:
+        from app import llm_config
+        saved_key = llm_config.api_key
+        llm_config.api_key = lambda: "DUMMY"          # take the LLM branch
+        fg._generate_with_llm = lambda *_a, **_k: (llm_bad, "llm said so")
+
+        assert fg.generate_fix(consumer, change, use_llm=True) is None, (
+            "the LLM branch produced a fix that ADDS a parameter while claiming to "
+            "remove a field, and it was accepted -- the diff contract is not gating "
+            "this path")
+
+        # A CORRECT llm output must still pass, or the gate is simply refusing
+        # everything and proves nothing.
+        good = original.replace(" ${user.phoneNumber}", "")
+        fg._generate_with_llm = lambda *_a, **_k: (good, "llm said so")
+        ok = fg.generate_fix(consumer, change, use_llm=True)
+        assert ok is not None and "user.phoneNumber" not in ok.fixed_code, \
+            "a correct LLM removal was rejected -- the gate over-refuses"
+    finally:
+        fg._generate_with_llm = saved_llm
+        if saved_key is not None:
+            from app import llm_config as _lc
+            _lc.api_key = saved_key
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_jsx_attribute_is_removed_but_a_parameter_list_is_never_touched():
+    """React consumers dominate real TypeScript, so the attribute shape matters most.
+
+    `<Row phone={user.phoneNumber} />` -> `<Row />`. Same reasoning as the
+    object-literal property: the field no longer exists upstream, so passing it
+    conveys nothing. If the prop is REQUIRED, `tsc` reports it and the validator
+    blocks the fix -- that decision belongs to the compiler, not a regex.
+
+    THE PART THAT NEEDED MEASURING, not assuming. Two guards protect this: the
+    pattern requires the braces to hold exactly a member chain, and
+    _inside_jsx_tag() scans back for the opening `<`. I assumed the pattern was
+    load-bearing. It is not -- loosening it alone changes nothing, because the scan
+    rejects a default parameter on hitting `(`. Removing the SCAN is what does
+    damage:
+
+        function f(opts={user: user.phoneNumber}) { return opts; }
+          ->  function f() { return opts; }
+
+    a destroyed signature with the body still using the parameter. So this test
+    pins the scan, and the corpus case default-parameter-object-value fails the
+    coverage gate if it is ever deleted.
+    """
+    from app.ts_codemod import remove_field
+
+    # Shapes that must be removed, including the two the first implementation
+    # REFUSED because the backward scan treated a preceding attribute's `}` as the
+    # end of the tag.
+    for label, src, expected in (
+        ("single line", 'const el = <Row phone={user.phoneNumber} />;\n',
+         "const el = <Row />;\n"),
+        ("optional chain", 'const el = <Row phone={user?.phoneNumber} />;\n',
+         "const el = <Row />;\n"),
+        ("among siblings", 'const el = <Row a={x} phone={user.phoneNumber} b={y} />;\n',
+         "const el = <Row a={x} b={y} />;\n"),
+        # `>` inside a sibling's arrow function is not the end of the tag.
+        ("after an arrow sibling",
+         'const el = <Row onClick={() => f()} phone={user.phoneNumber} />;\n',
+         "const el = <Row onClick={() => f()} />;\n"),
+        # A quoted value may contain `>` too.
+        ("after a quoted sibling",
+         'const el = <Row title="a>b" phone={user.phoneNumber} />;\n',
+         'const el = <Row title="a>b" />;\n'),
+    ):
+        r = remove_field(src, "phoneNumber")
+        assert len(r.edits) == 1 and not r.refusals, (label, r.refusals)
+        assert r.edits[0]["shape"] == "JSX attribute", (label, r.edits)
+        assert r.code == expected, (label, repr(r.code))
+
+    # Alone on its line: the LINE goes, not just the attribute, or a blank line is
+    # left behind and the diff stops being scannable.
+    multi = ('const el = (\n  <Row\n    name={user.fullName}\n'
+             '    phone={user.phoneNumber}\n  />\n);\n')
+    r = remove_field(multi, "phoneNumber")
+    assert len(r.edits) == 1 and not r.refusals, r.refusals
+    assert r.code == ('const el = (\n  <Row\n    name={user.fullName}\n  />\n);\n'), \
+        repr(r.code)
+    assert "\n\n" not in r.code, "a blank line was left where the attribute was"
+
+    # A PARAMETER LIST IS NOT AN ATTRIBUTE LIST. These must never be edited.
+    for src in ('function f(opts={user: user.phoneNumber}) {\n  return opts;\n}\n',
+                'function f(phone=user.phoneNumber) {\n  return phone;\n}\n',
+                'const o = { phone: user.phoneNumber };\n'):
+        r = remove_field(src, "phoneNumber")
+        assert not any(e["shape"] == "JSX attribute" for e in r.edits), \
+            f"the JSX rule matched outside a tag: {src!r} -> {r.code!r}"
+
+    # And the output must satisfy the diff contract, which now runs in production.
+    from app.diff_contract import check
+    for src in ('const el = <Row phone={user.phoneNumber} />;\n', multi,
+                'const el = <Row a={x} phone={user.phoneNumber} b={y} />;\n'):
+        r = remove_field(src, "phoneNumber")
+        verdict = check(src, r.code, "phoneNumber")
+        assert verdict.ok, (src, verdict.violations)
+
+
+def test_python_regions_and_a_language_aware_diff_contract():
+    """The diff contract now covers Python, and the language parameter is load-bearing.
+
+    It was TS/JS-only because the scanner knew `//` and `/* */` but not `#`. Scanning
+    Python with those rules means a stale `# phone_number is gone` comment is not a
+    comment at all -- it reads as CODE, the "field still present in CODE" rule fires,
+    and a CORRECT fix is REJECTED. That is asserted below in both directions, because
+    a language parameter nothing depends on is decoration.
+
+    F-STRINGS ARE THE HARD PART, and they are the exact analogue of TS template
+    literals: the text is string content, `{...}` holds real code.
+
+        f"phone_number={user.phone_number}"
+          ^^^^^^^^^^^^ string (a NOTE)     ^^^^^^^^^^^^^^^^^ code (must be fixed)
+
+    Getting that backwards fails silently in one direction (the fix never happens)
+    and destructively in the other (a customer's log message is rewritten).
+    """
+    import re
+
+    from app.diff_contract import check
+    from app.source_regions import SCANNED, regions
+
+    def kinds(src, field="phone_number"):
+        spans = regions(src, "python")
+        return [next((k for s, e, k in spans if s <= m.start() < e), "CODE")
+                for m in re.finditer(rf"\b{field}\b", src)]
+
+    for label, src, expected in (
+        ("hash comment", "# phone_number is gone\nx = 1\n", ["comment"]),
+        ("member access", "p = user.phone_number\n", ["CODE"]),
+        ("plain string", 'log("phone_number gone")\n', ["string"]),
+        ("docstring", 'def f():\n    """phone_number removed."""\n    return 1\n',
+         ["string"]),
+        ("triple single", "x = '''phone_number'''\n", ["string"]),
+        ("f-string text", 'msg = f"phone_number missing"\n', ["string"]),
+        ("f-string interpolation", 'msg = f"{user.phone_number}"\n', ["CODE"]),
+        # One line, BOTH position classes -- the case that cannot be expressed by a
+        # rule as coarse as `if field in line`.
+        ("f-string both", 'msg = f"phone_number={user.phone_number}"\n',
+         ["string", "CODE"]),
+        # `{{` is a literal brace, not an interpolation. Reading it as one would put
+        # the following text in a code span.
+        ("escaped braces", 'msg = f"{{phone_number}} {user.phone_number}"\n',
+         ["string", "CODE"]),
+        ("raw string", "p = r'phone_number\\d'\n", ["string"]),
+        ("rf-string", 'm = rf"a{user.phone_number}"\n', ["CODE"]),
+        # `format_f` must not be read as an `f` prefix on the following quote.
+        ("not a prefix", "format_f = user.phone_number\n", ["CODE"]),
+    ):
+        assert kinds(src) == expected, (label, kinds(src), expected)
+
+    # THE LOAD-BEARING ASSERTION. A correct Python fix that leaves a stale comment
+    # passes as Python and is WRONGLY REJECTED as TypeScript.
+    before = ("# phone_number was removed upstream\n"
+              "class User:\n    name: str\n    phone_number: str\n")
+    after = "# phone_number was removed upstream\nclass User:\n    name: str\n"
+    assert check(before, after, "phone_number", language="python").ok, \
+        "a correct Python removal was rejected with the Python scanner"
+    assert not check(before, after, "phone_number", language="typescript").ok, \
+        "the language parameter changes nothing -- scanning Python as TypeScript " \
+        "should misread the `#` comment as code, so either the scanner regressed " \
+        "or this check is not consulting it"
+
+    # And it must have TEETH on Python, not merely accept everything.
+    src = ('# keep this note\n'
+           'def build(user):\n'
+           '    payload = {}\n'
+           '    payload["email"] = user.email\n'
+           '    payload["phone"] = user.phone_number\n'
+           '    return payload\n')
+    good = src.replace('    payload["phone"] = user.phone_number\n', "")
+    assert check(src, good, "phone_number", language="python").ok, "correct fix"
+    for label, bad in (
+        ("collateral deletion",
+         good.replace('    payload["email"] = user.email\n', "")),
+        ("partial removal",
+         src.replace('    payload["phone"] = user.phone_number\n',
+                     "    phone = user.phone_number\n")),
+        ("rewrote the comment",
+         good.replace("# keep this note", "# phone_number gone")),
+        ("no-op", src),
+    ):
+        assert not check(src, bad, "phone_number", language="python").ok, \
+            f"the Python diff contract rubber-stamped: {label}"
+
+    # The production gate keys off SCANNED, so a language can never be admitted
+    # without a scanner -- adding one is the single edit that widens coverage.
+    assert "python" in SCANNED and "typescript" in SCANNED, SCANNED
+    src_gate = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "fix_generator.py")).read()
+    assert "lang in _SCANNED" in src_gate, \
+        "fix_generator no longer gates on source_regions.SCANNED, so a language " \
+        "with no scanner can reach the diff contract and be misjudged"
+
+
+def test_llm_is_briefed_per_operation_and_never_given_contradictory_orders():
+    """The prompt must describe the operation being performed.
+
+    There was ONE hardcoded instruction block, used for every change_type:
+
+        1. Add the new required field "{field}" to the API call.
+        2. Add it as a parameter/argument that callers must provide.
+
+    with no branching. So a REMOVAL asked the model to ADD the field. Measured on a
+    live gemini-flash-latest call: asked to remove `phoneNumber`, it added
+    `phoneNumber: string` to two signatures and explained itself as "Added required
+    field" -- doing exactly what it was told. Only the diff contract stopped it, and
+    it read as model unreliability for a day. It was the prompt.
+
+    The table is an ALLOWLIST. An unlisted operation gets NO LLM attempt and returns
+    to the deterministic path, because the previous shape was the "unknown enum falls
+    through to the weakest path" defect: every unrecognised operation silently
+    inherited add-a-required-field.
+    """
+    from app.diff_engine import BreakingChange
+    from app.fix_generator import _llm_explanation, _llm_instructions
+
+    def change(**kw):
+        base = dict(change_type="", path="/users", method="get", field_name="phone",
+                    field_type="string", location="request_body", severity="breaking",
+                    description="")
+        base.update(kw)
+        return BreakingChange(**base)
+
+    # Each briefed operation must be told to do THAT operation.
+    for change_type, must_contain, must_not in (
+        ("removed_field", "REMOVE every reference", "Add it as a parameter"),
+        ("added_required_field", "now REQUIRED", "REMOVE every reference"),
+        ("renamed_field", "was RENAMED", "REMOVE every reference"),
+        ("field_type_changed", "changed type", "REMOVE every reference"),
+    ):
+        kw = {"change_type": change_type}
+        if change_type == "renamed_field":
+            kw["new_name"] = "phone_no"
+        if change_type == "field_type_changed":
+            kw["new_type"] = "number"
+        text = _llm_instructions(change(**kw))
+        assert text, change_type
+        assert must_contain in text, (change_type, text[:120])
+        assert must_not not in text, \
+            f"{change_type} inherited instructions for a different operation"
+
+    # JUDGMENT operations are absent by design -- REVIEW is the correct answer for
+    # them, not a prompt. The first four are the dialects engines actually emit; the
+    # last two exercise the suffix FALLBACK, where `removed_package` used to degrade
+    # to `remove_field` and would have been briefed as a field removal.
+    for change_type in ("removed_operation", "package_removed", "spec_removed",
+                        "directory_removed", "removed_package", "restrict_schema"):
+        assert _llm_instructions(change(change_type=change_type)) == "", \
+            f"{change_type} is being briefed to the LLM; it is a judgment call"
+
+    # An unknown operation must get NOTHING rather than the nearest match.
+    assert _llm_instructions(change(change_type="%%nonsense%%")) == "", \
+        "an unrecognised change_type received instructions -- the allowlist leaks"
+
+    # Instructions that interpolate a field must refuse when it is empty, or the
+    # model is asked to rename something to "" and will invent a plausible answer.
+    assert _llm_instructions(change(change_type="renamed_field")) == "", \
+        "a rename with no new_name was briefed anyway"
+    assert _llm_instructions(change(change_type="field_type_changed")) == "", \
+        "a type change with no new_type was briefed anyway"
+
+    # The EXPLANATION is what a customer reads in the PR body, and it was hardcoded
+    # to "Added required field" for every operation -- so a removal PR announced
+    # itself as an addition.
+    assert "Removed references" in _llm_explanation(change(change_type="removed_field"))
+    assert "Added" in _llm_explanation(change(change_type="added_required_field"))
+    assert "Renamed" in _llm_explanation(
+        change(change_type="renamed_field", new_name="phone_no"))
+    assert "Added" not in _llm_explanation(change(change_type="removed_field")), \
+        "a removal is still described as an addition"
+
+
+def test_llm_output_keeps_the_files_trailing_newline():
+    """`.strip()` on the response dropped the final newline, and the contract noticed.
+
+    An otherwise CORRECT live fix was rejected with "REMOVED text that does not
+    reference 'phoneNumber': '\\n'". The contract was right -- losing the trailing
+    newline puts "\\ No newline at end of file" in the diff, which is an unrelated
+    change. The loss was ours, not the model's, and I attributed it to the model
+    first.
+
+    Normalising the generator's OUTPUT is the fix. Relaxing the verifier to ignore
+    trailing whitespace would have hidden a real class of unrelated change.
+    """
+    import inspect
+    import tempfile
+
+    from app import fix_generator as fg
+    from app.consumer_finder import ConsumerMatch
+    from app.diff_engine import BreakingChange
+    from app.diff_contract import check
+
+    def _mk(cls, **over):
+        kw = {}
+        for name, p in inspect.signature(cls).parameters.items():
+            if name in over:
+                kw[name] = over[name]
+                continue
+            if p.default is not inspect.Parameter.empty:
+                continue
+            ann = str(p.annotation)
+            kw[name] = (0.9 if "float" in ann else 1 if "int" in ann
+                        else [] if "list" in ann else "")
+        return cls(**kw)
+
+    original = ('import { User } from "./types";\n'
+                "\n"
+                "export function f(user: User): string {\n"
+                "  return `${user.fullName} ${user.phoneNumber}`;\n"
+                "}\n")
+    # A correct removal that has LOST the trailing newline, which is what .strip()
+    # used to produce.
+    stripped = original.replace(" ${user.phoneNumber}", "").rstrip("\n")
+
+    tmp = tempfile.mkdtemp(prefix="ripple-nl-")
+    path = os.path.join(tmp, "f.ts")
+    with open(path, "w") as fh:
+        fh.write(original)
+
+    consumer = _mk(ConsumerMatch, file_path=path, repo="r", language="typescript",
+                   confidence="high")
+    ch = _mk(BreakingChange, change_type="removed_field", field_name="phoneNumber",
+             method="get", path="/users", field_type="string", severity="breaking")
+
+    # Without restoration the contract rejects it -- proving the rule has teeth and
+    # that the restoration below is doing real work rather than being cosmetic.
+    assert not check(original, stripped, "phoneNumber",
+                     language="typescript").ok, \
+        "losing the trailing newline no longer violates the contract, so this " \
+        "normalisation is untested"
+
+    saved = fg._generate_with_llm
+    try:
+        from app import llm_config
+        saved_key = llm_config.api_key
+        llm_config.api_key = lambda: "DUMMY"
+        # The generator hands back the stripped form; generate_fix must still produce
+        # a patch the contract accepts.
+        fg._generate_with_llm = lambda *_a, **_k: (stripped, "removed")
+        got = fg.generate_fix(consumer, ch, use_llm=True)
+        assert got is not None, \
+            "a correct fix was refused only because the trailing newline was lost"
+        assert got.fixed_code.endswith("\n"), got.fixed_code[-20:]
+    finally:
+        fg._generate_with_llm = saved
+        from app import llm_config as _lc
+        _lc.api_key = saved_key
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_repo_archive_extraction_is_contained_and_capped():
+    """Extraction takes an archive built by whoever owns the repo. Untrusted input.
+
+    Stage 1 replaced per-file `contents/` fetches with a whole-tree fetch, because a
+    compiler needs a PROJECT and a file in isolation typechecks nothing. The cost of
+    that unlock is that we now extract someone else's archive, and the classic
+    attacks are not theoretical.
+
+    THE INVARIANT IS CONTAINMENT, NOT REFUSAL. Two hostile shapes are ACCEPTED and
+    still safe, which is why asserting "it refused" would assert the wrong thing:
+
+        absolute member path   data_filter STRIPS the leading slash, so `/tmp/x`
+                               lands inside the tree as `tmp/x`
+        symlink member         _extract skips every non-regular member, so the link
+                               is never created and there is nothing to escape through
+
+    Sizes and counts are ours, because a filter cannot know our budget.
+    """
+    import io
+    import tarfile
+    import tempfile
+
+    from app.repo_workspace import Limits, RepoTooLarge, WorkspaceError, _extract
+
+    small = Limits(download_bytes=1 << 20, extracted_bytes=2 << 20, files=50,
+                   file_bytes=1 << 19, timeout_seconds=5)
+
+    def build(path, members):
+        with tarfile.open(path, "w:gz") as tar:
+            for name, data, kind in members:
+                info = tarfile.TarInfo(name)
+                if kind == "link":
+                    info.type, info.linkname = tarfile.SYMTYPE, "/tmp"
+                    tar.addfile(info)
+                    continue
+                if kind == "fifo":
+                    info.type = tarfile.FIFOTYPE
+                    tar.addfile(info)
+                    continue
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+    blank = b"\0" * (1 << 18)
+    cases = [
+        ("traversal", [("../../tmp/ripple-t", b"x", "f")], "refuse"),
+        ("absolute sanitised", [("/tmp/ripple-a", b"x", "f")], "accept"),
+        ("symlink skipped", [("escape", b"", "link"),
+                             ("escape/ripple-l", b"x", "f")], "accept"),
+        ("bomb", [(f"b/{i}.bin", blank, "f") for i in range(12)], "refuse"),
+        ("too many files", [(f"m/{i}", b"", "f") for i in range(60)], "refuse"),
+        ("file over cap", [("big", b"\0" * ((1 << 19) + 1), "f")], "refuse"),
+        ("fifo skipped", [("a.fifo", b"", "fifo"), ("ok", b"y", "f")], "accept"),
+        ("normal repo", [("r-abc/package.json", b"{}", "f")], "accept"),
+    ]
+
+    tmp = tempfile.mkdtemp(prefix="ripple-arch-")
+    try:
+        for label, members, expected in cases:
+            arch = os.path.join(tmp, f"{label.replace(' ', '_')}.tar.gz")
+            build(arch, members)
+            into = tempfile.mkdtemp(dir=tmp)
+            try:
+                _extract(arch, into, small)
+                got = "accept"
+            except (RepoTooLarge, WorkspaceError):
+                got = "refuse"
+            except Exception:                       # noqa: BLE001
+                got = "refuse"                      # the filter's own errors count
+            assert got == expected, f"{label}: expected {expected}, got {got}"
+
+            # Containment, for every case including the accepted ones.
+            real_into = os.path.realpath(into)
+            for base, dirs, names in os.walk(into):
+                for name in names:
+                    full = os.path.realpath(os.path.join(base, name))
+                    assert full.startswith(real_into + os.sep), \
+                        f"{label}: escaped the tree -- {full}"
+                for entry in dirs + names:
+                    assert not os.path.islink(os.path.join(base, entry)), \
+                        f"{label}: a symlink was created -- {entry}"
+
+            for probe in ("/tmp/ripple-t", "/tmp/ripple-a", "/tmp/ripple-l"):
+                assert not os.path.exists(probe), \
+                    f"{label}: wrote outside the tree -- {probe}"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_an_extracted_tree_is_a_project_a_compiler_can_read():
+    """The reason cloning exists: a tree typechecks, a single file does not.
+
+    Asserts the GitHub archive SHAPE is handled -- one `{owner}-{repo}-{sha}` wrapper
+    directory. Returning the temp root instead would put every relative path one
+    level off, and a tsconfig lookup would silently find nothing, which reads as
+    "this repo has no TypeScript project" rather than as a bug here.
+
+    The compiler half needs a validation backend and SKIPS without one, but the shape
+    assertions always run.
+    """
+    import tarfile
+    import tempfile
+
+    from app.repo_workspace import Limits, _extract, _single_root
+    from app.validation import choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fixture = os.path.join(root, "fixtures", "typescript-openapi", "remove-field",
+                           "consumer")
+    tmp = tempfile.mkdtemp(prefix="ripple-tree-")
+    try:
+        arch = os.path.join(tmp, "r.tar.gz")
+        with tarfile.open(arch, "w:gz") as tar:
+            for base, dirs, names in os.walk(fixture):
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+                for name in names:
+                    full = os.path.join(base, name)
+                    tar.add(full, arcname=os.path.join(
+                        "acme-billing-abc1234", os.path.relpath(full, fixture)))
+
+        into = os.path.join(tmp, "tree")
+        os.makedirs(into)
+        files, _written = _extract(arch, into, Limits())
+        assert files >= 3, files
+
+        tree = _single_root(into)
+        assert os.path.basename(tree) == "acme-billing-abc1234", tree
+        for required in ("tsconfig.json", "package.json"):
+            assert os.path.exists(os.path.join(tree, required)), \
+                f"{required} missing from the extracted tree, so tsc cannot resolve " \
+                f"the project -- the single-root unwrap is wrong"
+
+        backend, _note = choose_backend()
+        if not backend:
+            print("      SKIP: no validation backend for the compiler half")
+            return
+
+        from app.fix_templates import apply_fix_template
+        from app.validation import validate
+
+        # Unfixed, the tree must be INVALID -- proof the compiler is really seeing
+        # the project rather than an empty directory.
+        assert validate("typescript", tree).state.value == "INVALID", \
+            "the unfixed tree typechecked, so the compiler is not seeing the project"
+
+        target = os.path.join(tree, "src", "checkout.ts")
+        with open(target) as fh:
+            before = fh.read()
+        fixed, _expl = apply_fix_template(
+            code=before, language="typescript", change_type="removed_field",
+            field_name="phoneNumber")
+        assert fixed != before
+        with open(target, "w") as fh:
+            fh.write(fixed)
+
+        assert validate("typescript", tree).state.value == "VALID", \
+            "the fix did not typecheck against the extracted tree"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

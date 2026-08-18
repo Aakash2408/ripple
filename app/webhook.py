@@ -299,19 +299,27 @@ async def health_capability():
     condition -- and does not re-implement the registry's rule for which cells earn
     AUTO, because a second copy of that rule is how two surfaces start disagreeing.
     """
-    from .validation import describe_backend
+    from .validation import describe_backend, DEGRADED_OPT_IN
 
     described = describe_backend()
+    # The hint must name the ACTUAL reason. It used to say "this image has no
+    # TypeScript toolchain" for every can_validate=False, which became wrong the
+    # moment node was added to the image and the refusal was the opt-in gate
+    # instead -- a message telling a stale story about the world, which is the
+    # failure build_info exists to prevent, reappearing in the thing that reports it.
+    hint = None
+    if not described["can_validate"]:
+        if "toolchain exists" in (described.get("isolation") or ""):
+            hint = (f"A toolchain IS present; the host backend is DEGRADED and "
+                    f"{DEGRADED_OPT_IN} is not set. Set it to accept that isolation "
+                    f"level, or leave production REVIEW-only.")
+        else:
+            hint = ("This image has no TypeScript toolchain, so every fix will be "
+                    "UNABLE_TO_VALIDATE and no cell can reach AUTO here.")
+
     return {
         "healthy": True,
-        "validation": {
-            **described,
-            "hint": None if described["can_validate"] else (
-                "This image has no TypeScript toolchain, so every fix will be "
-                "UNABLE_TO_VALIDATE and no cell can reach AUTO here. Add node to "
-                "the image, or accept that production is REVIEW-only."
-            ),
-        },
+        "validation": {**described, "hint": hint},
         "build": build_info(),
     }
 

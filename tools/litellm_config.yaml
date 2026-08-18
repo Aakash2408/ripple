@@ -44,17 +44,60 @@ model_list:
       api_key: os.environ/GEMINI_API_KEY
 
 litellm_settings:
-  # Fail fast in local testing rather than retrying into a rate limit.
-  num_retries: 0
+  # Per-ATTEMPT timeout, not a total budget. With retries below, a worst-case call
+  # is bounded by (attempts x this) + backoff.
   request_timeout: 60
 
   # The free tier returns HTTP 503 "experiencing high demand" unpredictably --
   # observed on gemini-flash-latest while -lite served the same prompt fine.
   # Without fallbacks a single 503 fails the whole run, which looks like a
   # wiring bug rather than congestion.
+  #
+  # Left in litellm_settings rather than moved to router_settings because it is
+  # OBSERVED WORKING here -- the chain fired during a real session. Moving config
+  # that works to where the docs prefer it is how you acquire a mystery.
   fallbacks:
     - gemini-flash-latest: ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
     - gemini-3.5-flash: ["gemini-3.5-flash-lite"]
+
+# RETRIES. These are Router arguments, so they belong here and NOT in
+# litellm_settings -- the proxy passes router_settings straight to Router(), while
+# litellm_settings keys are setattr'd onto the module, so a misplaced key here would
+# be accepted in silence and do nothing.
+#
+# WHY THIS REVERSES THE EARLIER `num_retries: 0`
+# That was justified as "fail fast in local testing rather than retrying into a rate
+# limit", on the assumption that retries would mask wiring bugs. They cannot.
+# litellm.utils._should_retry() returns True for 408, 409, 429 and 5xx ONLY, and
+# False for every other 4xx. So a wrong model name (404), a bad key (401) or a
+# malformed request (400) still fails immediately and loudly -- which is the entire
+# class of bug the fail-fast setting existed to expose.
+#
+# What it DOES change is the measured failure mode. One real session:
+#     200  31   |  429  8  |  500  4      -- 72% success
+# The 429s were PER-MINUTE quota, not the daily cap: every model answered fine once
+# the minute rolled over. Failing a developer's request over a limit that clears in
+# seconds is the wrong trade for interactive use.
+#
+# retry_after matters more than it looks. Router._time_to_sleep_before_retry()
+# returns 0 -- an INSTANT retry -- when the model group has other healthy
+# deployments. Each model_name here has exactly one deployment so real backoff
+# applies, but a floor is set explicitly rather than relying on that staying true.
+# An instant retry into a per-minute rate limit just burns another request.
+router_settings:
+  num_retries: 3
+  retry_after: 5            # seconds, minimum -- a 429 needs real waiting
+
+  # Per-exception counts, so the numbers say which failures are worth waiting on.
+  # The three zeros are the point: they keep the fail-fast property for the errors
+  # that indicate a bug rather than congestion.
+  retry_policy:
+    RateLimitErrorRetries: 4
+    InternalServerErrorRetries: 3
+    TimeoutErrorRetries: 2
+    BadRequestErrorRetries: 0
+    AuthenticationErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
 
 general_settings:
   # No master key: this listens on localhost only and is for local testing.

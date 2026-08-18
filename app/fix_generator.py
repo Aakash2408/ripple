@@ -67,7 +67,82 @@ def generate_fix(
     
     if not fixed_code or fixed_code == original_code:
         return None
-    
+
+    # RESTORE THE TRAILING NEWLINE CONVENTION, for EVERY generator.
+    #
+    # `_generate_with_llm` calls .strip() on the response to shed surrounding
+    # whitespace and code fences, which also removes the file's final newline. An
+    # otherwise CORRECT live fix was then rejected by the diff contract with
+    # "REMOVED text that does not reference 'phoneNumber': '\n'". The contract was
+    # right -- losing it puts "\ No newline at end of file" in the diff, an unrelated
+    # change. The loss was ours, not the model's.
+    #
+    # This lives HERE rather than inside the LLM branch, where it was first written.
+    # A test that monkeypatches the generator bypassed it entirely, which was the
+    # signal that it also protected only one of the two paths. Normalising once at
+    # the point both paths converge is the correct placement, and relaxing the
+    # verifier to ignore trailing whitespace would have hidden a real class of
+    # unrelated change.
+    if original_code.endswith("\n") and not fixed_code.endswith("\n"):
+        fixed_code += "\n"
+        if fixed_code == original_code:
+            return None                  # the only difference WAS the newline
+
+    # THE DIFF CONTRACT, ON EVERY PATH -- INCLUDING THE LLM.
+    #
+    # It was wired inside fix_templates._remove_field_typescript, which the LLM
+    # branch never reaches: _generate_with_llm returns its output directly and only
+    # falls back to a template on EXCEPTION. So the deterministic generator was
+    # checked and the probabilistic one was not, which is exactly backwards.
+    #
+    # Measured, not hypothesised. Asked to REMOVE `phoneNumber`, a live Gemini call
+    # through the LiteLLM proxy ADDED a parameter instead:
+    #
+    #   - export function formatContact(user: User): string {
+    #   + export function formatContact(user: User, phoneNumber: string): string {
+    #
+    # That breaks every caller. `tsc --noEmit` returned VALID -- adding a parameter
+    # and using it is perfectly well-typed -- and only the diff contract objected,
+    # with "INSERTED text into a line, which a removal never does". Preserved as
+    # known_bad_fix_007 in tools/audit_negative_corpus.py.
+    #
+    # TWO GATES, both of which matter:
+    #
+    #   REMOVALS ONLY. The contract forbids insertions. An add_required fix inserts
+    #   by definition, so applying this to one would reject every correct fix.
+    #
+    #   ONLY LANGUAGES WITH A REAL SCANNER. The gate is source_regions.SCANNED
+    #   rather than a literal tuple, so adding a scanner is the ONE edit that widens
+    #   coverage and a language can never be admitted here without one. It used to
+    #   read ("typescript", "javascript") with a note that Python needed teaching
+    #   first -- and it did: scanning Python with the TypeScript rules means
+    #   `# phone_number is gone` is not a comment, the surviving mention reads as
+    #   CODE, and the "still present in CODE" rule REJECTS A CORRECT FIX. Measured
+    #   both ways before widening.
+    from .change_types import canonical_op as _canonical_op
+    from .source_regions import SCANNED as _SCANNED
+
+    # Read DECLARED fields directly. `getattr(bc, "field_name", "")` was caught by
+    # test_no_phantom_getattr_on_breaking_change and rightly: a default silently
+    # turns a renamed or missing field into "no field name", which disables this
+    # whole check without anyone noticing. Both attributes are on the dataclass, so
+    # a real absence should raise.
+    field = breaking_change.field_name or ""
+    lang = (consumer.language or "").lower()
+    if (field and lang in _SCANNED
+            and _canonical_op(breaking_change.change_type or "") == "remove_field"):
+        from .diff_contract import check as _diff_check
+
+        verdict = _diff_check(original_code, fixed_code, field, language=lang)
+        if not verdict.ok:
+            # Refuse the whole patch. Returning None is what the caller already
+            # treats as "no fix", and it is the same decision the template path
+            # makes by returning the original code unchanged.
+            _log = ("; ".join(verdict.violations[:3]))[:300]
+            print(f"[fix_generator] diff contract REJECTED the generated fix for "
+                  f"{consumer.file_path}: {_log}")
+            return None
+
     diff = _compute_diff(original_code, fixed_code, consumer.file_path)
     
     return GeneratedFix(
@@ -100,27 +175,149 @@ def generate_fixes(
     return fixes
 
 
+#: Per-OPERATION instructions for the LLM, and the fields each one needs filled.
+#:
+#: WHY THIS TABLE EXISTS
+#: There was one hardcoded instruction block, used for every change type:
+#:
+#:     1. Add the new required field "{field_name}" to the API call.
+#:     2. Add it as a parameter/argument that callers must provide.
+#:
+#: with NO branching on change_type. So a removal asked the model to ADD the field.
+#: Measured on a live gemini-flash-latest call: asked to remove `phoneNumber`, it
+#: added `phoneNumber: string` as a parameter to two functions and explained itself
+#: as "Added required field 'phoneNumber'" -- doing exactly what it was told. The
+#: diff contract rejected the patch, which is the only reason it never shipped.
+#:
+#: That misread as model unreliability for a day. It was the prompt.
+#:
+#: AN ALLOWLIST, NOT A DEFAULT
+#: An operation absent from this table gets NO LLM attempt -- it returns to the
+#: deterministic template path. The previous shape was the "unknown enum falls
+#: through to the weakest path" defect: every unrecognised operation silently
+#: inherited the add-a-required-field instructions. A new operation must be added
+#: here deliberately, and until it is, it cannot be given contradictory orders.
+#:
+#: JUDGMENT OPERATIONS ARE ABSENT ON PURPOSE
+#: remove_operation, remove_package and restrict_schema are not here. Deleting call
+#: sites for an endpoint that no longer exists is a product decision, and REVIEW is
+#: the permanently correct answer for it -- not a prompt.
+_LLM_INSTRUCTIONS: dict = {
+    "remove_field": (
+        (),
+        '1. The field "{field}" no longer exists upstream. REMOVE every reference\n'
+        '   to it from this file.\n'
+        '2. Do NOT remove a function parameter or a destructured binding -- those\n'
+        '   change the signature callers depend on. Leave them and remove nothing\n'
+        '   else if that is all you find.\n'
+        '3. Do NOT edit comments or string literals that mention "{field}".\n'
+        '4. Insert nothing. A removal never adds a line.'
+    ),
+    "add_required": (
+        (),
+        '1. The field "{field}" is now REQUIRED by the API. Add it to the call in\n'
+        '   this file.\n'
+        '2. Add it as a parameter or argument that callers must provide.\n'
+        '3. Do not invent a value -- thread it through from the caller.'
+    ),
+    "rename_field": (
+        ("new_name",),
+        '1. The field "{field}" was RENAMED to "{new_name}".\n'
+        '2. Rename every reference, preserving the surrounding shape exactly.\n'
+        '3. Do not rename anything whose name merely CONTAINS "{field}".'
+    ),
+    "change_field_type": (
+        ("new_type",),
+        '1. The field "{field}" changed type from "{old_type}" to "{new_type}".\n'
+        '2. Adapt the uses of that field to the new type. Convert at the boundary\n'
+        '   rather than changing unrelated signatures.\n'
+        '3. Do not write the contract type name into the source -- use the\n'
+        '   language\'s own type.'
+    ),
+    "remove_enum_value": (
+        (),
+        '1. The enum value "{field}" was removed.\n'
+        '2. Remove the branch or case that handles it, INCLUDING its body -- an\n'
+        '   orphaned body is a syntax error.\n'
+        '3. Leave every other branch untouched.'
+    ),
+}
+
+
+def _llm_instructions(change: BreakingChange) -> str:
+    """Instructions for THIS operation, or "" if the LLM must not be asked.
+
+    Returns "" when the operation is not in the allowlist, or when it is but a field
+    its instructions interpolate is empty -- `Rename "x" to ""` is worse than no
+    attempt, because the model will invent something plausible.
+    """
+    from .change_types import canonical_op
+
+    entry = _LLM_INSTRUCTIONS.get(canonical_op(change.change_type or ""))
+    if entry is None:
+        return ""
+    required, template = entry
+    values = {"field": change.field_name, "new_name": change.new_name,
+              "old_type": change.old_type or change.field_type,
+              "new_type": change.new_type}
+    if any(not values.get(name) for name in required):
+        return ""
+    return template.format(**values)
+
+
+def _llm_explanation(change: BreakingChange) -> str:
+    """What was actually done, for the PR body.
+
+    Kept beside _LLM_INSTRUCTIONS so the two cannot drift: an operation briefed one
+    way and announced another is how a removal PR came to say "Added required field".
+    """
+    from .change_types import canonical_op
+
+    field = change.field_name
+    where = f"{(change.method or '').upper()} {change.path}".strip()
+    suffix = f" in the {where} call" if where else ""
+    return {
+        "remove_field": f"Removed references to the deleted field '{field}'{suffix}",
+        "add_required": f"Added the newly required field '{field}'{suffix}",
+        "rename_field": (f"Renamed field '{field}' to "
+                         f"'{change.new_name}'{suffix}"),
+        "change_field_type": (
+            f"Adapted uses of '{field}' from "
+            f"{change.old_type or change.field_type} to {change.new_type}{suffix}"),
+        "remove_enum_value": f"Removed handling of the deleted enum value '{field}'",
+    }.get(canonical_op(change.change_type or ""),
+          f"Applied a fix for {change.change_type} on '{field}'{suffix}")
+
+
 def _generate_with_llm(
     original_code: str,
     consumer: ConsumerMatch,
     breaking_change: BreakingChange,
 ) -> tuple[str, str]:
-    """Use Claude API to generate the fix."""
+    """Use the configured LLM to generate the fix."""
     try:
         import anthropic
     except ImportError:
         print("  ⚠️  anthropic package not installed. Using template fix.")
         return _generate_with_template(original_code, consumer, breaking_change)
-    
+
+    instructions = _llm_instructions(breaking_change)
+    if not instructions:
+        # No contradictory orders. The deterministic path is the correct answer for
+        # an operation we cannot brief the model on.
+        print(f"  ⚠️  no LLM instructions for change_type="
+              f"{breaking_change.change_type!r}; using the template instead")
+        return _generate_with_template(original_code, consumer, breaking_change)
+
     from .llm_config import api_key as _llm_key, base_url as _llm_base, model as _llm_model
     # base_url passed explicitly rather than relying on the SDK reading the env,
     # so the configured backend is visible at the call site.
     client = anthropic.Anthropic(api_key=_llm_key(), base_url=_llm_base())
-    
+
     prompt = f"""You are a code assistant. An API has a breaking change. Fix the consumer code.
 
 BREAKING CHANGE:
-- Endpoint: {breaking_change.method.upper()} {breaking_change.path}
+- Endpoint: {(breaking_change.method or '').upper()} {breaking_change.path}
 - Change: {breaking_change.change_type}
 - Field: "{breaking_change.field_name}" (type: {breaking_change.field_type})
 - Description: {breaking_change.description}
@@ -131,11 +328,12 @@ CONSUMER CODE ({consumer.language}):
 ```
 
 INSTRUCTIONS:
-1. Add the new required field "{breaking_change.field_name}" to the API call.
-2. Add it as a parameter/argument that callers must provide.
-3. Keep the fix minimal — only change what's necessary.
-4. Return ONLY the complete fixed file content, no explanation.
-5. Do NOT add comments explaining the fix.
+{instructions}
+
+FINALLY:
+- Keep the fix minimal -- only change what is necessary.
+- Return ONLY the complete fixed file content, no explanation.
+- Do NOT add comments explaining the fix.
 
 FIXED CODE:"""
 
@@ -147,7 +345,7 @@ FIXED CODE:"""
         )
         
         fixed_code = response.content[0].text.strip()
-        
+
         # Strip markdown code fences if present
         if fixed_code.startswith("```"):
             lines = fixed_code.split("\n")
@@ -156,8 +354,15 @@ FIXED CODE:"""
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             fixed_code = "\n".join(lines)
-        
-        explanation = f"Added required field '{breaking_change.field_name}' to {breaking_change.method.upper()} {breaking_change.path} call"
+
+        # The trailing newline is restored centrally in generate_fix(), where
+        # both generator paths converge -- see the note there.
+
+        # The explanation is what a human reads in the PR body, so it must describe
+        # what was actually DONE. It was hardcoded to "Added required field" for
+        # every operation -- the same defect as the prompt, and visible to customers:
+        # a removal PR announced itself as an addition.
+        explanation = _llm_explanation(breaking_change)
         return fixed_code, explanation
         
     except Exception as e:

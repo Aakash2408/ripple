@@ -115,6 +115,15 @@ jobs:
         # gate that leaned on tsc would let it through.
         run: python tools/audit_negative_corpus.py
 
+      - name: Archive safety (blocking)
+        # app/repo_workspace.py extracts an archive built by whoever owns the
+        # repository -- untrusted input. This builds hostile ones (traversal,
+        # absolute paths, symlink members, a decompression bomb, inode exhaustion,
+        # an oversized file, a fifo) and asserts CONTAINMENT rather than refusal:
+        # two of them are legitimately accepted after being neutralised, so
+        # asserting "it refused" would assert the wrong property.
+        run: python tools/verify_archive_safety.py
+
       - name: Safety layer reachability (blocking)
         # A safety layer that production cannot reach is not a safety layer. The diff
         # contract was reported as "wired into the pipeline" while being imported only

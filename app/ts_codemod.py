@@ -66,6 +66,66 @@ from dataclasses import dataclass, field as _field
 _CHAIN = r"[A-Za-z_$][\w$]*(?:\s*\??\.\s*[A-Za-z_$][\w$]*)*\s*\??\."
 
 
+def _inside_jsx_tag(code: str, pos: int, limit: int = 4000) -> bool:
+    """Is `pos` inside a JSX opening tag's attribute list?
+
+    Walks BACKWARDS from pos to find the `<Tag` that opens the element.
+
+    THE PART THAT IS NOT OBVIOUS: it must SKIP BALANCED GROUPS. The first version
+    treated `}` as "the tag already closed", which broke both of the shapes that
+    matter most:
+
+        <Row a={x} phone={user.phoneNumber} />       the `}` of a={x}
+        <Row                                        the `}` of name={...}
+          name={user.fullName}
+          phone={user.phoneNumber}
+
+    Both were refused. So on a closing delimiter we jump to its opener and carry
+    on, which also skips past arrow functions in sibling attributes -- `onClick={()
+    => f()}` contains `>`, and reading that as the end of the tag would be wrong.
+    Quoted attribute values are skipped for the same reason: `title="a>b"`.
+
+    An UNMATCHED opener going backwards means we are inside an expression rather
+    than an attribute list, so that still stops the scan.
+    """
+    pairs = {"}": "{", ")": "(", "]": "["}
+    i = pos - 1
+    stop = max(0, pos - limit)
+    while i >= stop:
+        ch = code[i]
+
+        if ch in "\"'`":
+            # Skip a quoted run backwards to its opening quote.
+            j = i - 1
+            while j >= stop and not (code[j] == ch and (j == 0 or code[j - 1] != "\\")):
+                j -= 1
+            i = j - 1
+            continue
+
+        if ch in pairs:
+            opener, depth, j = pairs[ch], 1, i - 1
+            while j >= stop and depth:
+                if code[j] == ch:
+                    depth += 1
+                elif code[j] == opener:
+                    depth -= 1
+                j -= 1
+            if depth:
+                return False             # unbalanced -- give up rather than guess
+            i = j
+            continue
+
+        if ch == "<":
+            nxt = code[i + 1] if i + 1 < len(code) else ""
+            return bool(nxt) and (nxt.isalpha() or nxt in "_$")
+
+        if ch in ">;{(,":
+            return False
+
+        i -= 1
+    return False
+
+
 @dataclass
 class CodemodResult:
     code: str
@@ -87,65 +147,16 @@ class CodemodResult:
 
 
 def _regions(code: str) -> list:
-    """Spans of comment and string CONTENT, as (start, end, kind).
+    """Comment and string spans, delegating to the shared scanner.
 
-    Template literals are split: the literal text is "string", but the contents of
-    each `${...}` are real code and are NOT included. Getting this wrong in either
-    direction is a bug -- treating `${user.phoneNumber}` as string content would
-    stop the fix working, and treating a comment as code would delete prose.
+    The implementation moved to app/source_regions.py when Python was added: keeping
+    a Python scanner in a module named ts_codemod would have made the name a lie,
+    and app/diff_contract.py was already importing this private function across the
+    boundary. Kept as a thin alias because this module calls it in one place and the
+    indirection is cheaper than churning that call site.
     """
-    out, i, n = [], 0, len(code)
-    while i < n:
-        ch = code[i]
-        nxt = code[i + 1] if i + 1 < n else ""
-        if ch == "/" and nxt == "/":
-            j = code.find("\n", i)
-            j = n if j == -1 else j
-            out.append((i, j, "comment"))
-            i = j
-        elif ch == "/" and nxt == "*":
-            j = code.find("*/", i + 2)
-            j = n if j == -1 else j + 2
-            out.append((i, j, "comment"))
-            i = j
-        elif ch in "'\"":
-            j, quote = i + 1, ch
-            while j < n:
-                if code[j] == "\\":
-                    j += 2
-                    continue
-                if code[j] == quote or code[j] == "\n":
-                    break
-                j += 1
-            out.append((i, min(j + 1, n), "string"))
-            i = min(j + 1, n)
-        elif ch == "`":
-            # Walk the template, emitting text runs and SKIPPING ${...} contents.
-            j, run_start = i + 1, i + 1
-            while j < n:
-                if code[j] == "\\":
-                    j += 2
-                    continue
-                if code[j] == "`":
-                    break
-                if code[j] == "$" and j + 1 < n and code[j + 1] == "{":
-                    out.append((run_start, j, "string"))
-                    depth, k = 1, j + 2
-                    while k < n and depth:
-                        if code[k] == "{":
-                            depth += 1
-                        elif code[k] == "}":
-                            depth -= 1
-                        k += 1
-                    j = k
-                    run_start = k
-                    continue
-                j += 1
-            out.append((run_start, min(j, n), "string"))
-            i = min(j + 1, n)
-        else:
-            i += 1
-    return out
+    from .source_regions import regions as _shared
+    return _shared(code, "typescript")
 
 
 def _kind_at(pos: int, regions: list) -> str:
@@ -263,7 +274,60 @@ def remove_field(code: str, field: str) -> CodemodResult:
                       "removed": out[start:end]})
         out = out[:cut] + out[end:]
 
-    # 4. Classify what remains. A mention in a comment or a string is a NOTE, not a
+    # 4. JSX attribute whose value is exactly the member chain:
+    #    `<Row phone={user.phoneNumber} />` -> `<Row />`
+    #
+    #    WHY THIS IS SAFE TO PATTERN-MATCH WITHOUT A JSX PARSER -- TWO GUARDS,
+    #    AND MEASUREMENT SAYS WHICH ONE MATTERS
+    #
+    #    Guard 1, the pattern: the braces must contain EXACTLY a member chain ending
+    #    in the field. That shape is valid ONLY as a JSX attribute value:
+    #
+    #        <Row phone={user.phoneNumber} />        JSX          <- matches
+    #        { a: {user.phoneNumber} }               not valid JS
+    #        function f(a = {user.phoneNumber})      not valid JS
+    #
+    #    Guard 2, _inside_jsx_tag(): a backward scan for the opening `<`.
+    #
+    #    I assumed guard 1 was the load-bearing one. It is not. Loosening the pattern
+    #    to accept anything in the braces did NOT break the default-parameter case --
+    #    guard 2 rejected it, because scanning back from the attribute hits `(`.
+    #    Removing guard 2 and loosening guard 1 together produces real damage:
+    #
+    #        function f(opts={user: user.phoneNumber}) { return opts; }
+    #          ->  function f() { return opts; }
+    #
+    #    a destroyed signature with the body still using the parameter. So guard 2 is
+    #    the one that must never be deleted, and `default-parameter-object-value` in
+    #    the coverage corpus fails the build if it ever is.
+    #
+    #    WHY EDIT AND NOT JUDGMENT
+    #    Same reasoning as the object-literal property: the field no longer exists
+    #    upstream, so passing it conveys nothing. If the prop is REQUIRED by the
+    #    component, `tsc` reports the missing prop and the validator blocks the fix
+    #    -- the compiler is the right place to decide that, not a regex.
+    jsx_attr = re.compile(
+        rf"(?P<lead>[ \t]*)(?P<name>[A-Za-z_$][\w$-]*)[ \t]*=[ \t]*"
+        rf"\{{[ \t]*{_CHAIN}{esc}[ \t]*\}}")
+    for m in reversed(list(jsx_attr.finditer(out))):
+        if not _inside_jsx_tag(out, m.start()):
+            continue                     # not an attribute; leave it to step 5
+        line_start = out.rfind("\n", 0, m.start()) + 1
+        line_end = out.find("\n", m.end())
+        line_end = len(out) if line_end == -1 else line_end
+        alone = (out[line_start:m.start()].strip() == ""
+                 and out[m.end():line_end].strip() == "")
+        if alone:
+            # The attribute owns the whole line. Remove the line, or a blank line
+            # is left behind and the diff stops being scannable.
+            cut_start, cut_end = line_start, min(line_end + 1, len(out))
+        else:
+            cut_start, cut_end = m.start(), m.end()
+        edits.append({"shape": "JSX attribute",
+                      "removed": out[m.start():m.end()].strip()})
+        out = out[:cut_start] + out[cut_end:]
+
+    # 5. Classify what remains. A mention in a comment or a string is a NOTE, not a
     #    refusal: it cannot break a build, so blocking the fix over it would block
     #    nearly every real consumer.
     regions = _regions(out)
