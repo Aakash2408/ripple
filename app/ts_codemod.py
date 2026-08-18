@@ -96,14 +96,36 @@ def remove_field(code: str, field: str) -> CodemodResult:
     if not field:
         return CodemodResult(code, False, refusals=["no field name given"])
 
-    access = re.compile(rf"\.\s*{re.escape(field)}\b")
-    if not access.search(code):
-        return CodemodResult(code, False, refusals=[])   # nothing to do, not a refusal
+    # DETECTION IS BY WORD BOUNDARY, NOT BY MEMBER ACCESS.
+    #
+    # The first version searched only for `.field`. Measured against a REAL
+    # repository in Stage 7 -- the billing-api demo consumer -- it returned
+    # changed=False, edits=0, REFUSALS=0 despite the file containing four
+    # references: two interface property declarations, a function parameter, and a
+    # shorthand object property. "Nothing to do" and "four things I cannot do" are
+    # different answers, and reporting the first for the second is the silent-gap
+    # defect this project keeps rediscovering.
+    anywhere = re.compile(rf"\b{re.escape(field)}\b")
+    if not anywhere.search(code):
+        return CodemodResult(code, False, refusals=[])   # genuinely nothing to do
 
     edits, refusals = [], []
     out = code
 
-    # 1. Object-literal property whose VALUE is the member expression. Matched as a
+    # 1. Type / interface property DECLARATION on its own line:
+    #        phoneNumber: string;      phoneNumber?: string;
+    #    Safe: the upstream field is gone, so a mirror declaration of it is dead.
+    #    Runs BEFORE the object-literal rule, and cannot collide with it because the
+    #    field must be the KEY here and the value there.
+    decl = re.compile(
+        rf"^[ \t]*{re.escape(field)}\??[ \t]*:[ \t]*[^=\n]*?[;,]?[ \t]*$\n?",
+        re.MULTILINE)
+    for m in list(decl.finditer(out)):
+        edits.append({"shape": "type property declaration",
+                      "removed": m.group(0).strip()})
+    out = decl.sub("", out)
+
+    # 2. Object-literal property whose VALUE is the member expression. Matched as a
     #    whole line on purpose: a property occupying its own line can be deleted
     #    entirely, which is what makes this shape safe. A property sharing a line
     #    with others is refused rather than sliced.
@@ -116,7 +138,7 @@ def remove_field(code: str, field: str) -> CodemodResult:
                       "removed": m.group(0).strip()})
     out = prop.sub("", out)
 
-    # 2. Template interpolation whose entire contents are the member expression.
+    # 3. Template interpolation whose entire contents are the member expression.
     #    Recomputed on the current text, and applied right-to-left so earlier spans
     #    keep their offsets.
     inner_only = re.compile(rf"^\s*[A-Za-z_$][\w$.]*\.{re.escape(field)}\s*$")
@@ -132,13 +154,17 @@ def remove_field(code: str, field: str) -> CodemodResult:
                       "removed": out[start:end]})
         out = out[:cut_start] + out[end:]
 
-    # 3. Anything still referencing the field is a shape this codemod will not touch.
-    for m in access.finditer(out):
+    # 4. Anything STILL referencing the field is a shape this codemod will not
+    #    touch. Named individually, because "could not finish" is not a reason.
+    #    Comments count: a stale comment is not a compile error, so it is reported
+    #    rather than silently edited.
+    for m in anywhere.finditer(out):
         line_no = out[:m.start()].count("\n") + 1
         line = out.split("\n")[line_no - 1].strip()
         refusals.append(
-            f"line {line_no}: `{line[:80]}` -- the value is used, so removing the "
-            f"reference would change behaviour. A human must decide what this code "
-            f"should do without the field.")
+            f"line {line_no}: `{line[:80]}` -- not a shape this transformation can "
+            f"remove safely. Removing a function parameter breaks every caller; "
+            f"removing a shorthand property or a used value changes behaviour. A "
+            f"human must decide.")
 
     return CodemodResult(out, out != code, edits, refusals)

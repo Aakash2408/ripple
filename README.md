@@ -312,7 +312,15 @@ whose named test runs the whole path. `python tools/audit_capabilities.py` repor
 1 of 48 fixable cells production-ready and recomputes that from the code.
 
 The other 1,799 combinations are `REVIEW`. Removing either the validation or the
-end-to-end evidence takes `AUTO` away, which is asserted in the suite. `app/routing.py` derives the level by asking
+end-to-end evidence takes `AUTO` away, which is asserted in the suite.
+
+**Measured against a real repository, the golden path does not complete.**
+`python tools/verify_real_repo.py` clones `billing-api`, finds its one TypeScript
+consumer, removes the two dead interface declarations, and then **refuses** the
+remaining two references: a function parameter (removing it breaks every caller) and
+a shorthand object property. Terminal state `BLOCKED`, with both refusals named by
+line. The cell is production-ready for the shapes it handles; real code contains
+shapes it correctly declines. Widening it is a decision about safety, not a bug fix. `app/routing.py` derives the level by asking
 `app/capability_claims.py`; it keeps no list of its own, and CI fails if it grows one.
 
 **GitHub is the only live surface.** The GitLab and Bitbucket integrations are
@@ -708,7 +716,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 115 tests
+python tests/test_regression.py            # 116 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes

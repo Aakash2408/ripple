@@ -3633,5 +3633,76 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
     assert "human review required" in review.split("\n")[0]
 
 
+def test_codemod_reports_every_reference_it_cannot_handle():
+    """A reference the codemod cannot see is worse than one it refuses.
+
+    Stage 7 measured the first version against a REAL repository -- the billing-api
+    demo consumer -- and it returned changed=False, edits=0, REFUSALS=0 while the
+    file contained FOUR references: two interface property declarations, a function
+    parameter, and a shorthand object property. Detection searched only for
+    `.field`, so none of those four were member accesses and none were seen.
+
+    "Nothing to do" and "four things I cannot do" are different answers. Reporting
+    the first for the second is the silent-gap defect this project keeps finding, and
+    it is worse here than elsewhere: `complete` would have been False with no reason
+    attached, so the PR body could not say why.
+
+    Detection is now by word boundary. Three shapes are transformed; everything else
+    is named individually with a line number.
+    """
+    from app.ts_codemod import remove_field
+
+    # 1. THE REAL-REPOSITORY SHAPE. Two declarations are removed (a mirror of a
+    #    field that no longer exists upstream is dead), and the parameter and
+    #    shorthand are REFUSED -- removing a parameter breaks every caller, which is
+    #    a change Ripple is not making in this PR.
+    real = (
+        "export interface User {\n"
+        "  id: string;\n"
+        "  phoneNumber: string;\n"
+        "}\n"
+        "export interface CreateUserRequest {\n"
+        "  phoneNumber: string;\n"
+        "}\n"
+        "async function createUser(email: string, phoneNumber: string) {\n"
+        "  const request: CreateUserRequest = { email, phoneNumber };\n"
+        "  return request;\n"
+        "}\n"
+    )
+    r = remove_field(real, "phoneNumber")
+    assert r.changed and not r.complete
+    assert len([e for e in r.edits
+                if e["shape"] == "type property declaration"]) == 2, r.edits
+    assert len(r.refusals) == 2, r.refusals
+    assert all("line " in x for x in r.refusals), r.refusals
+    assert any("createUser" in x for x in r.refusals)
+    assert any("{ email, phoneNumber }" in x for x in r.refusals)
+
+    # 2. Every refusal carries a REASON, not just a location.
+    for x in r.refusals:
+        assert "human must decide" in x, x
+
+    # 3. A file with no reference at all is not a refusal.
+    clean = remove_field("export const x = 1;\n", "phoneNumber")
+    assert not clean.changed and not clean.refusals
+
+    # 4. A reference in a COMMENT is refused rather than silently edited. Slightly
+    #    conservative -- a stale comment is not a compile error -- but claiming less
+    #    is the correct direction, and rewriting prose is not this tool's job.
+    only_comment = remove_field("// phoneNumber was removed upstream\nexport const y = 2;\n",
+                                "phoneNumber")
+    assert not only_comment.changed and len(only_comment.refusals) == 1
+
+    # 5. The golden fixture is UNAFFECTED by the broadened detection -- the two
+    #    mechanical shapes still resolve completely, which is what keeps AUTO earned.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fixture = os.path.join(root, "fixtures", "typescript-openapi", "remove-field",
+                           "consumer", "src", "checkout.ts")
+    g = remove_field(open(fixture).read(), "phoneNumber")
+    assert g.complete and len(g.edits) == 2 and not g.refusals, (g.edits, g.refusals)
+    assert "phoneNumber" not in g.code
+    assert "user.}" not in g.code
+
+
 if __name__ == "__main__":
     sys.exit(_main())
