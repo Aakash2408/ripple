@@ -74,6 +74,7 @@ GATES=(
     "tools/audit_negative_corpus.py"
     "tools/audit_safety_reachability.py"
     "tools/verify_archive_safety.py"
+    "tools/verify_project_resolution.py"
 )
 
 echo ""
