@@ -22,6 +22,7 @@ Run:  python3.12 -m pytest tests/test_regression.py -q
 
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -3236,6 +3237,102 @@ def test_every_breaking_change_ends_in_exactly_one_terminal_state():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "app", "webhook.py")
     assert _terminal_state_wrapping(webhook_py) == []
+
+
+def test_golden_fixture_is_broken_satisfiable_and_claims_nothing_yet():
+    """The golden fixture must FAIL to compile, be fixable, and claim nothing.
+
+    A fixture that compiles in its broken state proves nothing. This one does not:
+    `src/types.ts` is already regenerated from the after-spec, so every remaining
+    reference to `phoneNumber` is a type error -- verified with a real `tsc`, 2
+    errors, exit 2, and exit 0 after a correct two-edit fix.
+
+    Three things this test enforces, none of which need node to check:
+
+    1. The declared contract exists and is internally consistent.
+    2. The MEASURED baseline is recorded rather than glossed. Ripple's TypeScript
+       remove_field handler is currently a no-op on this fixture while reporting
+       "Removed all references to field 'phoneNumber' (0 lines affected)" -- a
+       false claim in a user-facing string. That is written down in expected.json
+       so Stage 6 cannot quietly assume the transformation works.
+    3. NOTHING is claimed. E2E_FIXTURES stays empty until a run genuinely satisfies
+       `expect`. A fixture existing is not evidence; the capability registry only
+       counts a fixture that a named, actually-run test satisfied.
+    """
+    import json as _json
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "typescript-openapi", "remove-field")
+    spec = _json.load(open(os.path.join(base, "expected.json")))
+
+    # 1. the contract is coherent
+    assert spec["cell"] == {"language": "typescript", "contract": "openapi",
+                            "operation": "remove_field"}
+    assert spec["change"]["field"] == "phoneNumber"
+    assert spec["expect"]["typecheck_before_fix"] == "FAIL"
+    assert spec["expect"]["typecheck_after_fix"] == "PASS"
+    assert spec["expect"]["consumers_found"] == ["src/checkout.ts"]
+    assert spec["expect"]["pr_files"] == ["src/checkout.ts"]
+    for t in spec["expect"]["transformation"]:
+        assert t["mechanical"] is True and t["why"], t
+
+    # every file the contract mentions actually exists
+    for rel in (spec["change"]["spec_before"], spec["change"]["spec_after"]):
+        assert os.path.exists(os.path.join(base, rel)), rel
+    for rel in spec["expect"]["consumers_found"] + spec["expect"]["untouched"]:
+        assert os.path.exists(os.path.join(base, "consumer", rel)), rel
+
+    # the removed field is gone from the after-spec and the regenerated type, and
+    # still present in the consumer -- which is precisely why it does not compile
+    after = open(os.path.join(base, spec["change"]["spec_after"])).read()
+    types = open(os.path.join(base, "consumer", "src", "types.ts")).read()
+    consumer = open(os.path.join(base, "consumer", "src", "checkout.ts")).read()
+    untouched = open(os.path.join(base, "consumer", "src", "orders.ts")).read()
+    assert "phoneNumber" not in after
+    # Check the DECLARATION, not the word: types.ts documents in its header comment
+    # why the field is absent, and a bare substring test fails on that comment. The
+    # same text-vs-structure mistake as the gate that matched KNOWN_LANGUAGES inside
+    # a docstring.
+    assert not re.search(r"^\s*phoneNumber\??\s*:", types, re.MULTILINE), types
+    assert "phoneNumber" in types, "the header should explain why it is absent"
+    assert consumer.count("user.phoneNumber") == 2
+    assert "phoneNumber" not in untouched     # so "untouched" is falsifiable
+
+    # 2. the measured baseline is recorded, including the false claim
+    m = spec["measured"]
+    assert m["fixture_fails_without_a_fix"] is True
+    assert m["fixture_is_satisfiable"] is True
+    assert m["ripple_output_parses"] is False
+    assert m["verdict"] == "BROKEN FIX, not an incomplete one"
+    assert len(m["gap"]) == 3
+
+    # Measured here, not trusted from the file. The handler CORRUPTS the object
+    # literal -- `phone: user.phoneNumber,` becomes `phone: user.};` -- because the
+    # destructuring cleanup strips `phoneNumber,` wherever it appears, including as
+    # the tail of a member expression. And it leaves the template-literal reference
+    # untouched. Both report "Removed all references".
+    from app.fix_templates import apply_fix_template
+    fixed, explanation = apply_fix_template(
+        code=consumer, language="typescript", change_type="removed_field",
+        field_name="phoneNumber")
+    assert fixed != consumer, "the handler no longer touches the fixture -- re-measure"
+    assert "phone: user.};" in fixed, (
+        "the corrupting substitution changed shape. Re-run tsc against the output "
+        "and update expected.json rather than relaxing this assertion.")
+    assert "${user.phoneNumber}" in fixed, \
+        "the template-literal reference is still expected to survive untouched"
+    assert "Removed all references" in explanation, \
+        "the false success claim is part of the recorded baseline"
+
+    # The output is not merely wrong, it does not PARSE. Checked without node: a
+    # bare `user.}` cannot be valid in any TypeScript expression position.
+    assert "user.}" in fixed
+
+    # 3. nothing is claimed yet
+    from app.capability_claims import E2E_FIXTURES, e2e_tested
+    assert E2E_FIXTURES == {} or not e2e_tested("typescript", "openapi",
+                                               "remove_field"), \
+        "the fixture exists but must not be cited as evidence until a run satisfies it"
 
 
 if __name__ == "__main__":
