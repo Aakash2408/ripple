@@ -67,12 +67,6 @@ FROZEN: dict = {
     "app/slack_notify.py": (
         100, "notifications, 394 lines, no importers. Nothing has ever been sent, "
              "which is why its two fail-silent sites never mattered"),
-    "app/validated_fix.py": (
-        114, "the validation stub, 243 lines, ZERO callers, covers 3 of 15 "
-             "languages, and its TypeScript check is brace-matching -- it "
-             "returned VALID for `phoneNumber: int32` and for `!!! not rust`. "
-             "Stage 5 builds a real execution layer; this is a deletion "
-             "candidate, not a foundation"),
 }
 
 

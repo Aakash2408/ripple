@@ -208,6 +208,35 @@ TRIAGE: dict[tuple, tuple] = {
     ("slack_notify.py", "_send_via_bot_api", "silent_empty_return", "", 0): (
         NEEDS_SIGNAL, SAME_AS("slack_notify.py", "_send_via_webhook")),
 
+    ("capability_claims.py", "is_wired", "swallowed_except", "Exception", 0): (
+        LEGITIMATE,
+        "A validator path that fails to import is NOT wired, which is the "
+        "conservative answer and the one that claims less. The outcome is visible: "
+        "audit_capabilities prints 'validators declared 3, wired N', so a typo in "
+        "the dotted path shows up as a dropped count rather than a false claim."),
+    ("capability_claims.py", "is_wired", "silent_empty_return", "", 0): (
+        LEGITIMATE, SAME_AS("capability_claims.py", "is_wired")),
+
+    ("validation.py", "_docker_available", "swallowed_except",
+     "(OSError, subprocess.SubprocessError)", 0): (
+        LEGITIMATE,
+        "Docker being unreachable is an expected environment fact, not an error. It "
+        "means the docker backend is unavailable, and choose_backend() then falls "
+        "back to host or returns no backend at all -- which produces "
+        "UNABLE_TO_VALIDATE. Every Verdict names the backend that ran, so the "
+        "degradation is stated rather than hidden."),
+    ("validation.py", "_docker_available", "silent_empty_return", "", 0): (
+        LEGITIMATE, SAME_AS("validation.py", "_docker_available")),
+
+    ("validation.py", "_host_node", "swallowed_except",
+     "(OSError, subprocess.SubprocessError)", 0): (
+        LEGITIMATE,
+        "Probing candidate node binaries in order until one executes. On a glibc "
+        "2.26 host the system node exists and fails with GLIBC_2.27 not found, so "
+        "failure is the expected case for most candidates. Same shape as "
+        "token_store._find_store_dir and tls.resolve_ca_bundle, and the resolved "
+        "path is reported in the Verdict evidence."),
+
     # -------------------------------------------------------------- LEGITIMATE
     ("dry_run.py", "<module>", "swallowed_except", "ImportError", 0): (
         LEGITIMATE, "Optional-dependency import guard at module scope."),

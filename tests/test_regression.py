@@ -2504,16 +2504,27 @@ def test_production_readiness_cannot_be_declared():
     assert not offenders, (
         f"production must be COMPUTED, not declared: {offenders}")
 
-    # Today: nothing FIXABLE is production-ready, and the blocker is validation.
-    # wire_only and non_breaking ARE ready on detection alone -- changing code
-    # would be wrong for them, so requiring a transformation would demand
-    # something the category forbids.
+    # Stage 5 changed this. `validate_ok` is no longer 0: TypeScript has a real
+    # container-backed runner, so 63 cells now validate. But `e2e_ok` is still 0,
+    # so no FIXABLE cell is production-ready -- the blocker moved from two facts to
+    # one rather than disappearing.
+    #
+    # This assertion deliberately does NOT hardcode 63. Pinning the number would
+    # make adding a second language's validator a test failure, which punishes
+    # progress; what must hold is that validation is real AND that real validation
+    # alone does not confer readiness.
     s = cc.summary()
-    assert s["validate_ok"] == 0 and s["e2e_ok"] == 0
+    assert s["validate_ok"] > 0, \
+        "TypeScript validation is wired -- if this is 0 again, is_wired stopped resolving"
+    assert s["e2e_ok"] == 0, \
+        "no cell has end-to-end evidence yet; E2E_FIXTURES must stay empty until a " \
+        "run genuinely satisfies a fixture's declared expectations"
     fixable = [r for r in cc.claim_matrix()
                if "generate_fix" in cc.required_facts(r["operation"])]
     assert not any(r["production"] for r in fixable), (
-        "a fixable cell claims production with 0 validated and 0 e2e-tested")
+        "a fixable cell claims production with 0 e2e-tested -- validation alone is "
+        "not sufficient, and Stage 4 measured exactly why: the TypeScript "
+        "remove_field handler emits code that does not parse")
     wire = [r for r in cc.claim_matrix()
             if cc.required_facts(r["operation"]) == ("detect",)]
     assert wire and all(r["production"] for r in wire), (
@@ -2521,12 +2532,19 @@ def test_production_readiness_cannot_be_declared():
     # Detection and fix generation are NOT the blockers -- both are mostly true.
     assert s["generate_fix_ok"] > s["cells"] // 2, s["generate_fix_ok"]
 
-    # The verdict must respond to its inputs: a cell that fails ONLY on
-    # validation + e2e becomes ready when both are satisfied.
+    # The verdict must respond to its inputs. Before Stage 5 this cell was blocked
+    # on TWO facts; TypeScript validation is now real, so exactly one remains. That
+    # the count MOVED is the point -- a predicate whose output never changes when a
+    # fact changes is not computing anything.
     reasons = cc.blocking_reasons("typescript", "openapi", "remove_field")
-    assert len(reasons) == 2, reasons
-    assert any("UNABLE_TO_VALIDATE" in r for r in reasons)
-    assert any("end-to-end" in r for r in reasons)
+    assert len(reasons) == 1, reasons
+    assert any("end-to-end" in r for r in reasons), reasons
+    assert not any("UNABLE_TO_VALIDATE" in r for r in reasons), \
+        "TypeScript validation is wired; this reason should have disappeared"
+
+    # And a language WITHOUT a runner still reports both.
+    unwired = cc.blocking_reasons("go", "openapi", "remove_field")
+    assert any("UNABLE_TO_VALIDATE" in r for r in unwired), unwired
 
 
 def test_every_e2e_claim_names_the_test_that_proves_it():
@@ -3333,6 +3351,94 @@ def test_golden_fixture_is_broken_satisfiable_and_claims_nothing_yet():
     assert E2E_FIXTURES == {} or not e2e_tested("typescript", "openapi",
                                                "remove_field"), \
         "the fixture exists but must not be cited as evidence until a run satisfies it"
+
+
+def test_validation_never_turns_unknown_into_valid():
+    """Three states, and UNABLE_TO_VALIDATE is not a pass.
+
+    app/validated_fix.py -- deleted in Stage 5 -- got this wrong in the most
+    expensive way available: it ended `else: return True, ''`, and its TypeScript
+    check was brace-matching, so it returned VALID for `phoneNumber: int32` AND for
+    `!!! not rust`. A validator that cannot fail converts "unproven" into "proven".
+
+    Hermetic on purpose: no docker, no network, no node. The real three-case proof
+    lives in tools/verify_validation.py, which is an acceptance check rather than a
+    gate because it needs a container runtime -- and a gate that cannot run is the
+    same defect as a matcher that cannot be reached.
+    """
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.validation import (Verdict, validate, validate_typescript,
+                                choose_backend, RUNNERS)
+
+    # 1. A language with no runner makes no claim.
+    for lang in ("python", "go", "rust", "cobol"):
+        v = validate(lang, "/nonexistent")
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE, lang
+        assert not v.is_valid
+        assert "no validation runner" in v.reason
+
+    # 2. An unrecognised backend REFUSES rather than silently taking the weakest
+    #    path. The first version branched `if docker ... else host`, so any unknown
+    #    string ran with the least isolation -- the same shape as canonical_op()
+    #    returning "" for input it did not recognise.
+    v = validate_typescript(".", backend="bogus-backend")
+    assert v.state is ValidationState.UNABLE_TO_VALIDATE, v.state
+    assert "unknown validation backend" in v.reason
+
+    # 3. A workspace without the project files cannot be typechecked meaningfully.
+    empty = tempfile.mkdtemp()
+    try:
+        v = validate_typescript(empty, backend="host")
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE
+        assert "package.json" in v.reason
+    finally:
+        import shutil as _sh
+        _sh.rmtree(empty, ignore_errors=True)
+
+    # 4. is_valid is True for exactly one state -- no truthiness accidents.
+    for state in ValidationState:
+        verdict = Verdict(state, "x")
+        assert verdict.is_valid is (state is ValidationState.VALID), state
+
+    # 5. The evidence names the backend, so a reader can tell how much isolation
+    #    actually applied. "VALID" without provenance is the claim-without-evidence
+    #    problem the capability registry exists to prevent.
+    detail = Verdict(ValidationState.VALID, "ok",
+                     evidence={"backend": "docker"}).as_detail()
+    assert detail["validation"] == "VALID"
+    assert detail["evidence_backend"] == "docker"
+
+    # 6. `validate` is now a DERIVED fact: the dotted path must resolve to a
+    #    callable. A declared path that does not import is a lie -- exactly what
+    #    app/impact_prediction.py was before it was deleted.
+    from app.capability_claims import VALIDATORS, validates, validation_state
+    ts = VALIDATORS["typescript"]
+    assert ts.implemented_by == "app.validation:validate_typescript"
+    assert ts.is_wired and validates("typescript")
+    assert validation_state("typescript") is ValidationState.VALID
+
+    for unwired in ("python", "go"):
+        assert not VALIDATORS[unwired].is_wired, unwired
+        assert not validates(unwired)
+        assert validation_state(unwired) is ValidationState.UNABLE_TO_VALIDATE
+
+    # A path that does not resolve must NOT count as wired.
+    from app.capability_claims import ValidatorSpec
+    assert not ValidatorSpec("x", "t", implemented_by="app.nope:missing").is_wired
+    assert not ValidatorSpec("x", "t", implemented_by="app.validation:not_a_func").is_wired
+    assert not ValidatorSpec("x", "t", implemented_by="no_colon_here").is_wired
+
+    # 7. The superseded stub is gone, not merely frozen.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert not os.path.exists(os.path.join(root, "app", "validated_fix.py"))
+    assert "typescript" in RUNNERS and len(RUNNERS) == 1, \
+        "only TypeScript has a real runner; adding a key here is a capability claim"
+
+    # 8. choose_backend never invents one.
+    backend, note = choose_backend()
+    assert backend in ("", "docker", "host"), backend
+    assert note
 
 
 if __name__ == "__main__":
