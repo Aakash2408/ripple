@@ -133,15 +133,42 @@ def _remove_field_typescript(code: str, variants: dict[str, str]) -> str:
     derivation turns into BLOCKED with a reason.
     """
     from .ts_codemod import remove_field as _codemod
+    from .diff_contract import check as _diff_check
     result = _codemod(code, variants['camel'])
-    # Stash the reasons so apply_fix_template can put them in the explanation, and
-    # from there into the PR body. A refusal or a stale comment that nobody is told
-    # about is the silence this whole effort exists to remove -- and the handler
-    # signature returns only code, so there is nowhere else to carry it.
+
+    # THE DIFF CONTRACT, IN THE REQUEST PATH.
+    #
+    # It was written in Stage 3 and gated in CI, and for three stages it was imported
+    # by tests/ and tools/ and by NOTHING in app/ -- built, tested, CI-gated,
+    # unreachable, which is the defect class this project keeps rediscovering. The
+    # cost was exactly one class: `known_bad_fix_003`, a half-fix that keeps a
+    # function parameter, which `tsc` ACCEPTS as VALID and which only this check
+    # rejects. Five of the six negative-corpus cases fail the compiler on their own
+    # merits; that one does not.
+    #
+    # On violation the ORIGINAL code is returned, not the partial result. A patch
+    # that changed something it should not have is worse than no patch, and returning
+    # unchanged code is already what apply_fix_template turns into a truthful "could
+    # not remove" and what the outcome derivation turns into BLOCKED. This also
+    # settles the residue carried since Stage 2: a partial removal used to return
+    # changed code and open as REVIEW carrying a compile error.
+    refusals = list(result.refusals)
+    out = result.code
+    diff_violations = []
+    if out != code:
+        verdict = _diff_check(code, out, variants['camel'])
+        if not verdict.ok:
+            diff_violations = verdict.violations
+            refusals = refusals + [
+                f"diff contract: {v}" for v in verdict.violations[:3]]
+            out = code                      # refuse the patch entirely
+
     _LAST_TS_RESULT.clear()
-    _LAST_TS_RESULT.update(refusals=result.refusals, notes=result.notes,
-                           edits=[e["shape"] for e in result.edits])
-    return result.code
+    _LAST_TS_RESULT.update(
+        refusals=refusals, notes=result.notes,
+        edits=[] if diff_violations else [e["shape"] for e in result.edits],
+        diff_violations=diff_violations)
+    return out
 
 
 def _remove_field_python(code: str, variants: dict[str, str]) -> str:

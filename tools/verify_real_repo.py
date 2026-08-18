@@ -131,23 +131,43 @@ def main(argv: list) -> int:
                     run.refused(rel, f"no codemod for {lang}")
                     print(f"\n  {rel}: REFUSED, no codemod for {lang}")
                     continue
-                result = remove_field(content, field)
-                print(f"\n  {rel}")
-                print(f"      edits    {len(result.edits)}   "
-                      f"refusals {len(result.refusals)}   "
-                      f"complete {result.complete}")
-                for e in result.edits:
-                    print(f"        EDIT   {e['shape']}: {e['removed'][:56]}")
-                for x in result.refusals:
-                    print(f"        REFUSE {x[:104]}")
+                # Through the PRODUCTION entry point, not the codemod directly.
+                #
+                # This called ts_codemod.remove_field() until the diff contract was
+                # wired, and then reported "2 edits" for a file production now
+                # refuses outright -- a proof harness measuring something the product
+                # no longer does. Same mistake as the negative corpus building its
+                # own layer stack: if the tool does not go through the door the
+                # customer's request goes through, it is measuring a sibling.
+                from app.fix_templates import apply_fix_template, _LAST_TS_RESULT
 
-                if not result.complete:
-                    run.refused(rel, "; ".join(result.refusals)[:200]
+                fixed, _explanation = apply_fix_template(
+                    code=content, language="typescript",
+                    change_type="removed_field", field_name=field)
+                edits = _LAST_TS_RESULT.get("edits") or []
+                refusals = _LAST_TS_RESULT.get("refusals") or []
+                diff_violations = _LAST_TS_RESULT.get("diff_violations") or []
+                complete = (fixed != content) and not refusals
+
+                print(f"\n  {rel}")
+                print(f"      edits    {len(edits)}   "
+                      f"refusals {len(refusals)}   "
+                      f"complete {complete}")
+                for shape in edits:
+                    print(f"        EDIT   {shape}")
+                for x in refusals:
+                    print(f"        REFUSE {str(x)[:104]}")
+                if diff_violations:
+                    print(f"      diff contract REJECTED the patch, so the original "
+                          f"is returned unchanged")
+
+                if not complete:
+                    run.refused(rel, "; ".join(str(r) for r in refusals)[:200]
                                 or "transformation incomplete")
                     continue
 
                 # --- validation, which needs the repo to BE a project ---------
-                open(os.path.join(work, rel), "w").write(result.code)
+                open(os.path.join(work, rel), "w").write(fixed)
                 verdict = validate(lang, work)
                 print(f"      validate {verdict.state.value}: {verdict.reason[:88]}")
                 if verdict.is_valid:
@@ -162,9 +182,22 @@ def main(argv: list) -> int:
         print("\n  NOT PROVEN HERE, and why:")
         print("    * no PR was opened -- that needs GitHub App credentials, and the")
         print("      claim worth making is that the DEPLOYED service opened it")
-        print("    * the deployed service is older than app/build_info.py, so a live")
-        print("      webhook run would exercise code without the codemod, the")
-        print("      validator, or the terminal state")
+        # DERIVED, not hardcoded. This used to assert "the deployed service is older
+        # than app/build_info.py" as a fact. It stayed in the output after the deploy
+        # caught up, which is a tool telling a stale story about the world -- the
+        # exact failure mode build_info was added to prevent, reappearing in the
+        # thing that reports it.
+        local_head = _local_head()
+        deployed = dep.get("sha") or ""
+        if deployed and local_head and deployed.startswith(local_head[:8]):
+            print(f"    * the deployed service IS current ({deployed[:8]}), so a")
+            print("      live webhook run would exercise this exact code -- what is")
+            print("      missing is the credentials and a real inbound spec change,")
+            print("      not the deployment")
+        else:
+            print("    * the deployed revision does not match local HEAD, so a live")
+            print("      webhook run would exercise different code from what was")
+            print("      measured above")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
