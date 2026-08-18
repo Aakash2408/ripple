@@ -2964,5 +2964,77 @@ def test_governance_scope_is_exactly_what_was_verified():
     assert G.main([]) == 0
 
 
+def test_running_revision_is_reported_or_explicitly_unknown():
+    """After pushing 8 commits, "is the fix deployed?" was UNANSWERABLE.
+
+    `/` returned a hardcoded "version": "0.1.0" that could not change, and
+    /health/storage was byte-identical to before the push. Not "no" -- there was no
+    way to tell, from inside or outside. That is the absent-vs-unreachable
+    ambiguity that has now cost this project four times: get_file returning "" for
+    both 404 and 503, PropBench caching a 403 as "unreachable", /propbench/results
+    unable to distinguish zero submissions from wiped state, and this.
+
+    The rule that matters: an undeterminable revision reports sha=None with
+    source="unavailable", NOT a plausible-looking fallback. A wrong SHA is worse
+    than no SHA, because it answers the question falsely.
+    """
+    import importlib
+    import json
+    from app import build_info as bi
+
+    # 1. Platform-injected SHA is used and its ORIGIN is reported, because a SHA
+    #    from the local working tree is not evidence about anything deployed.
+    os.environ["RAILWAY_GIT_COMMIT_SHA"] = "a" * 40
+    os.environ["RAILWAY_GIT_BRANCH"] = "main"
+    try:
+        importlib.reload(bi)
+        info = bi.build_info()
+        assert info["sha"] == "a" * 40, info
+        assert info["short"] == "a" * 8
+        assert info["source"] == "env:RAILWAY_GIT_COMMIT_SHA", info
+        assert info["branch"] == "main"
+        assert bi.is_determinable()
+    finally:
+        del os.environ["RAILWAY_GIT_COMMIT_SHA"]
+        del os.environ["RAILWAY_GIT_BRANCH"]
+
+    # 2. Local checkout: reported, but tagged as the working tree, and flagged
+    #    dirty when it is -- a dirty tree does not correspond to any commit.
+    importlib.reload(bi)
+    info = bi.build_info()
+    assert info["source"].startswith("git:working-tree"), info
+
+    # 3. THE CASE THAT MATTERS: nothing to go on. Must refuse, not guess.
+    real_run = bi.subprocess.run
+
+    def no_git(*a, **k):
+        raise OSError("no git here")
+
+    bi.subprocess.run = no_git
+    try:
+        for key in bi._ENV_KEYS:
+            os.environ.pop(key, None)
+        importlib.reload(bi)
+        bi.subprocess.run = no_git          # reload restored the real one
+        resolved = bi._resolve()
+        assert resolved["sha"] is None, resolved
+        assert resolved["source"] == "unavailable", resolved
+        assert "refusal to guess" in resolved["detail"], resolved
+        # No plausible-looking fallback anywhere in the payload.
+        assert "0.1.0" not in json.dumps(resolved)
+    finally:
+        bi.subprocess.run = real_run
+        importlib.reload(bi)
+
+    # 4. Both surfaces render the SAME function's output -- a second assembly is
+    #    how two endpoints end up disagreeing about one fact.
+    import asyncio
+    from app import webhook
+    root_body = asyncio.run(webhook.root())
+    health_body = asyncio.run(webhook.health())
+    assert root_body["build"] == health_body["build"], (root_body, health_body)
+    assert set(root_body["build"]) == set(webhook.build_info())
+
+
 if __name__ == "__main__":
     sys.exit(_main())

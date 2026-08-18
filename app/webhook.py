@@ -78,6 +78,7 @@ from .playbook_engine import PlaybookEngine, EnsembleConsumerFinder
 from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLATE
 from .confidence import format_pr_body, classify_confidence
 from .routing import pr_level, Decision
+from .build_info import build_info
 from .expand_contract import advise as expand_contract_advise, analyze_changes as ec_analyze
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .retry_queue import get_retry_queue, should_retry, should_retry_error
@@ -167,7 +168,11 @@ def get_config(org: str) -> RippleConfig:
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "ripple", "version": "0.1.0"}
+    # `version` was a hardcoded "0.1.0" that could not change, so after a deploy
+    # there was no way -- from inside or outside -- to tell what code was running.
+    # `build` answers that, or says it cannot; it never guesses.
+    return {"status": "ok", "service": "ripple", "version": "0.1.0",
+            "build": build_info()}
 
 
 # --- Activity log ---
@@ -213,7 +218,9 @@ _activity_log = _ActivityLogProxy()
 
 @app.get("/health")
 async def health():
-    return {"healthy": True}
+    # Same build block as `/`, from the same function -- a second assembly here is
+    # how two surfaces end up disagreeing about the same fact.
+    return {"healthy": True, "build": build_info()}
 
 
 @app.get("/health/storage")

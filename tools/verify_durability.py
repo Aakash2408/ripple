@@ -47,6 +47,19 @@ def _get(url: str, path: str) -> dict:
                          f"        unreachable is not durable -- refusing to pass")
 
 
+def _local_head() -> str:
+    """Local HEAD, or "" if undeterminable. Used only to CONTRAST with the deployed
+    revision -- never as a substitute for it."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def main(argv: list) -> int:
     url = DEFAULT_URL
     if "--url" in argv:
@@ -61,6 +74,26 @@ def main(argv: list) -> int:
           f"exists={st.get('activity_exists')}")
     print(f"  event_count    {st.get('event_count')}")
     print(f"  durable        {durable}  ({st.get('durability_reason')})")
+
+    # WHICH CODE IS RUNNING. Reported before any verdict, because a durability
+    # reading against a stale deploy tells you about code you did not ship. After
+    # pushing 8 commits there was no way to answer this at all: `/` returned a
+    # hardcoded "0.1.0" and /health/storage was byte-identical to before the push,
+    # so "is the fix deployed?" was unanswerable rather than yes or no.
+    build = _get(url, "/health").get("build") or {}
+    deployed = build.get("sha")
+    if deployed:
+        print(f"  deployed       {build.get('short')}  (source {build.get('source')})")
+        local = _local_head()
+        if local and deployed != local:
+            print(f"  LOCAL HEAD IS  {local[:8]}  -- the deploy is NOT running your "
+                  f"local commit")
+        elif local:
+            print(f"  matches local HEAD {local[:8]}")
+    else:
+        # Not a failure of durability. Say which question is unanswerable, rather
+        # than letting a missing field read as a pass.
+        print(f"  deployed       UNKNOWN -- {build.get('detail', 'no build info on /health')}")
 
     # --before / --after turn this into a real redeploy comparison rather than a
     # point-in-time reading. A single "durable: true" only says the directory
