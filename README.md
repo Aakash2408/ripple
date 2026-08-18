@@ -688,7 +688,7 @@ own hooks path):
 git config core.hooksPath .githooks
 ```
 
-It runs every gate below and **refuses the commit** if any is red — because the
+It runs every gate below, plus the suite a second time with `GITHUB_SHA` set as CI sets it (~55s), and **refuses the commit** if any is red — because the
 recurring mistake was not too many commits, it was committing and then repairing
 the same change in a follow-up commit (`c6b60af`'s message literally names the
 commit it should have been part of). Escape with `git commit --no-verify`.

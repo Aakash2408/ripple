@@ -2999,10 +2999,25 @@ def test_running_revision_is_reported_or_explicitly_unknown():
         del os.environ["RAILWAY_GIT_BRANCH"]
 
     # 2. Local checkout: reported, but tagged as the working tree, and flagged
-    #    dirty when it is -- a dirty tree does not correspond to any commit.
-    importlib.reload(bi)
-    info = bi.build_info()
-    assert info["source"].startswith("git:working-tree"), info
+    #    dirty when it is -- a dirty tree corresponds to no commit at all.
+    #
+    #    The env keys MUST be cleared first. The first version of this assertion
+    #    did not, and it passed locally and failed in CI: GitHub Actions always
+    #    sets GITHUB_SHA, which is in _ENV_KEYS, so _from_env() correctly won and
+    #    reported "env:GITHUB_SHA". The code was right; the test had assumed an
+    #    environment rather than establishing one. A test that only holds on one
+    #    machine is the same defect as a gate that cannot run.
+    saved = {k: os.environ.pop(k, None) for k in bi._ENV_KEYS}
+    try:
+        importlib.reload(bi)
+        info = bi.build_info()
+        assert info["source"].startswith("git:working-tree"), info
+        assert info["sha"], info
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+        importlib.reload(bi)
 
     # 3. THE CASE THAT MATTERS: nothing to go on. Must refuse, not guess.
     real_run = bi.subprocess.run
@@ -3011,9 +3026,8 @@ def test_running_revision_is_reported_or_explicitly_unknown():
         raise OSError("no git here")
 
     bi.subprocess.run = no_git
+    saved3 = {k: os.environ.pop(k, None) for k in bi._ENV_KEYS}
     try:
-        for key in bi._ENV_KEYS:
-            os.environ.pop(key, None)
         importlib.reload(bi)
         bi.subprocess.run = no_git          # reload restored the real one
         resolved = bi._resolve()
@@ -3023,7 +3037,14 @@ def test_running_revision_is_reported_or_explicitly_unknown():
         # No plausible-looking fallback anywhere in the payload.
         assert "0.1.0" not in json.dumps(resolved)
     finally:
+        # Restore BOTH the patched call and the environment. The first version
+        # popped the env keys and never put them back, so under CI (where
+        # GITHUB_SHA is set) this test silently changed the environment for every
+        # test that ran after it.
         bi.subprocess.run = real_run
+        for k, v in saved3.items():
+            if v is not None:
+                os.environ[k] = v
         importlib.reload(bi)
 
     # 4. Both surfaces render the SAME function's output -- a second assembly is
