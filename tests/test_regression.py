@@ -20,6 +20,7 @@ Run:  python3.12 -m pytest tests/test_regression.py -q
   or: python3.12 tests/test_regression.py     (no pytest needed)
 """
 
+import json
 import os
 import sys
 
@@ -2944,23 +2945,35 @@ def test_governance_scope_is_exactly_what_was_verified():
                 if not [k for k in G.REQUIRED if k not in G._reachable(graph, e)]]
     assert governed == ["app/webhook.py:github_webhook"], governed
 
-    # Every ungoverned entry point is named with a reason, and every named
-    # exemption is still real.
+    # Every ungoverned entry point is either SWITCHED OFF or a named exemption,
+    # and every named exemption is still real. The three-way split replaced a
+    # two-way one in Stage 2: gitlab/bitbucket moved from "tolerated gap" to
+    # "actively closed", which is a stronger claim and a different assertion.
     ungoverned = sorted(set(entries) - set(governed))
-    assert ungoverned == sorted(G.EXEMPT), (ungoverned, sorted(G.EXEMPT))
-    for fn, reason in G.EXEMPT.items():
+    accounted = sorted(set(G.EXEMPT) | set(G.DISABLED))
+    assert ungoverned == accounted, (ungoverned, accounted)
+    assert not (set(G.EXEMPT) & set(G.DISABLED)), "an entry cannot be both"
+    for fn, reason in {**G.EXEMPT, **G.DISABLED}.items():
         assert len(reason) > 40, fn
+
+    # A disabled route must guard BEFORE it can open a PR, not merely contain a
+    # guard somewhere.
+    for entry in G.DISABLED:
+        guard, pr_call = G._guard_position(entry)
+        assert guard is not None, f"{entry} has no guard"
+        assert pr_call is None or guard < pr_call, (entry, guard, pr_call)
 
     # The gate is green on the real tree, and is not vacuous.
     assert G.main([]) == 0
-    G.EXEMPT.pop("app/webhook.py:gitlab_webhook")
+    G.EXEMPT.pop("app/cli.py:main")
     try:
         assert G.main([]) == 1, "an unlisted ungoverned entry point must fail"
     finally:
-        G.EXEMPT["app/webhook.py:gitlab_webhook"] = (
-            "154 lines of pipeline inlined in the route handler: its own engine "
-            "dispatch, its own fix generation, its own MR creation. A breaking "
-            "change on GitLab can still produce silence.")
+        G.EXEMPT["app/cli.py:main"] = (
+            "app/cli.py calls pr_engine.create_prs, which has its OWN "
+            "_format_pr_body and no routing decision. The CLI states no safety "
+            "level. Left live because it is developer-invoked and opens nothing "
+            "without an explicit command.")
     assert G.main([]) == 0
 
 
@@ -3055,6 +3068,78 @@ def test_running_revision_is_reported_or_explicitly_unknown():
     health_body = asyncio.run(webhook.health())
     assert root_body["build"] == health_body["build"], (root_body, health_body)
     assert set(root_body["build"]) == set(webhook.build_info())
+
+
+def test_experimental_platforms_are_off_across_the_whole_surface():
+    """All ELEVEN gitlab/bitbucket routes are switched off, not just the webhooks.
+
+    Disabling only /webhook/gitlab and /webhook/bitbucket would have introduced a
+    NEW silent failure: a user could still complete /auth/gitlab, see
+    /auth/gitlab/status report a connection, register via /setup/gitlab/register --
+    and then nothing would ever happen, with nothing saying why. A half-disabled
+    platform is worse than a live one, because the product appears to work.
+
+    The governance audit covers the two webhooks (they can open PRs). The other
+    nine are pinned here, because nothing else would notice their guard being
+    removed.
+    """
+    import ast
+    import importlib
+
+    GUARDED = {
+        "app/webhook.py": ["gitlab_webhook", "bitbucket_webhook"],
+        "app/gitlab_oauth.py": ["gitlab_auth_start", "gitlab_auth_callback",
+                                "gitlab_auth_status"],
+        "app/bitbucket_oauth.py": ["bitbucket_auth_start", "bitbucket_auth_callback",
+                                   "bitbucket_auth_status"],
+        "app/gitlab_setup.py": ["gitlab_setup_page", "register_gitlab_token",
+                                "list_registered_projects"],
+    }
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    checked = 0
+    for rel, funcs in GUARDED.items():
+        tree = ast.parse(open(os.path.join(root, rel)).read())
+        found = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for name in funcs:
+            assert name in found, f"{rel}: {name} is gone -- was the route renamed?"
+            calls = [c for c in ast.walk(found[name]) if isinstance(c, ast.Call)]
+            guards = [c for c in calls
+                      if (c.func.id if isinstance(c.func, ast.Name)
+                          else getattr(c.func, "attr", "")) == "experimental_disabled"]
+            assert guards, f"{rel}:{name} has no experimental_disabled() guard"
+            checked += 1
+    assert checked == 11, checked
+
+    # Default is OFF, and turning it on must be explicit -- a flag defaulting to ON
+    # that someone must remember to clear is how a temporary decision becomes
+    # permanent.
+    from app import experimental
+    saved = os.environ.pop("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", None)
+    try:
+        importlib.reload(experimental)
+        assert experimental.experimental_enabled() is False
+        os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = "1"
+        assert experimental.experimental_enabled() is True
+        os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = "true"   # only "1" counts
+        assert experimental.experimental_enabled() is False
+    finally:
+        os.environ.pop("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", None)
+        if saved is not None:
+            os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = saved
+        importlib.reload(experimental)
+
+    # The refusal STATES a reason and how to reverse it -- 501 with an empty body
+    # would be the same silence in a different costume.
+    resp = experimental.experimental_disabled("gitlab", "webhook")
+    assert resp.status_code == 501, resp.status_code
+    body = json.loads(resp.body)
+    assert body["error"] == "platform_disabled"
+    assert body["platform"] == "gitlab"
+    assert "RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS" in body["to_re_enable"]
+    assert "silence" in body["reason"]
+    assert "/dry-run" in body["what_still_works"]
 
 
 if __name__ == "__main__":

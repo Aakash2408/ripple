@@ -79,6 +79,7 @@ from .custom_playbooks import parse_ripple_config, RippleConfig, DEFAULT_TEMPLAT
 from .confidence import format_pr_body, classify_confidence
 from .routing import pr_level, Decision
 from .build_info import build_info
+from .experimental import experimental_enabled, experimental_disabled
 from .expand_contract import advise as expand_contract_advise, analyze_changes as ec_analyze
 from .rate_limiter import get_rate_limiter, get_github_rate_tracker
 from .retry_queue import get_retry_queue, should_retry, should_retry_error
@@ -559,6 +560,9 @@ async def bitbucket_webhook(request: FastAPIRequest):
     URL: https://your-server/webhook/bitbucket
     Triggers: Repository Push
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("bitbucket", "webhook")
     body = await request.body()
     payload = json.loads(body)
     
@@ -718,6 +722,9 @@ async def gitlab_webhook(request: FastAPIRequest):
     URL: https://your-server/webhook/gitlab
     Trigger: Push events
     """
+    # Switched off for the 30-day push -- see app/experimental.py.
+    if not experimental_enabled():
+        return experimental_disabled("gitlab", "webhook")
     body = await request.body()
     payload = json.loads(body)
     
