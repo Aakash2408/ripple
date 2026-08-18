@@ -47,7 +47,7 @@ import difflib
 import re
 from dataclasses import dataclass, field as _field
 
-from app.ts_codemod import _regions
+from app.source_regions import regions as _regions
 
 
 @dataclass
@@ -62,18 +62,34 @@ class DiffVerdict:
                 **{f"diff_{k}": v for k, v in self.summary.items()}}
 
 
-def _comments_and_strings(code: str) -> list:
+def _comments_and_strings(code: str, language: str = "typescript") -> list:
     """The text of every comment and string literal, for survival checking."""
     out = []
-    for start, end, kind in _regions(code):
+    for start, end, kind in _regions(code, language):
         text = code[start:end].strip()
         if len(text) > 2:               # ignore empty template runs and ""
             out.append((kind, text))
     return out
 
 
-def check(before: str, after: str, field: str) -> DiffVerdict:
-    """Verify a removal changed only references to `field`."""
+def check(before: str, after: str, field: str,
+          language: str = "typescript") -> DiffVerdict:
+    """Verify a removal changed only references to `field`.
+
+    `language` selects the comment/string scanner, and a wrong value produces
+    confident nonsense in BOTH directions:
+
+        Python scanned as TypeScript   `# phone_number is gone` is not a comment, so
+                                       a surviving mention reads as CODE and the
+                                       "field still present in CODE" rule rejects a
+                                       CORRECT fix
+        TypeScript scanned as Python   `// note` is not a comment either, and a `#`
+                                       inside a URL string starts one
+
+    Unknown languages fall back to the TypeScript rules rather than refusing, because
+    that is what every existing caller got before this parameter existed. Callers
+    that must not guess check source_regions.SCANNED -- app/fix_generator.py does.
+    """
     if not field:
         return DiffVerdict(False, ["no field name given"])
 
@@ -139,7 +155,7 @@ def check(before: str, after: str, field: str) -> DiffVerdict:
 
     # The field must be GONE from code positions. A surviving reference in a comment
     # or string is expected and reported elsewhere as a note.
-    regions = _regions(after)
+    regions = _regions(after, language)
     for m in re.finditer(rf"\b{re.escape(field)}\b", after):
         if not any(s <= m.start() < e for s, e, _ in regions):
             line_no = after[:m.start()].count("\n") + 1
@@ -159,8 +175,8 @@ def check(before: str, after: str, field: str) -> DiffVerdict:
     # fix -- found by trying to wire the contract into the pipeline, which is the
     # only place the two rules meet.
     removed_text = "".join(removed_chunks)
-    survived = {t for _k, t in _comments_and_strings(after)}
-    for kind, text in _comments_and_strings(before):
+    survived = {t for _k, t in _comments_and_strings(after, language)}
+    for kind, text in _comments_and_strings(before, language):
         if text in survived or text in removed_text:
             continue
         violations.append(f"a {kind} did not survive the change: {text[:60]!r}")

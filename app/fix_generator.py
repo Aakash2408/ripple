@@ -91,12 +91,16 @@ def generate_fix(
     #   REMOVALS ONLY. The contract forbids insertions. An add_required fix inserts
     #   by definition, so applying this to one would reject every correct fix.
     #
-    #   TS/JS ONLY. diff_contract._regions scans //, /* */, quotes and backticks. In
-    #   Python a `# phoneNumber` comment is not recognised as a comment, so it reads
-    #   as CODE and the "field still present in CODE" rule would fire on a correct
-    #   fix. Widening the language set requires teaching _regions that language, not
-    #   just deleting this condition.
+    #   ONLY LANGUAGES WITH A REAL SCANNER. The gate is source_regions.SCANNED
+    #   rather than a literal tuple, so adding a scanner is the ONE edit that widens
+    #   coverage and a language can never be admitted here without one. It used to
+    #   read ("typescript", "javascript") with a note that Python needed teaching
+    #   first -- and it did: scanning Python with the TypeScript rules means
+    #   `# phone_number is gone` is not a comment, the surviving mention reads as
+    #   CODE, and the "still present in CODE" rule REJECTS A CORRECT FIX. Measured
+    #   both ways before widening.
     from .change_types import canonical_op as _canonical_op
+    from .source_regions import SCANNED as _SCANNED
 
     # Read DECLARED fields directly. `getattr(bc, "field_name", "")` was caught by
     # test_no_phantom_getattr_on_breaking_change and rightly: a default silently
@@ -105,11 +109,11 @@ def generate_fix(
     # a real absence should raise.
     field = breaking_change.field_name or ""
     lang = (consumer.language or "").lower()
-    if (field and lang in ("typescript", "javascript")
+    if (field and lang in _SCANNED
             and _canonical_op(breaking_change.change_type or "") == "remove_field"):
         from .diff_contract import check as _diff_check
 
-        verdict = _diff_check(original_code, fixed_code, field)
+        verdict = _diff_check(original_code, fixed_code, field, language=lang)
         if not verdict.ok:
             # Refuse the whole patch. Returning None is what the caller already
             # treats as "no fix", and it is the same decision the template path

@@ -4308,5 +4308,102 @@ def test_jsx_attribute_is_removed_but_a_parameter_list_is_never_touched():
         assert verdict.ok, (src, verdict.violations)
 
 
+def test_python_regions_and_a_language_aware_diff_contract():
+    """The diff contract now covers Python, and the language parameter is load-bearing.
+
+    It was TS/JS-only because the scanner knew `//` and `/* */` but not `#`. Scanning
+    Python with those rules means a stale `# phone_number is gone` comment is not a
+    comment at all -- it reads as CODE, the "field still present in CODE" rule fires,
+    and a CORRECT fix is REJECTED. That is asserted below in both directions, because
+    a language parameter nothing depends on is decoration.
+
+    F-STRINGS ARE THE HARD PART, and they are the exact analogue of TS template
+    literals: the text is string content, `{...}` holds real code.
+
+        f"phone_number={user.phone_number}"
+          ^^^^^^^^^^^^ string (a NOTE)     ^^^^^^^^^^^^^^^^^ code (must be fixed)
+
+    Getting that backwards fails silently in one direction (the fix never happens)
+    and destructively in the other (a customer's log message is rewritten).
+    """
+    import re
+
+    from app.diff_contract import check
+    from app.source_regions import SCANNED, regions
+
+    def kinds(src, field="phone_number"):
+        spans = regions(src, "python")
+        return [next((k for s, e, k in spans if s <= m.start() < e), "CODE")
+                for m in re.finditer(rf"\b{field}\b", src)]
+
+    for label, src, expected in (
+        ("hash comment", "# phone_number is gone\nx = 1\n", ["comment"]),
+        ("member access", "p = user.phone_number\n", ["CODE"]),
+        ("plain string", 'log("phone_number gone")\n', ["string"]),
+        ("docstring", 'def f():\n    """phone_number removed."""\n    return 1\n',
+         ["string"]),
+        ("triple single", "x = '''phone_number'''\n", ["string"]),
+        ("f-string text", 'msg = f"phone_number missing"\n', ["string"]),
+        ("f-string interpolation", 'msg = f"{user.phone_number}"\n', ["CODE"]),
+        # One line, BOTH position classes -- the case that cannot be expressed by a
+        # rule as coarse as `if field in line`.
+        ("f-string both", 'msg = f"phone_number={user.phone_number}"\n',
+         ["string", "CODE"]),
+        # `{{` is a literal brace, not an interpolation. Reading it as one would put
+        # the following text in a code span.
+        ("escaped braces", 'msg = f"{{phone_number}} {user.phone_number}"\n',
+         ["string", "CODE"]),
+        ("raw string", "p = r'phone_number\\d'\n", ["string"]),
+        ("rf-string", 'm = rf"a{user.phone_number}"\n', ["CODE"]),
+        # `format_f` must not be read as an `f` prefix on the following quote.
+        ("not a prefix", "format_f = user.phone_number\n", ["CODE"]),
+    ):
+        assert kinds(src) == expected, (label, kinds(src), expected)
+
+    # THE LOAD-BEARING ASSERTION. A correct Python fix that leaves a stale comment
+    # passes as Python and is WRONGLY REJECTED as TypeScript.
+    before = ("# phone_number was removed upstream\n"
+              "class User:\n    name: str\n    phone_number: str\n")
+    after = "# phone_number was removed upstream\nclass User:\n    name: str\n"
+    assert check(before, after, "phone_number", language="python").ok, \
+        "a correct Python removal was rejected with the Python scanner"
+    assert not check(before, after, "phone_number", language="typescript").ok, \
+        "the language parameter changes nothing -- scanning Python as TypeScript " \
+        "should misread the `#` comment as code, so either the scanner regressed " \
+        "or this check is not consulting it"
+
+    # And it must have TEETH on Python, not merely accept everything.
+    src = ('# keep this note\n'
+           'def build(user):\n'
+           '    payload = {}\n'
+           '    payload["email"] = user.email\n'
+           '    payload["phone"] = user.phone_number\n'
+           '    return payload\n')
+    good = src.replace('    payload["phone"] = user.phone_number\n', "")
+    assert check(src, good, "phone_number", language="python").ok, "correct fix"
+    for label, bad in (
+        ("collateral deletion",
+         good.replace('    payload["email"] = user.email\n', "")),
+        ("partial removal",
+         src.replace('    payload["phone"] = user.phone_number\n',
+                     "    phone = user.phone_number\n")),
+        ("rewrote the comment",
+         good.replace("# keep this note", "# phone_number gone")),
+        ("no-op", src),
+    ):
+        assert not check(src, bad, "phone_number", language="python").ok, \
+            f"the Python diff contract rubber-stamped: {label}"
+
+    # The production gate keys off SCANNED, so a language can never be admitted
+    # without a scanner -- adding one is the single edit that widens coverage.
+    assert "python" in SCANNED and "typescript" in SCANNED, SCANNED
+    src_gate = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "app", "fix_generator.py")).read()
+    assert "lang in _SCANNED" in src_gate, \
+        "fix_generator no longer gates on source_regions.SCANNED, so a language " \
+        "with no scanner can reach the diff contract and be misjudged"
+
+
 if __name__ == "__main__":
     sys.exit(_main())

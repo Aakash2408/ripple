@@ -147,65 +147,16 @@ class CodemodResult:
 
 
 def _regions(code: str) -> list:
-    """Spans of comment and string CONTENT, as (start, end, kind).
+    """Comment and string spans, delegating to the shared scanner.
 
-    Template literals are split: the literal text is "string", but the contents of
-    each `${...}` are real code and are NOT included. Getting this wrong in either
-    direction is a bug -- treating `${user.phoneNumber}` as string content would
-    stop the fix working, and treating a comment as code would delete prose.
+    The implementation moved to app/source_regions.py when Python was added: keeping
+    a Python scanner in a module named ts_codemod would have made the name a lie,
+    and app/diff_contract.py was already importing this private function across the
+    boundary. Kept as a thin alias because this module calls it in one place and the
+    indirection is cheaper than churning that call site.
     """
-    out, i, n = [], 0, len(code)
-    while i < n:
-        ch = code[i]
-        nxt = code[i + 1] if i + 1 < n else ""
-        if ch == "/" and nxt == "/":
-            j = code.find("\n", i)
-            j = n if j == -1 else j
-            out.append((i, j, "comment"))
-            i = j
-        elif ch == "/" and nxt == "*":
-            j = code.find("*/", i + 2)
-            j = n if j == -1 else j + 2
-            out.append((i, j, "comment"))
-            i = j
-        elif ch in "'\"":
-            j, quote = i + 1, ch
-            while j < n:
-                if code[j] == "\\":
-                    j += 2
-                    continue
-                if code[j] == quote or code[j] == "\n":
-                    break
-                j += 1
-            out.append((i, min(j + 1, n), "string"))
-            i = min(j + 1, n)
-        elif ch == "`":
-            # Walk the template, emitting text runs and SKIPPING ${...} contents.
-            j, run_start = i + 1, i + 1
-            while j < n:
-                if code[j] == "\\":
-                    j += 2
-                    continue
-                if code[j] == "`":
-                    break
-                if code[j] == "$" and j + 1 < n and code[j + 1] == "{":
-                    out.append((run_start, j, "string"))
-                    depth, k = 1, j + 2
-                    while k < n and depth:
-                        if code[k] == "{":
-                            depth += 1
-                        elif code[k] == "}":
-                            depth -= 1
-                        k += 1
-                    j = k
-                    run_start = k
-                    continue
-                j += 1
-            out.append((run_start, min(j, n), "string"))
-            i = min(j + 1, n)
-        else:
-            i += 1
-    return out
+    from .source_regions import regions as _shared
+    return _shared(code, "typescript")
 
 
 def _kind_at(pos: int, regions: list) -> str:
