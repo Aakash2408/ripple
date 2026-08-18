@@ -4860,5 +4860,85 @@ def test_project_resolution_never_falls_back_to_the_repo_root():
         _sh.rmtree(tree, ignore_errors=True)
 
 
+def test_a_hoisted_workspace_validates_at_the_package_not_the_root():
+    """pnpm/yarn workspaces put tsconfig in the package and node_modules at the root.
+
+    The validator required both manifests in ONE directory, so Stage 2 measured this:
+    resolution correctly returned packages/api, and validate() then answered
+    "package.json is missing" -- the most common real monorepo layout was
+    UNABLE_TO_VALIDATE.
+
+    `workspace` is now where dependencies install and `project_subdir` is the path to
+    the compiler config. That is all it takes, because node's own resolution walks UP
+    from a file looking for node_modules.
+
+    THE SECOND ASSERTION IS THE IMPORTANT ONE. A SIBLING package contains a
+    deliberate type error. If the correct target came back INVALID, we would be
+    typechecking the whole workspace rather than the changed project -- which is the
+    failure the root tsconfig causes, and it would report errors from code the fix
+    never touched.
+
+    Needs a validation backend and SKIPS without one.
+    """
+    import json as _json
+    import tempfile
+
+    from app.project_resolution import resolve
+    from app.validation import choose_backend, validate
+
+    backend, note = choose_backend()
+    if not backend:
+        print(f"      SKIP: no validation backend ({note})")
+        return
+
+    def build(body):
+        tree = tempfile.mkdtemp(prefix="ripple-hoisted-")
+
+        def w(rel, text):
+            path = os.path.join(tree, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+
+        w("package.json", _json.dumps({
+            "name": "ws", "private": True, "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "5.3.3"}}))
+        w("packages/api/tsconfig.json", _json.dumps({
+            "compilerOptions": {"strict": True, "noEmit": True},
+            "include": ["src"]}))
+        w("packages/api/src/user.ts", body)
+        # A sibling with a deliberate error. It must NOT affect the target's verdict.
+        w("packages/web/tsconfig.json", _json.dumps({
+            "compilerOptions": {"strict": True}, "include": ["src"]}))
+        w("packages/web/src/broken.ts", "export const b: string = 42;\n")
+        return tree
+
+    for label, body, want in (
+        ("broken target", "export const u: string = 1;\n", "INVALID"),
+        ("correct target", 'export const u: string = "ok";\n', "VALID"),
+    ):
+        tree = build(body)
+        try:
+            project = resolve(tree, "packages/api/src/user.ts")
+            assert project is not None and project.deps_root, project
+            subdir = os.path.relpath(project.root, project.deps_root)
+            assert subdir == os.path.join("packages", "api"), subdir
+
+            verdict = validate("typescript", project.deps_root,
+                               project_subdir=subdir)
+            assert verdict.state.value == want, (
+                f"{label}: got {verdict.state.value}, wanted {want} -- "
+                f"{verdict.reason[:120]}")
+            if want == "INVALID":
+                assert any("packages/api" in e for e in verdict.errors), \
+                    f"errors do not name the target project: {verdict.errors[:2]}"
+                assert not any("packages/web" in e for e in verdict.errors), \
+                    "the sibling package appeared in the errors -- the whole " \
+                    "workspace is being typechecked, not the changed project"
+        finally:
+            import shutil as _sh
+            _sh.rmtree(tree, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(_main())
