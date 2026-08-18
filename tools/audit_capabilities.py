@@ -41,6 +41,31 @@ from app import capabilities as cap                      # noqa: E402
 from app import capability_claims as cc                   # noqa: E402
 
 RUN_EVIDENCE = os.path.join(ROOT, "tests", ".last_run.json")
+#: Proof that the e2e test actually COMPILED something, written only on a genuine
+#: validated run. tests/.last_run.json cannot serve here: it records a skipped test
+#: as "passed", so on a runner without docker the e2e claim would be honoured and
+#: AUTO would fire behind a test that did nothing. Found in Stage 8, in Stage 6's own
+#: work -- absence of evidence standing in for evidence, one layer up from where the
+#: rule was originally applied.
+E2E_EVIDENCE = os.path.join(ROOT, "tests", ".e2e_evidence.json")
+
+
+def _e2e_proof() -> tuple:
+    """(proven_cells, error). Missing proof is a FAILURE, never a pass."""
+    if not os.path.exists(E2E_EVIDENCE):
+        return set(), ("no e2e proof at tests/.e2e_evidence.json -- the e2e test "
+                       "writes it only after a real compile, so either it has not "
+                       "run or it SKIPPED for lack of a validation backend")
+    try:
+        with open(E2E_EVIDENCE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return set(), f"e2e proof unreadable: {type(exc).__name__}: {exc}"
+    if not data.get("validated") or data.get("typecheck_exit") != 0:
+        return set(), (f"e2e proof exists but does not show a successful compile: "
+                       f"{json.dumps(data)[:160]}")
+    return {tuple(data["cell"])}, ""
+
 
 # How stale the run record may be. Generous, because CI runs the suite seconds
 # earlier; the point is to reject a record from a different session entirely.
@@ -162,6 +187,17 @@ def main(argv: list) -> int:
         # but say so, rather than printing a clean bill of health.
         print(f"\n  note: {evidence_error}")
 
+    proven, proof_error = _e2e_proof()
+    unproven = sorted(set(cc.E2E_FIXTURES) - proven)
+    print("\n  e2e claims backed by a real compile:")
+    if proof_error:
+        print(f"      FAIL  {proof_error}")
+    for cell in unproven:
+        print(f"      FAIL  {cell} claims e2e evidence with no proof of a compile")
+    if not proof_error and not unproven:
+        print(f"      {len(proven)} cell(s) proven: "
+              f"{', '.join('/'.join(c) for c in sorted(proven))}")
+
     outside = _gate_capability_claims_outside_the_registry()
 
     if violations:
@@ -171,6 +207,9 @@ def main(argv: list) -> int:
         return 1
 
     if outside:
+        return 1
+
+    if proof_error or unproven:
         return 1
 
     print("\n  no unearned claims: every production=true has all five facts, "

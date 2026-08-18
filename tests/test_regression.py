@@ -3495,9 +3495,15 @@ def test_e2e_typescript_openapi_remove_field():
     base = os.path.join(root, "fixtures", "typescript-openapi", "remove-field")
     consumer = os.path.join(base, "consumer")
 
+    evidence_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 ".e2e_evidence.json")
     backend, note = choose_backend()
     if not backend:
-        print(f"      SKIP: no validation backend ({note})")
+        # Record NOTHING. tests/.last_run.json counts a skip as "passed", so without
+        # a separate proof file the capability registry would honour this cell's e2e
+        # claim on a runner with no docker -- AUTO fired by a test that did nothing.
+        # That is the absence-of-evidence-as-proof defect, one layer up.
+        print(f"      SKIP: no validation backend ({note}) -- no e2e evidence written")
         return
 
     # 1. the operation is mechanical, so a transformation is legitimate at all
@@ -3542,6 +3548,16 @@ def test_e2e_typescript_openapi_remove_field():
             assert filecmp.cmp(os.path.join(consumer, untouched),
                                os.path.join(work, untouched), shallow=False), \
                 f"{untouched} was modified -- the PR would not be reviewable"
+
+        # 6. Only now, having actually compiled, write the proof. audit_capabilities
+        #    requires this for every E2E_FIXTURES claim, so a skipped run cannot
+        #    stand in for a real one.
+        with open(evidence_path, "w") as fh:
+            json.dump({"ran_at": __import__("time").time(),
+                       "cell": ["typescript", "openapi", "remove_field"],
+                       "backend": after.evidence["backend"],
+                       "typecheck_exit": after.evidence["typecheck_exit"],
+                       "validated": True}, fh, indent=2)
     finally:
         _sh.rmtree(work_root, ignore_errors=True)
 

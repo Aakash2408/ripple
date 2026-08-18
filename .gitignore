@@ -17,3 +17,4 @@ data/activity.json
 data/*.json
 tests/.last_run.json
 tools/.durability_check.json
+tests/.e2e_evidence.json
