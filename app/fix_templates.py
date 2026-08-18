@@ -133,7 +133,15 @@ def _remove_field_typescript(code: str, variants: dict[str, str]) -> str:
     derivation turns into BLOCKED with a reason.
     """
     from .ts_codemod import remove_field as _codemod
-    return _codemod(code, variants['camel']).code
+    result = _codemod(code, variants['camel'])
+    # Stash the reasons so apply_fix_template can put them in the explanation, and
+    # from there into the PR body. A refusal or a stale comment that nobody is told
+    # about is the silence this whole effort exists to remove -- and the handler
+    # signature returns only code, so there is nowhere else to carry it.
+    _LAST_TS_RESULT.clear()
+    _LAST_TS_RESULT.update(refusals=result.refusals, notes=result.notes,
+                           edits=[e["shape"] for e in result.edits])
+    return result.code
 
 
 def _remove_field_python(code: str, variants: dict[str, str]) -> str:
@@ -223,6 +231,13 @@ def _remove_field_csharp(code: str, variants: dict[str, str]) -> str:
     # Remove this.field = param
     code = re.sub(rf'^\s*(this\.)?{pascal}\s*=.*$\n?', '', code, flags=re.MULTILINE)
     return code
+
+
+#: Reasons from the most recent TypeScript codemod run. Not elegant -- the handler
+#: contract is (code, variants) -> str, so there is no return channel for them --
+#: but losing them is worse: a PR that removes two references and silently declines
+#: a third tells the reviewer nothing about the third.
+_LAST_TS_RESULT: dict = {}
 
 
 REMOVE_HANDLERS: dict[str, Callable[[str, dict[str, str]], str]] = {
@@ -869,6 +884,11 @@ def apply_fix_template(
                 f"Cleaned: struct/class declarations, accessor methods, function params, object literals, "
                 f"and direct field access patterns for {lang}."
             )
+        if lang == "typescript" and _LAST_TS_RESULT:
+            for note in _LAST_TS_RESULT.get("notes", []):
+                explanation += f"\nNOTE: {note}"
+            for refusal in _LAST_TS_RESULT.get("refusals", []):
+                explanation += f"\nNEEDS A HUMAN: {refusal}"
         return result, explanation
 
     elif op == 'rename_field':

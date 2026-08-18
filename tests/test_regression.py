@@ -3702,12 +3702,37 @@ def test_codemod_reports_every_reference_it_cannot_handle():
     clean = remove_field("export const x = 1;\n", "phoneNumber")
     assert not clean.changed and not clean.refusals
 
-    # 4. A reference in a COMMENT is refused rather than silently edited. Slightly
-    #    conservative -- a stale comment is not a compile error -- but claiming less
-    #    is the correct direction, and rewriting prose is not this tool's job.
+    # 4. A reference in a COMMENT or STRING is a NOTE, not a refusal. Refusing it
+    #    set complete=False, so a stale comment vetoed the whole file -- and nearly
+    #    every real consumer has one, which is why the one real repository tested
+    #    came back BLOCKED. Reported, never edited, never blocking.
     only_comment = remove_field("// phoneNumber was removed upstream\nexport const y = 2;\n",
                                 "phoneNumber")
-    assert not only_comment.changed and len(only_comment.refusals) == 1
+    assert not only_comment.changed
+    assert not only_comment.refusals, "a comment must not block"
+    assert len(only_comment.notes) == 1, only_comment.notes
+
+    only_string = remove_field('console.log("phoneNumber");\n', "phoneNumber")
+    assert not only_string.refusals and len(only_string.notes) == 1
+
+    # An edit ALONGSIDE a comment and a string must still complete -- this is the
+    # case that unblocked real consumers.
+    mixed = remove_field(
+        "// phoneNumber removed upstream\n"
+        "const p = {\n  a: user?.phoneNumber,\n};\n"
+        'console.log("phoneNumber gone");\n', "phoneNumber")
+    assert mixed.complete, (mixed.refusals, mixed.notes)
+    assert len(mixed.edits) == 1 and len(mixed.notes) == 2
+    assert "user?.phoneNumber" not in mixed.code
+    assert "// phoneNumber removed upstream" in mixed.code, "the comment must survive"
+    assert 'console.log("phoneNumber gone")' in mixed.code, "the string must survive"
+
+    # 4b. Optional chaining is a handled shape -- `?.` changes nothing about whether
+    #     the reference is removable, and treating it as unhandled was an oversight.
+    for src in ('const p = {\n  a: user?.phoneNumber,\n};\n',
+                'const s = `${user?.phoneNumber}`;\n'):
+        r_opt = remove_field(src, "phoneNumber")
+        assert r_opt.complete, (src, r_opt.refusals)
 
     # 5. The golden fixture is UNAFFECTED by the broadened detection -- the two
     #    mechanical shapes still resolve completely, which is what keeps AUTO earned.

@@ -9,39 +9,61 @@ context-sensitive syntax. Measured against the golden fixture in Stage 4 it prod
     +    phone: user.};
 
 ...which does not parse, while reporting "Removed all references to field
-'phoneNumber' (1 lines affected)". The destructuring cleanup `\\b{field}\\s*,\\s*`
-stripped `phoneNumber,` wherever it appeared, including as the tail of a member
-expression. And the access pattern `^\\s*\\S*\\.field\\b.*$` only matched a line whose
-FIRST token was the access, so a template-literal interpolation survived untouched.
+'phoneNumber' (1 lines affected)". A wider regex cannot fix this: removing
+`user.phoneNumber` from an expression requires knowing what the expression IS.
 
-A wider regex cannot fix this. Removing `user.phoneNumber` from an expression
-requires knowing what the surrounding expression IS.
+THREE OUTCOMES PER REFERENCE, NOT TWO
+The first version had only "handled" and "refused", and that conflated two very
+different things. Measured against the twelve adversarial shapes, seven were
+refused -- but only three of those were genuine judgment calls. The other four were
+either an oversight (optional chaining) or, worse, *benign*:
 
-THE DESIGN: NARROW AND HONEST, NOT BROAD AND HOPEFUL
-This handles exactly two shapes, both of which are provably safe to remove because
-the value has no remaining effect:
+    console.log("phoneNumber");     a string that merely mentions the name
+    // phoneNumber is deprecated    a comment
 
-    template interpolation   `${user.phoneNumber}`     -> delete the whole ${...}
-    object-literal property  `phone: user.phoneNumber,` -> delete the whole property
+Neither is a compile error and neither should be edited. But refusing them set
+`complete = False`, so the whole file became unfixable and no PR opened. Nearly
+every real consumer has a log line or a comment naming the field it uses, which is
+why the one real repository tested in Stage 7 came back BLOCKED. A safety rule that
+blocks the safe cases is not conservative, it is broken.
 
-Everything else is REFUSED: the code comes back unchanged with a stated reason, the
-outcome enum reports BLOCKED, and a human decides. That is the correct answer for a
-reference the value of which is load-bearing --
+So references are now classified three ways:
 
-    const phone = user.phoneNumber;
-    return phone ? `sms:${phone}` : `mailto:${user.email}`;
+    EDIT      a shape that can be removed with no behavioural change
+    REFUSAL   a shape whose removal requires a human decision  -> blocks the fix
+    NOTE      a mention in a comment or string literal          -> reported only
 
--- where removal forces a behavioural decision no transformation can make. That case
-is `JUDGMENT` wearing a `remove_field` label.
+`complete` ignores notes. They travel to the PR body so a reviewer can see the
+stale comment, which is more useful than silently rewriting their prose.
 
-A transformation that abstains when it cannot be sure, paired with a validator that
-catches it when it is wrong anyway, is what makes the cell safe. Breadth here would
-mean guessing, and a guess that compiles is worse than a refusal.
+WHAT COUNTS AS AN EDITABLE SHAPE
+    template interpolation    `${user.phoneNumber}`      delete the whole ${...}
+    object-literal property   `phone: user.phoneNumber,` delete the whole property
+    type property declaration `phoneNumber: string;`     delete the whole line
+
+All three are safe because the value has no remaining effect: the field is gone
+upstream, so sending it, printing it, or mirroring its type is dead. Member chains
+may use optional chaining (`user?.phoneNumber`) and may be nested
+(`response.user.phoneNumber`) -- `?.` changes nothing about whether the reference is
+removable, and treating it as unhandled was simply an oversight.
+
+WHAT IS STILL REFUSED, CORRECTLY
+    const { name, phoneNumber } = user;      destructuring
+    function send(phoneNumber: string) {}    parameter -- breaks every caller
+    const phone = user.phoneNumber;          aliased, then used
+
+Removing any of these forces a behavioural decision no transformation can make. A
+transformation that abstains when unsure, paired with a validator that catches it
+when wrong anyway, is what makes the cell safe.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field as _field
+
+#: A member chain ending in `.field`, allowing optional chaining and nesting:
+#: `user.f`, `user?.f`, `response.user.f`, `a?.b?.f`
+_CHAIN = r"[A-Za-z_$][\w$]*(?:\s*\??\.\s*[A-Za-z_$][\w$]*)*\s*\??\."
 
 
 @dataclass
@@ -50,20 +72,91 @@ class CodemodResult:
     changed: bool
     edits: list = _field(default_factory=list)
     refusals: list = _field(default_factory=list)
+    notes: list = _field(default_factory=list)
 
     @property
     def complete(self) -> bool:
-        """Every reference was handled. A partial removal still leaves a type error,
-        so 'some edits' is not success -- it is a different failure."""
+        """Every reference that MATTERS was handled.
+
+        Notes are excluded deliberately: a comment or string mentioning the field
+        is not a compile error, so letting it veto the fix would block almost every
+        real consumer. A partial removal, by contrast, still leaves a type error, so
+        "some edits" is not success -- it is a different failure.
+        """
         return self.changed and not self.refusals
 
 
-def _interpolation_spans(code: str) -> list:
-    """(start, end) of every `${...}` inside a template literal, brace-aware.
+def _regions(code: str) -> list:
+    """Spans of comment and string CONTENT, as (start, end, kind).
 
-    Tracks backticks so `${...}` in a normal string is not touched, and counts
-    nested braces so `${ {a:1}.a }` ends at the right place.
+    Template literals are split: the literal text is "string", but the contents of
+    each `${...}` are real code and are NOT included. Getting this wrong in either
+    direction is a bug -- treating `${user.phoneNumber}` as string content would
+    stop the fix working, and treating a comment as code would delete prose.
     """
+    out, i, n = [], 0, len(code)
+    while i < n:
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "/":
+            j = code.find("\n", i)
+            j = n if j == -1 else j
+            out.append((i, j, "comment"))
+            i = j
+        elif ch == "/" and nxt == "*":
+            j = code.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append((i, j, "comment"))
+            i = j
+        elif ch in "'\"":
+            j, quote = i + 1, ch
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == quote or code[j] == "\n":
+                    break
+                j += 1
+            out.append((i, min(j + 1, n), "string"))
+            i = min(j + 1, n)
+        elif ch == "`":
+            # Walk the template, emitting text runs and SKIPPING ${...} contents.
+            j, run_start = i + 1, i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == "`":
+                    break
+                if code[j] == "$" and j + 1 < n and code[j + 1] == "{":
+                    out.append((run_start, j, "string"))
+                    depth, k = 1, j + 2
+                    while k < n and depth:
+                        if code[k] == "{":
+                            depth += 1
+                        elif code[k] == "}":
+                            depth -= 1
+                        k += 1
+                    j = k
+                    run_start = k
+                    continue
+                j += 1
+            out.append((run_start, min(j, n), "string"))
+            i = min(j + 1, n)
+        else:
+            i += 1
+    return out
+
+
+def _kind_at(pos: int, regions: list) -> str:
+    for start, end, kind in regions:
+        if start <= pos < end:
+            return kind
+    return "code"
+
+
+def _interpolation_spans(code: str) -> list:
+    """(start, end) of every `${...}` inside a template literal, brace-aware."""
     spans, i, n = [], 0, len(code)
     in_template = False
     while i < n:
@@ -92,79 +185,68 @@ def _interpolation_spans(code: str) -> list:
 
 
 def remove_field(code: str, field: str) -> CodemodResult:
-    """Remove references to `field`, or refuse per-reference with a reason."""
+    """Remove references to `field`; refuse or note the rest."""
     if not field:
         return CodemodResult(code, False, refusals=["no field name given"])
 
-    # DETECTION IS BY WORD BOUNDARY, NOT BY MEMBER ACCESS.
-    #
-    # The first version searched only for `.field`. Measured against a REAL
-    # repository in Stage 7 -- the billing-api demo consumer -- it returned
-    # changed=False, edits=0, REFUSALS=0 despite the file containing four
-    # references: two interface property declarations, a function parameter, and a
-    # shorthand object property. "Nothing to do" and "four things I cannot do" are
-    # different answers, and reporting the first for the second is the silent-gap
-    # defect this project keeps rediscovering.
+    # Word boundary, not member access. Searching only for `.field` made four real
+    # references invisible in Stage 7 -- "nothing to do" reported for "four things I
+    # cannot do". `\b` also means `phoneNumberFormatter` is correctly not a match.
     anywhere = re.compile(rf"\b{re.escape(field)}\b")
     if not anywhere.search(code):
-        return CodemodResult(code, False, refusals=[])   # genuinely nothing to do
+        return CodemodResult(code, False)
 
-    edits, refusals = [], []
+    edits, refusals, notes = [], [], []
     out = code
+    esc = re.escape(field)
 
-    # 1. Type / interface property DECLARATION on its own line:
-    #        phoneNumber: string;      phoneNumber?: string;
-    #    Safe: the upstream field is gone, so a mirror declaration of it is dead.
-    #    Runs BEFORE the object-literal rule, and cannot collide with it because the
-    #    field must be the KEY here and the value there.
-    decl = re.compile(
-        rf"^[ \t]*{re.escape(field)}\??[ \t]*:[ \t]*[^=\n]*?[;,]?[ \t]*$\n?",
-        re.MULTILINE)
+    # 1. Type / interface property DECLARATION on its own line.
+    decl = re.compile(rf"^[ \t]*{esc}\??[ \t]*:[ \t]*[^=\n]*?[;,]?[ \t]*$\n?",
+                      re.MULTILINE)
     for m in list(decl.finditer(out)):
         edits.append({"shape": "type property declaration",
                       "removed": m.group(0).strip()})
     out = decl.sub("", out)
 
-    # 2. Object-literal property whose VALUE is the member expression. Matched as a
-    #    whole line on purpose: a property occupying its own line can be deleted
-    #    entirely, which is what makes this shape safe. A property sharing a line
-    #    with others is refused rather than sliced.
+    # 2. Object-literal property whose VALUE is a member chain ending in the field.
     prop = re.compile(
-        rf"^[ \t]*[A-Za-z_$][\w$]*[ \t]*:[ \t]*[A-Za-z_$][\w$.]*\.{re.escape(field)}"
-        rf"[ \t]*,?[ \t]*$\n?",
+        rf"^[ \t]*[A-Za-z_$][\w$]*[ \t]*:[ \t]*{_CHAIN}{esc}[ \t]*,?[ \t]*$\n?",
         re.MULTILINE)
     for m in list(prop.finditer(out)):
         edits.append({"shape": "object-literal property",
                       "removed": m.group(0).strip()})
     out = prop.sub("", out)
 
-    # 3. Template interpolation whose entire contents are the member expression.
-    #    Recomputed on the current text, and applied right-to-left so earlier spans
-    #    keep their offsets.
-    inner_only = re.compile(rf"^\s*[A-Za-z_$][\w$.]*\.{re.escape(field)}\s*$")
+    # 3. Template interpolation whose entire contents are the member chain.
+    inner_only = re.compile(rf"^\s*{_CHAIN}{esc}\s*$")
     for start, end in reversed(_interpolation_spans(out)):
-        inner = out[start + 2:end - 1]
-        if not inner_only.match(inner):
+        if not inner_only.match(out[start + 2:end - 1]):
             continue
-        # Absorb ONE adjacent space so `<a> ${x}` does not become `<a> `.
-        cut_start = start
-        if cut_start > 0 and out[cut_start - 1] == " ":
-            cut_start -= 1
+        cut = start - 1 if start > 0 and out[start - 1] == " " else start
         edits.append({"shape": "template interpolation",
                       "removed": out[start:end]})
-        out = out[:cut_start] + out[end:]
+        out = out[:cut] + out[end:]
 
-    # 4. Anything STILL referencing the field is a shape this codemod will not
-    #    touch. Named individually, because "could not finish" is not a reason.
-    #    Comments count: a stale comment is not a compile error, so it is reported
-    #    rather than silently edited.
+    # 4. Classify what remains. A mention in a comment or a string is a NOTE, not a
+    #    refusal: it cannot break a build, so blocking the fix over it would block
+    #    nearly every real consumer.
+    regions = _regions(out)
     for m in anywhere.finditer(out):
         line_no = out[:m.start()].count("\n") + 1
         line = out.split("\n")[line_no - 1].strip()
-        refusals.append(
-            f"line {line_no}: `{line[:80]}` -- not a shape this transformation can "
-            f"remove safely. Removing a function parameter breaks every caller; "
-            f"removing a shorthand property or a used value changes behaviour. A "
-            f"human must decide.")
+        kind = _kind_at(m.start(), regions)
+        if kind == "comment":
+            notes.append(f"line {line_no}: mentioned in a comment -- left as is, "
+                         f"but it is now stale: `{line[:70]}`")
+        elif kind == "string":
+            notes.append(f"line {line_no}: appears in a string literal -- left as "
+                         f"is, since editing it could change behaviour: "
+                         f"`{line[:70]}`")
+        else:
+            refusals.append(
+                f"line {line_no}: `{line[:80]}` -- not a shape this transformation "
+                f"can remove safely. Removing a function parameter breaks every "
+                f"caller; removing a destructured binding or an aliased value "
+                f"changes behaviour. A human must decide.")
 
-    return CodemodResult(out, out != code, edits, refusals)
+    return CodemodResult(out, out != code, edits, refusals, notes)
