@@ -74,12 +74,30 @@ class Decision:
 
 
 def pr_level(language: str, contract: str, change_type: str,
-             confidence: float, min_confidence: float) -> Decision:
+             confidence: float, min_confidence: float,
+             validated: bool | None = None) -> Decision:
     """Decide the safety level. Callers pass facts, never a level.
 
     Same rule as Stage 3's terminal_outcome(): the decision is DERIVED here so no
     caller can assert it. A level someone must remember to set is exactly how the
     package vector ended up unreachable.
+
+    `validated` IS THE FIX THAT WAS COMPILED, not the cell that was proven.
+
+        True   this customer's patched project typechecked
+        False  it did not
+        None   no validation was attempted
+
+    AUTO requires True. Registry evidence proves the CELL works -- that
+    typescript x openapi x remove_field has an end-to-end fixture that compiles. It
+    says nothing about whether THIS patch, on THIS repository, compiles. Until the
+    request path could validate, those were conflated and AUTO rested on the former.
+    They are different claims and only the second justifies opening a PR nobody
+    reads.
+
+    None therefore yields REVIEW, not AUTO. "We could not check" must never read as
+    "it is fine" -- the same rule app/validation.py enforces by refusing to call
+    UNABLE_TO_VALIDATE a pass.
     """
     # 1. Below the configured confidence threshold: no PR. Delegated to the
     #    EXISTING should_create_pr() rather than restating `confidence <
@@ -115,12 +133,21 @@ def pr_level(language: str, contract: str, change_type: str,
     if category != MECHANICAL:
         reasons.append(f"{op} is {category}, not a deterministic transform")
 
+    # 5. THIS fix must have compiled. Not the fixture for this cell -- this patch,
+    #    on this repository. Absence of a verdict is not a pass.
+    if validated is False:
+        reasons.append("the patched project did not typecheck")
+    elif validated is None:
+        reasons.append("this fix was not validated, so AUTO cannot be earned -- "
+                       "registry evidence proves the CELL works, not this patch")
+
     if reasons:
         return Decision(Level.REVIEW, tuple(reasons))
 
     # Reached only when the registry says production-ready AND the change is
-    # mechanical AND confidence clears. Guarded by a regression test that fails
-    # if AUTO can ever be produced for a cell the registry has not cleared.
+    # mechanical AND confidence clears AND this specific patch compiled. Guarded by a
+    # regression test that fails if AUTO can ever be produced for a cell the registry
+    # has not cleared, or without a live validation.
     return Decision(Level.AUTO, ())
 
 

@@ -1366,6 +1366,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
     ensemble_stats = {"grep": 0, "playbook": 0, "history": 0, "multi_invoker": 0, "custom": 0}
     
     wire_only_changes = []
+    _drop_consumer_trees()
     for change in breaking_changes:
         # Determine contract type from spec file
         # ONE terminal state per breaking change, emitted on every exit path --
@@ -1460,6 +1461,16 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
         
             for consumer_repo in consumer_repos:
                 consumer_files = consumer_files_by_repo.get(consumer_repo, [])
+
+                # ONE tree per repository. Validation needs a PROJECT, and until this
+                # existed the pipeline read files one at a time so tsc could never
+                # run -- which is why AUTO was unreachable in production for every
+                # language, not just the ones with no codemod.
+                _tree, _tree_note = _fetch_consumer_tree(
+                    consumer_repo, after_sha, token)
+                if _tree_note:
+                    _log_activity("tree_unavailable", {
+                        "repo": consumer_repo, "reason": _tree_note})
             
                 for consumer_file, consumer_content, detector_confidence in consumer_files:
                     # Check ignore patterns
@@ -1553,6 +1564,17 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                                 file_reasons = pred.get("reasons", file_reasons)
                                 break
                     
+                        # VALIDATE THIS FIX, not the fixture for this cell. The
+                        # registry proves typescript x openapi x remove_field has an
+                        # end-to-end fixture that compiles; it says nothing about
+                        # whether THIS patch on THIS repository compiles. Those were
+                        # conflated while the request path could not validate.
+                        _validated, _vdetail = _validate_fix_against_tree(
+                            _tree, consumer_file, fixed_code)
+                        _log_activity("fix_validated", {
+                            "repo": consumer_repo, "file": consumer_file,
+                            "validated": _validated, **_vdetail})
+
                         # THE ROUTING DECISION. Previously this consulted confidence
                         # and nothing else, so a cell the registry knew had four
                         # blockers opened a PR titled "Automated Fix" exactly like a
@@ -1564,6 +1586,7 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                             change_type=change.change_type,
                             confidence=file_confidence,
                             min_confidence=min_confidence,
+                            validated=_validated,
                         )
                         if not decision.opens_pr:
                             run.refused(consumer_file, "; ".join(decision.reasons) or "below confidence threshold")
@@ -1599,7 +1622,8 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                             prs_created.append(pr_url)
                             # validated=False until Stage 5 exists: an unvalidated fix is a proposal,
                             # so RESOLVED stays unreachable for the same reason AUTO does.
-                            run.pr_created(pr_url, consumer_file, validated=False)
+                            run.pr_created(pr_url, consumer_file,
+                                           validated=bool(_validated))
                             # Track for lifecycle (pending -> merged -> reverted)
                             try:
                                 from .pr_lifecycle import (
@@ -1871,6 +1895,119 @@ def _retry_delay(err, attempt: int) -> float:
     except (AttributeError, TypeError, ValueError):
         pass
     return _BACKOFF_BASE * (2 ** attempt)
+
+
+#: Temp roots of consumer trees fetched while handling the CURRENT webhook.
+#:
+#: WHY A MODULE-LEVEL REGISTRY RATHER THAN A `with` BLOCK
+#: One tree serves EVERY consumer file in a repository -- per-file cloning would mean
+#: N downloads of the same archive and N times the rate limit. Holding it across the
+#: per-file loop with a context manager means re-indenting ~150 lines of code that
+#: carries governance guards and a ChangeRun scope. I tried the try/finally version
+#: first and it produced a SyntaxError; a large structural edit for no behavioural
+#: gain is the shape that has bitten this file before.
+#:
+#: So the registry is LRU-of-one: fetching a tree drops the previous one, and the
+#: start of each spec change drops everything. At most one tree exists at a time, and
+#: the worst case is that the LAST tree of a webhook survives until the next one --
+#: bounded by the 150 MB download cap, on a container that is ephemeral anyway.
+_CONSUMER_TREE_ROOTS: list = []
+
+
+def _drop_consumer_trees() -> None:
+    """Delete every tree fetched so far. Safe to call repeatedly."""
+    import shutil as _shutil
+
+    while _CONSUMER_TREE_ROOTS:
+        _shutil.rmtree(_CONSUMER_TREE_ROOTS.pop(), ignore_errors=True)
+
+
+def _fetch_consumer_tree(consumer_repo: str, ref: str, token: str) -> tuple:
+    """(tree, note). One tree per consumer REPOSITORY.
+
+    `tree` is None when the repository cannot be fetched and `note` says why, in
+    words that belong in a PR body. Both failure kinds degrade to "no validation",
+    never to a partial tree: validating against half a repository produces confident
+    wrong answers, which is worse than admitting we could not check.
+    """
+    from .repo_workspace import RepoTooLarge, WorkspaceError, fetch_tree
+
+    _drop_consumer_trees()
+    try:
+        tree, root = fetch_tree(consumer_repo, ref or "HEAD", token)
+        _CONSUMER_TREE_ROOTS.append(root)
+        return tree, ""
+    except (RepoTooLarge, WorkspaceError) as exc:
+        return None, f"not validated: {exc}"
+    except Exception as exc:                        # noqa: BLE001
+        # Any other failure is still "we could not check", never "it is fine".
+        return None, f"not validated: {type(exc).__name__}: {exc}"
+
+
+def _validate_fix_against_tree(tree: str, consumer_file: str,
+                               fixed_code: str) -> tuple:
+    """(validated, detail). validated is True / False / None -- None means unchecked.
+
+    THE THREE-STATE RETURN IS THE POINT. app/routing.pr_level() grants AUTO only on
+    True, so None -- no tree, no owning project, no backend -- yields REVIEW. "We
+    could not check" must never read as "it is fine", the rule app/validation.py
+    already enforces by refusing to call UNABLE_TO_VALIDATE a pass.
+
+    The fix is written into the tree, validated, and the original RESTORED. Each
+    consumer file gets its own PR, so each is validated ALONE: leaving the previous
+    file's patch in place would attribute its failure to this one.
+    """
+    from .project_resolution import resolve as _resolve
+    from .validation import validate as _validate
+
+    if not tree:
+        return None, {"validation": "SKIPPED", "validation_reason": "no tree"}
+
+    project = _resolve(tree, consumer_file)
+    if project is None:
+        # Deliberately NOT falling back to the tree root: tsc there either excludes
+        # the changed file, so a broken fix validates clean, or drags in thousands of
+        # unrelated ones. Both are confident verdicts about the wrong thing.
+        return None, {"validation": "SKIPPED",
+                      "validation_reason": f"no project owns {consumer_file}"}
+
+    target = os.path.join(tree, consumer_file)
+    try:
+        with open(target) as fh:
+            original = fh.read()
+    except OSError as exc:
+        return None, {"validation": "SKIPPED",
+                      "validation_reason": f"cannot read {consumer_file}: {exc}"}
+
+    # deps_root is where dependencies install and may be an ANCESTOR of the project
+    # in a hoisted pnpm/yarn workspace. project_subdir tells tsc which project to
+    # check; without it tsc reads the workspace ROOT tsconfig, which either excludes
+    # the changed package or drags in every package.
+    deps_root = project.deps_root or project.root
+    subdir = os.path.relpath(project.root, deps_root)
+    subdir = "" if subdir == "." else subdir
+
+    try:
+        with open(target, "w") as fh:
+            fh.write(fixed_code)
+        verdict = _validate(project.language, deps_root, project_subdir=subdir)
+    except OSError as exc:
+        return None, {"validation": "SKIPPED",
+                      "validation_reason": f"cannot write {consumer_file}: {exc}"}
+    finally:
+        try:
+            with open(target, "w") as fh:
+                fh.write(original)
+        except OSError:
+            pass          # the tree is dropped after this webhook regardless
+
+    detail = {**verdict.as_detail(), **project.as_detail()}
+    state = verdict.state.value
+    if state == "VALID":
+        return True, detail
+    if state == "INVALID":
+        return False, detail
+    return None, detail            # UNABLE_TO_VALIDATE is not a pass
 
 
 def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:

@@ -77,32 +77,18 @@ LAYERS = {
         "consequence": None,
     },
     "validation": {
-        "role": "the compiler -- does the patched project typecheck",
-        "reachable": False,
-        "consequence":
-            "no generated fix is ever compiled in the request path; AUTO rests on "
-            "build-time e2e evidence for the CELL, not on validating THIS customer's "
-            "fix. Wiring it needs repo_workspace wired FIRST -- tsc cannot typecheck "
-            "a file without its project, which is the whole reason Stage 1 exists. "
-            "The image now has a toolchain (see tools/verify_deployed_capability.py) "
-            "but RIPPLE_ALLOW_DEGRADED_VALIDATION is unset in production, so the "
-            "backend resolves to '' and every fix would be UNABLE_TO_VALIDATE.",
+        "role": "the compiler -- does the patched project typecheck. Wired at "
+                "webhook._validate_fix_against_tree, and app/routing.pr_level() now "
+                "grants AUTO only when THIS patch returns VALID",
+        "reachable": True,
+        "consequence": None,
     },
     "repo_workspace": {
         "role": "fetches the repository TREE, so a compiler sees a project rather "
-                "than an orphan file. Prerequisite for validation, for monorepo "
-                "package resolution, and for an accepted-fix corpus",
-        "reachable": False,
-        "consequence":
-            "the webhook still reads consumer files one at a time via "
-            "GET /repos/{repo}/contents/{path}, so tsc/mypy/go build have no project "
-            "to work with and AUTO is unreachable in production for EVERY language -- "
-            "not only the ones with no codemod. Monorepos are impossible for the same "
-            "reason: the owning package of a file cannot be known without the tree. "
-            "Registered the DAY it was written, unwired, because diff_contract sat in "
-            "exactly this state for three stages while a commit message claimed it "
-            "was 'wired into the pipeline'. Being able to see the gap is the point; "
-            "wiring is Stage 2, and needs project resolution to be useful.",
+                "than an orphan file. Wired at webhook._fetch_consumer_tree -- one "
+                "tree per consumer repository, LRU of one",
+        "reachable": True,
+        "consequence": None,
     },
 }
 
