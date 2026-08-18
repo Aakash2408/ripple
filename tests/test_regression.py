@@ -3805,17 +3805,18 @@ def test_codemod_coverage_does_not_regress():
 
     # COUNTS, not a percentage. The audit printed 84.6% as "85%" and a floor set from
     # that display then failed against the real value. Integers cannot round.
-    assert handled >= 12, f"handled dropped to {handled} of {total}, was 12"
-    assert missed <= 2, f"{missed} unimplemented shapes, was 2"
+    # 17 after the JSX attribute shape landed: React consumers dominate real
+    # TypeScript, so an attribute is plausibly more common than the object literal
+    # that was already handled.
+    assert handled >= 17, f"handled dropped to {handled} of {total}, was 17"
+    assert missed <= 1, f"{missed} unimplemented shapes, was 1"
 
     # Judgment references must stay refused. If this count ever DROPS, a judgment
     # call was silently transformed -- which would raise coverage while making the
     # product less safe, so it is the assertion that matters most here.
-    # 6 after Stage 3 added the two side-effecting keyed-property cases. If this
-    # count DROPS, a judgment call was silently transformed -- which would raise
-    # coverage while making the product less safe, so it is the assertion that
-    # matters most in this test.
-    assert judgment == 6, f"judgment references changed to {judgment}, was 6"
+    # 7 after default-parameter-object-value was added: it is the case that fails if
+    # _inside_jsx_tag is ever deleted, which was measured to destroy a signature.
+    assert judgment == 7, f"judgment references changed to {judgment}, was 7"
     # 5 after the same-line template case was added: its static text is a note while
     # its ${...} contents are an edit. If this DROPS, the position classifier stopped
     # distinguishing prose from code -- which would either rewrite a customer's
@@ -4230,6 +4231,81 @@ def test_the_llm_branch_is_subject_to_the_diff_contract():
             _lc.api_key = saved_key
         import shutil as _sh
         _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_jsx_attribute_is_removed_but_a_parameter_list_is_never_touched():
+    """React consumers dominate real TypeScript, so the attribute shape matters most.
+
+    `<Row phone={user.phoneNumber} />` -> `<Row />`. Same reasoning as the
+    object-literal property: the field no longer exists upstream, so passing it
+    conveys nothing. If the prop is REQUIRED, `tsc` reports it and the validator
+    blocks the fix -- that decision belongs to the compiler, not a regex.
+
+    THE PART THAT NEEDED MEASURING, not assuming. Two guards protect this: the
+    pattern requires the braces to hold exactly a member chain, and
+    _inside_jsx_tag() scans back for the opening `<`. I assumed the pattern was
+    load-bearing. It is not -- loosening it alone changes nothing, because the scan
+    rejects a default parameter on hitting `(`. Removing the SCAN is what does
+    damage:
+
+        function f(opts={user: user.phoneNumber}) { return opts; }
+          ->  function f() { return opts; }
+
+    a destroyed signature with the body still using the parameter. So this test
+    pins the scan, and the corpus case default-parameter-object-value fails the
+    coverage gate if it is ever deleted.
+    """
+    from app.ts_codemod import remove_field
+
+    # Shapes that must be removed, including the two the first implementation
+    # REFUSED because the backward scan treated a preceding attribute's `}` as the
+    # end of the tag.
+    for label, src, expected in (
+        ("single line", 'const el = <Row phone={user.phoneNumber} />;\n',
+         "const el = <Row />;\n"),
+        ("optional chain", 'const el = <Row phone={user?.phoneNumber} />;\n',
+         "const el = <Row />;\n"),
+        ("among siblings", 'const el = <Row a={x} phone={user.phoneNumber} b={y} />;\n',
+         "const el = <Row a={x} b={y} />;\n"),
+        # `>` inside a sibling's arrow function is not the end of the tag.
+        ("after an arrow sibling",
+         'const el = <Row onClick={() => f()} phone={user.phoneNumber} />;\n',
+         "const el = <Row onClick={() => f()} />;\n"),
+        # A quoted value may contain `>` too.
+        ("after a quoted sibling",
+         'const el = <Row title="a>b" phone={user.phoneNumber} />;\n',
+         'const el = <Row title="a>b" />;\n'),
+    ):
+        r = remove_field(src, "phoneNumber")
+        assert len(r.edits) == 1 and not r.refusals, (label, r.refusals)
+        assert r.edits[0]["shape"] == "JSX attribute", (label, r.edits)
+        assert r.code == expected, (label, repr(r.code))
+
+    # Alone on its line: the LINE goes, not just the attribute, or a blank line is
+    # left behind and the diff stops being scannable.
+    multi = ('const el = (\n  <Row\n    name={user.fullName}\n'
+             '    phone={user.phoneNumber}\n  />\n);\n')
+    r = remove_field(multi, "phoneNumber")
+    assert len(r.edits) == 1 and not r.refusals, r.refusals
+    assert r.code == ('const el = (\n  <Row\n    name={user.fullName}\n  />\n);\n'), \
+        repr(r.code)
+    assert "\n\n" not in r.code, "a blank line was left where the attribute was"
+
+    # A PARAMETER LIST IS NOT AN ATTRIBUTE LIST. These must never be edited.
+    for src in ('function f(opts={user: user.phoneNumber}) {\n  return opts;\n}\n',
+                'function f(phone=user.phoneNumber) {\n  return phone;\n}\n',
+                'const o = { phone: user.phoneNumber };\n'):
+        r = remove_field(src, "phoneNumber")
+        assert not any(e["shape"] == "JSX attribute" for e in r.edits), \
+            f"the JSX rule matched outside a tag: {src!r} -> {r.code!r}"
+
+    # And the output must satisfy the diff contract, which now runs in production.
+    from app.diff_contract import check
+    for src in ('const el = <Row phone={user.phoneNumber} />;\n', multi,
+                'const el = <Row a={x} phone={user.phoneNumber} b={y} />;\n'):
+        r = remove_field(src, "phoneNumber")
+        verdict = check(src, r.code, "phoneNumber")
+        assert verdict.ok, (src, verdict.violations)
 
 
 if __name__ == "__main__":

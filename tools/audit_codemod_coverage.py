@@ -161,6 +161,34 @@ CORPUS: list = [
     ("jsx-attribute",
      'const el = <Row phone={user.phoneNumber} />;\n',
      [(EDIT, "an attribute whose value is the removed field can be dropped")]),
+
+    # The two JSX variants that actually appear in React code, and that the first
+    # implementation REFUSED: the backward scan for the opening `<` treated the `}`
+    # of a PRECEDING attribute as "the tag already closed".
+    ("jsx-attribute-multiline",
+     'const el = (\n  <Row\n    name={user.fullName}\n'
+     '    phone={user.phoneNumber}\n  />\n);\n',
+     [(EDIT, "attribute alone on its line -- the whole line goes, or a blank line "
+             "is left behind and the diff stops being scannable")]),
+
+    ("jsx-attribute-among-siblings",
+     'const el = <Row a={x} phone={user.phoneNumber} b={y} />;\n',
+     [(EDIT, "siblings on both sides must survive untouched")]),
+
+    # A sibling containing `>` inside an arrow function. Reading that `>` as the end
+    # of the tag would make this refuse, so this case pins the brace-skipping.
+    ("jsx-sibling-with-arrow-function",
+     'const el = <Row onClick={() => f()} phone={user.phoneNumber} />;\n',
+     [(EDIT, "the `>` inside a sibling's arrow function is not the end of the tag")]),
+
+    # THE SAFETY CASE for the JSX rule, and the reason its pattern requires the
+    # braces to contain EXACTLY a member chain. A looser pattern matches this too,
+    # and dropping a default parameter changes a function's signature. If this ever
+    # becomes an EDIT, the JSX rule has started rewriting parameter lists.
+    ("default-parameter-object-value",
+     'function f(opts={user: user.phoneNumber}) {\n  return opts;\n}\n',
+     [(JUDGMENT, "a default parameter value, not a JSX attribute -- removing it "
+                 "changes the signature every caller relies on")]),
 ]
 
 #: Cases spanning MULTIPLE files: (id, {path: source}, expectation per file)
