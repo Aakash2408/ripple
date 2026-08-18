@@ -237,6 +237,26 @@ TRIAGE: dict[tuple, tuple] = {
         "token_store._find_store_dir and tls.resolve_ca_bundle, and the resolved "
         "path is reported in the Verdict evidence."),
 
+    ("validation.py", "_host_limits", "swallowed_except", "ImportError", 0): (
+        LEGITIMATE,
+        "The `resource` module does not exist on Windows. Returning None means no "
+        "preexec_fn is passed, which is the only thing that CAN happen there -- and "
+        "it is not hidden: every Verdict carries evidence['host_rlimits'], so a run "
+        "without limits says so. Refusing to run at all would be worse, because the "
+        "host backend already requires an explicit opt-in."),
+    ("validation.py", "_host_limits", "silent_empty_return", "", 0): (
+        LEGITIMATE, SAME_AS("validation.py", "_host_limits")),
+
+    ("validation.py", "_apply", "swallowed_except", "(ValueError, OSError)", 0): (
+        LEGITIMATE,
+        "Three independent rlimits are set in a loop. A kernel or container policy "
+        "may refuse one -- RLIMIT_AS is commonly capped below our ceiling under some "
+        "sandboxes -- and abandoning the remaining limits because one was rejected "
+        "would leave the process LESS constrained than it could be. Each setrlimit "
+        "already clamps to the existing hard limit, so a rejection here means the "
+        "environment is stricter than we asked for, not laxer. Verified enforced: a "
+        "3 GiB allocation under these limits raises MemoryError."),
+
     # -------------------------------------------------------------- LEGITIMATE
     ("dry_run.py", "<module>", "swallowed_except", "ImportError", 0): (
         LEGITIMATE, "Optional-dependency import guard at module scope."),

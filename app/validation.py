@@ -121,14 +121,39 @@ def _host_node() -> str:
     return ""
 
 
+#: The host backend is DEGRADED: no network isolation, no cgroup memory/cpu caps, no
+#: no-new-privileges. It is a real fallback for a developer machine and a deliberate
+#: risk in production, so it is never selected AUTOMATICALLY without this being set.
+#:
+#: Why a gate rather than just picking it: the production image now ships node, which
+#: means choose_backend() would silently start returning "host" for every customer
+#: repository -- running `npm install` against dependency trees the customer controls
+#: on an unisolated network. `--ignore-scripts` removes the lifecycle-script execution
+#: vector and `tsc` does not execute the code it checks, so the residual risk is
+#: narrower than "arbitrary code execution" -- but it is not zero, and the difference
+#: between a toolchain being AVAILABLE and its weakest mode being ACCEPTED is a
+#: decision an operator should make, not an import side effect.
+#:
+#: An EXPLICIT backend="host" (as tools/verify_validation.py --backend host passes)
+#: is unaffected: this gates the automatic fallback only.
+DEGRADED_OPT_IN = "RIPPLE_ALLOW_DEGRADED_VALIDATION"
+
+
 def choose_backend() -> tuple:
     """(backend, note). Preference order is strongest isolation first."""
     if _docker_available():
         return "docker", f"container, {DOCKER_IMAGE}, --network none for typecheck"
     node = _host_node()
     if node:
-        return "host", (f"DEGRADED: subprocess with --ignore-scripts and rlimits, "
-                        f"network NOT isolated ({node})")
+        if os.environ.get(DEGRADED_OPT_IN, "").strip() not in ("1", "true", "yes"):
+            return "", (f"a node toolchain exists ({node}) but the host backend is "
+                        f"DEGRADED (no network isolation, no cgroup caps) and "
+                        f"{DEGRADED_OPT_IN} is not set. Refusing to select weaker "
+                        f"isolation than the operator has accepted")
+        return "host", (f"DEGRADED, explicitly accepted via {DEGRADED_OPT_IN}: "
+                        f"subprocess with --ignore-scripts, rlimits (2GiB address "
+                        f"space, {HOST_CPU_SECONDS}s cpu) and a timeout; network is "
+                        f"NOT isolated ({node})")
     return "", "no usable node and no docker"
 
 
@@ -167,10 +192,47 @@ def describe_backend() -> dict:
 # the runner
 # --------------------------------------------------------------------------
 
-def _run(cmd: list, cwd: str, timeout: int) -> tuple:
+#: Address space and CPU ceilings for the HOST backend, mirroring what docker gets
+#: from --memory and --cpus. Docker enforces those via cgroups; a bare subprocess
+#: gets nothing unless it is asked for, and for three stages this module's docstring
+#: and choose_backend() both advertised "rlimits" that did not exist. A claimed
+#: protection that is absent is worse than an admitted absence, because it stops
+#: anyone looking.
+HOST_ADDRESS_SPACE = 2 * 1024 * 1024 * 1024      # 2 GiB; tsc on a large repo is hungry
+HOST_CPU_SECONDS = 240
+HOST_MAX_FILE_BYTES = 512 * 1024 * 1024          # no filling the disk with one file
+
+
+def _host_limits():
+    """A preexec_fn applying rlimits, or None where unsupported (Windows).
+
+    Deliberately NOT limiting the process count: npm legitimately fans out, and an
+    RLIMIT_NPROC low enough to matter breaks the install rather than containing it.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    def _apply():
+        for what, limit in ((resource.RLIMIT_AS, HOST_ADDRESS_SPACE),
+                            (resource.RLIMIT_CPU, HOST_CPU_SECONDS),
+                            (resource.RLIMIT_FSIZE, HOST_MAX_FILE_BYTES)):
+            try:
+                soft, hard = resource.getrlimit(what)
+                ceiling = limit if hard in (resource.RLIM_INFINITY,) else min(limit, hard)
+                resource.setrlimit(what, (ceiling, hard))
+            except (ValueError, OSError):
+                # A limit we cannot set is not a reason to abandon the others.
+                pass
+
+    return _apply
+
+
+def _run(cmd: list, cwd: str, timeout: int, limits=None) -> tuple:
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                           timeout=timeout)
+                           timeout=timeout, preexec_fn=limits)
         return p.returncode, (p.stdout or "") + (p.stderr or ""), ""
     except subprocess.TimeoutExpired:
         return None, "", f"timed out after {timeout}s"
@@ -243,7 +305,12 @@ def validate_typescript(workspace: str, backend: str = "") -> Verdict:
             node_dir = os.path.dirname(_host_node())
             install = ["env", f"PATH={node_dir}:{os.environ.get('PATH','')}"] + npm_cmd
 
-        code, out, err = _run(install, work, INSTALL_TIMEOUT)
+        # rlimits apply ONLY to the host path; docker enforces the equivalent via
+        # cgroups and adding a preexec_fn there would limit the `docker` client.
+        host_limits = _host_limits() if backend == "host" else None
+        ev["host_rlimits"] = bool(host_limits)
+
+        code, out, err = _run(install, work, INSTALL_TIMEOUT, host_limits)
         ev["install_exit"] = code
         if code != 0:
             # NOT invalid. We never found out whether the code is correct.
@@ -266,7 +333,7 @@ def validate_typescript(workspace: str, backend: str = "") -> Verdict:
                      "./node_modules/.bin/tsc", "--noEmit", "--skipLibCheck"]
         ev["typecheck"] = "tsc --noEmit --skipLibCheck"
 
-        code, out, err = _run(check, work, TYPECHECK_TIMEOUT)
+        code, out, err = _run(check, work, TYPECHECK_TIMEOUT, host_limits)
         ev["typecheck_exit"] = code
         if code is None:
             return Verdict(ValidationState.UNABLE_TO_VALIDATE,
