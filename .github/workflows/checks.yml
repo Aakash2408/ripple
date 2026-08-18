@@ -102,6 +102,19 @@ jobs:
         # which is the one outcome that must never happen.
         run: python tools/audit_codemod_coverage.py
 
+      - name: Negative fix corpus (blocking)
+        # Six fixes that the deleted app/validated_fix.py once called VALID. Each is
+        # replayed against a frozen reproduction of that old logic to prove it really
+        # did pass -- so the corpus cannot be padded with cases that were never a
+        # problem -- and then run through the current stack, which must block it.
+        #
+        # Runs WITHOUT docker on purpose: every case is stopped by the diff contract
+        # or the no-op check, both pure functions over text. The compiler is consulted
+        # only by `--compiler`, and its verdict is reported, never depended on. One
+        # case (a half-fix that keeps a function parameter) compiles cleanly, so a
+        # gate that leaned on tsc would let it through.
+        run: python tools/audit_negative_corpus.py
+
       - name: Frozen surface (blocking)
         # The 30-day push has one objective: ONE real breaking change becoming one
         # validated, mergeable PR. Ripple already detects across 10 contract types

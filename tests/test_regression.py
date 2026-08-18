@@ -3872,5 +3872,61 @@ def test_keyed_property_with_a_side_effect_is_refused():
         assert len(r.edits) == 1 and not r.refusals, (src, r.refusals)
 
 
+def test_every_historical_false_valid_stays_blocked():
+    """The six fixes that were once called VALID must never be called VALID again.
+
+    Two assertions, and the second is the one that stops this decaying into
+    decoration:
+
+      1. every case is blocked by the current stack, by the layer it declares;
+      2. every case is GENUINELY historical -- replayed against a frozen copy of
+         the deleted validator's logic, which must accept it.
+
+    Without (2) the corpus can be padded with inputs that were never a problem, and
+    the count grows while the safety boundary does not. Without the size floor the
+    corpus can be emptied and still pass, which is the same defect one level up.
+
+    Note what this does NOT assert: that `tsc` rejects all six. It does not.
+    `known_bad_fix_003` keeps an unused function parameter, which is legal
+    TypeScript, so the compiler returns VALID and the diff contract is the only
+    thing standing between it and an automatically opened PR. A gate written around
+    the compiler would ship it.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_negative_corpus as neg
+
+    assert len(neg.CORPUS) >= 6, \
+        f"the negative corpus shrank to {len(neg.CORPUS)} -- entries are permanent"
+
+    ids = [c["id"] for c in neg.CORPUS]
+    assert len(set(ids)) == len(ids), f"duplicate case ids: {ids}"
+
+    layers = {}
+    for case in neg.CORPUS:
+        was_valid, err = neg._historical_validate(case["after"], case["language"])
+        assert was_valid, (
+            f"{case['id']}: the deleted validator REJECTED this ({err}), so it is "
+            f"not one of the false VALIDs and does not belong in the corpus")
+
+        result = neg._run_stack(case)
+        assert result["blocked"], f"{case['id']} ESCAPED: {result['detail']}"
+        assert result["layer"] == case["blocked_by"], (
+            f"{case['id']}: declared blocked_by={case['blocked_by']!r} but "
+            f"{result['layer']!r} stopped it -- a layer changed behaviour and "
+            f"another covered for it")
+        layers[result["layer"]] = layers.get(result["layer"], 0) + 1
+
+    # At least two DIFFERENT layers must be doing work. If every case collapsed onto
+    # one layer, the corpus would stop being evidence that the stack has depth.
+    assert len(layers) >= 2, f"all cases blocked by one layer only: {layers}"
+
+    # The half-fix is the reason the diff layer exists. Losing it would leave the
+    # corpus unable to show the compiler is insufficient.
+    half = [c for c in neg.CORPUS if "half_fix" in c["id"]]
+    assert half, "the half-fix case was removed -- it is the one tsc lets through"
+    assert half[0]["blocked_by"] == "diff", half[0]["blocked_by"]
+
+
 if __name__ == "__main__":
     sys.exit(_main())
