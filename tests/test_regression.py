@@ -3745,5 +3745,47 @@ def test_codemod_reports_every_reference_it_cannot_handle():
     assert "user.}" not in g.code
 
 
+def test_codemod_coverage_does_not_regress():
+    """Coverage is a number that must not fall, and correctness must not break.
+
+    The coverage audit exits 0 on a coverage gap deliberately -- a gap is a task, and
+    failing the build on it would pressure someone into reclassifying a judgment call
+    as an edit to make the number go up. That is the one outcome that must never
+    happen, so the ratchet lives here instead.
+
+    Measured per REFERENCE, not per case: a file with four references and one bad
+    shape is three automatable references plus one that needs a human, and the ratio
+    is what predicts whether a design partner ever sees an automated fix. The AUTO
+    flag was already true while the one real repository tested came back BLOCKED.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_codemod_coverage as cov
+    from app.ts_codemod import remove_field
+
+    handled = missed = judgment = notes = 0
+    for case_id, src, expected in cov.CORPUS:
+        r = remove_field(src, cov.FIELD)
+        h, m, j, n, problems = cov._classify(r, expected)
+        assert not problems, f"{case_id}: {problems}"
+        handled += h; missed += m; judgment += j; notes += n
+
+    total = handled + missed
+
+    # COUNTS, not a percentage. The audit printed 84.6% as "85%" and a floor set from
+    # that display then failed against the real value. Integers cannot round.
+    assert handled >= 11, f"handled dropped to {handled} of {total}, was 11"
+    assert missed <= 2, f"{missed} unimplemented shapes, was 2"
+
+    # Judgment references must stay refused. If this count ever DROPS, a judgment
+    # call was silently transformed -- which would raise coverage while making the
+    # product less safe, so it is the assertion that matters most here.
+    assert judgment == 4, f"judgment references changed to {judgment}, was 4"
+    assert notes == 4, notes
+
+    # And the gate itself is green on the real corpus.
+    assert cov.main([]) == 0
+
+
 if __name__ == "__main__":
     sys.exit(_main())

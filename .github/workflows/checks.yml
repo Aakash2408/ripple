@@ -93,6 +93,15 @@ jobs:
         # corrected to a number, because there is no single right one.
         run: python tools/audit_public_claims.py
 
+      - name: Codemod coverage (blocking on correctness, not on coverage)
+        # Reports what fraction of automatable references the one AUTO cell can
+        # actually transform. Exits 1 only on CORRECTNESS problems -- an unexpected
+        # edit, a judgment call that got transformed, a missed note -- because those
+        # are bugs. A coverage gap is a task, not a failure, and failing the build on
+        # it would pressure someone into reclassifying a judgment call as an edit,
+        # which is the one outcome that must never happen.
+        run: python tools/audit_codemod_coverage.py
+
       - name: Frozen surface (blocking)
         # The 30-day push has one objective: ONE real breaking change becoming one
         # validated, mergeable PR. Ripple already detects across 10 contract types

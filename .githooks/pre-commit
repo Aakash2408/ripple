@@ -70,6 +70,7 @@ GATES=(
     "tools/audit_fail_silent.py --check"
     "tools/audit_pipeline_governance.py"
     "tools/audit_frozen_surface.py"
+    "tools/audit_codemod_coverage.py"
 )
 
 echo ""
