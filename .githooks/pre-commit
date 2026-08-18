@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit while any gate is red.
+#
+# WHY THIS EXISTS
+# 66 commits landed in two days, and the recurring shape was not "too many" -- it
+# was COMMIT, then discover the defect in what was just committed, then commit the
+# fix. The evidence is in the messages:
+#
+#   2505ac4  "docs: test count 100 -> 101"                     belonged in 9ece147
+#   c6b60af  "the language gate still imported the module
+#             deleted in 9ece147"                              names its own parent
+#
+# Both were mistakes in the immediately preceding commit. A rule about running the
+# suite first is a promise; this is a mechanism. Same reasoning as deriving the
+# outcome inside the funnel instead of asking callers to pass one: a step someone
+# must remember is a step that gets skipped.
+#
+# It runs the FULL set (~30s) rather than a fast subset, on purpose. The cost is
+# the point -- it makes a 20-commit day expensive and a batched, coherent commit
+# cheap, which is the behaviour being encouraged.
+#
+# SETUP (per clone, since git will not let a repo configure its own hooks path):
+#   git config core.hooksPath .githooks
+#
+# ESCAPE HATCH:
+#   git commit --no-verify        # deliberate, and visible in your shell history
+#
+# If the gates CANNOT be run, this refuses rather than passing. Absence of evidence
+# is not evidence -- the same rule tools/verify_durability.py follows when it cannot
+# reach the deployed service.
+
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+# --- resolve a python that can actually run the gates -------------------------
+PY=""
+for candidate in \
+    "python3.12" \
+    "$HOME/.toolbox/tools/meshclaw/3.3.7/python3.12/bin/python3.12" \
+    "python3"; do
+    if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+        ver="$("$candidate" -c 'import sys; print(sys.version_info[:2])' 2>/dev/null)"
+        case "$ver" in
+            "(3, 1"[2-9]")") PY="$candidate"; break ;;
+        esac
+    fi
+done
+
+if [ -z "$PY" ]; then
+    echo ""
+    echo "  pre-commit: REFUSED -- no python >= 3.12 found, so the gates cannot run."
+    echo "  This is not a pass. Either install python3.12 or, if you know what you"
+    echo "  are doing:  git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+# --- the gates, in the same order CI runs them -------------------------------
+GATES=(
+    "tools/check_names.py app/*.py"
+    "tests/test_regression.py"
+    "tools/audit_diff_engines.py"
+    "tools/audit_change_types.py"
+    "tools/coverage_matrix.py"
+    "tools/audit_capabilities.py"
+    "tools/audit_public_claims.py"
+    "tools/audit_fail_silent.py --check"
+    "tools/audit_pipeline_governance.py"
+)
+
+echo ""
+echo "  pre-commit: ${#GATES[@]} gates (~30s). Skip with --no-verify."
+
+failed=()
+for gate in "${GATES[@]}"; do
+    # shellcheck disable=SC2086
+    if out="$("$PY" $gate 2>&1)"; then
+        printf "    ok    %s\n" "${gate%% *}"
+    else
+        printf "    FAIL  %s\n" "${gate%% *}"
+        failed+=("$gate")
+        LAST_OUT="$out"
+    fi
+done
+
+if [ ${#failed[@]} -ne 0 ]; then
+    echo ""
+    echo "  COMMIT REFUSED -- ${#failed[@]} gate(s) red:"
+    for gate in "${failed[@]}"; do echo "      $gate"; done
+    echo ""
+    echo "  Last failure output (tail):"
+    echo "${LAST_OUT:-}" | tail -15 | sed 's/^/      /'
+    echo ""
+    echo "  Fix it and commit once -- do NOT commit this and repair it in a"
+    echo "  follow-up commit. If you have already committed, use:"
+    echo "      git commit --amend"
+    echo ""
+    exit 1
+fi
+
+echo "    all gates green"
+echo ""
+exit 0

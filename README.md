@@ -681,6 +681,18 @@ carry the caveat and a regression test asserts the false claim is absent.
 transform quietly matches nothing. Six real defects here were found by
 investigating cells that reported "no change" — none by the passing total.
 
+Enable the pre-commit hook once per clone (git will not let a repo configure its
+own hooks path):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+It runs every gate below and **refuses the commit** if any is red — because the
+recurring mistake was not too many commits, it was committing and then repairing
+the same change in a follow-up commit (`c6b60af`'s message literally names the
+commit it should have been part of). Escape with `git commit --no-verify`.
+
 Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7):
 
 ```bash
