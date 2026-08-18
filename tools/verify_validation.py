@@ -72,6 +72,17 @@ def _ripple(src: str) -> str:
     return fixed
 
 
+def _corrupted(src: str) -> str:
+    """The exact output the pre-Stage-6 regex produced: `phone: user.};`.
+
+    Kept as a permanent adversarial case. A validator that only ever sees good code
+    is indistinguishable from one that always says VALID.
+    """
+    out = src.replace("    phone: user.phoneNumber,\n  };", "    phone: user.};")
+    assert out != src, "the corruption target moved -- update this helper"
+    return out
+
+
 def main(argv: list) -> int:
     from app.validation import validate, choose_backend
 
@@ -94,7 +105,14 @@ def main(argv: list) -> int:
     cases = [
         ("broken fixture", None, "INVALID"),
         ("hand-written correct fix", _correct, "VALID"),
-        ("Ripple's own generated fix", _ripple, "INVALID"),
+        # Stage 6 replaced the regex with a syntax-aware codemod, so Ripple's own
+        # output now compiles. Until Stage 6 this case expected INVALID and proved
+        # the validator would reject OUR bad fix -- the reason the codemod exists.
+        ("Ripple's own generated fix", _ripple, "VALID"),
+        # ...so the rejection power is proven separately, with the EXACT corruption
+        # the regex used to emit. Dropping this case would leave the suite unable to
+        # show the validator can reject anything at all.
+        ("the old regex's corruption", _corrupted, "INVALID"),
     ]
     failures = []
     for label, transform, expected in cases:
@@ -119,8 +137,9 @@ def main(argv: list) -> int:
             print(f"      {f}")
         return 1
 
-    print("\n  the validator accepts correct code, rejects broken code, and rejects")
-    print("  RIPPLE'S OWN output -- which is the case that stops it being decorative.")
+    print("\n  the validator accepts correct code (including Ripple's own generated")
+    print("  fix), and rejects both the unfixed consumer and the exact corruption the")
+    print("  pre-Stage-6 regex emitted -- so it can still say no.")
     return 0
 
 

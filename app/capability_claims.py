@@ -122,9 +122,15 @@ VALIDATORS: dict[str, ValidatorSpec] = {
 # diff -> fix, and one that posts a synthetic push payload, but none reach a
 # validated PR because validation does not exist yet.
 #
-# Empty is therefore the correct content, not an oversight. It becomes non-empty
-# when the sandboxed validation runner exists.
-E2E_FIXTURES: dict[tuple, str] = {}
+# It became non-empty in Stage 6, with ONE entry. The named test copies the golden
+# fixture, asserts it does not compile, generates and APPLIES the fix, runs
+# `tsc --noEmit` in a container, and byte-compares every other file to prove the
+# diff is minimal. It SKIPS when no backend exists rather than passing, because a
+# test that passes without a compiler is evidence of nothing.
+E2E_FIXTURES: dict[tuple, str] = {
+    ("typescript", "openapi", "remove_field"):
+        "test_e2e_typescript_openapi_remove_field",
+}
 
 
 # --------------------------------------------------------------------------

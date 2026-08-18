@@ -305,10 +305,14 @@ the capability registry, not by confidence:
 | 🟡 `REVIEW` | A fix was produced but something is unproven. The PR opens, states the reasons, and asks for a human. |
 | 🔴 `BLOCKED` | No PR. |
 
-**Today every PR is `REVIEW`.** Real toolchain validation is not built and
-`E2E_FIXTURES` is empty, so no cell can satisfy `AUTO` — `python tools/audit_capabilities.py`
-reports 0 of 48 fixable cells production-ready. Ripple therefore never claims a fix
-is automatic. `app/routing.py` derives the level by asking
+**Exactly one cell is `AUTO`: `typescript × openapi × remove_field`.** It earned it
+— a syntax-aware transformation that refuses shapes it cannot remove safely,
+`tsc --noEmit` in a container against the generated code, and an end-to-end fixture
+whose named test runs the whole path. `python tools/audit_capabilities.py` reports
+1 of 48 fixable cells production-ready and recomputes that from the code.
+
+The other 1,799 combinations are `REVIEW`. Removing either the validation or the
+end-to-end evidence takes `AUTO` away, which is asserted in the suite. `app/routing.py` derives the level by asking
 `app/capability_claims.py`; it keeps no list of its own, and CI fails if it grows one.
 
 **GitHub is the only live surface.** The GitLab and Bitbucket integrations are
@@ -704,7 +708,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 113 tests
+python tests/test_regression.py            # 115 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes

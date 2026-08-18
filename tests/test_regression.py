@@ -2516,15 +2516,15 @@ def test_production_readiness_cannot_be_declared():
     s = cc.summary()
     assert s["validate_ok"] > 0, \
         "TypeScript validation is wired -- if this is 0 again, is_wired stopped resolving"
-    assert s["e2e_ok"] == 0, \
-        "no cell has end-to-end evidence yet; E2E_FIXTURES must stay empty until a " \
-        "run genuinely satisfies a fixture's declared expectations"
+    assert s["e2e_ok"] > 0, \
+        "Stage 6 registered one end-to-end fixture; if this is 0 the evidence was lost"
     fixable = [r for r in cc.claim_matrix()
                if "generate_fix" in cc.required_facts(r["operation"])]
-    assert not any(r["production"] for r in fixable), (
-        "a fixable cell claims production with 0 e2e-tested -- validation alone is "
-        "not sufficient, and Stage 4 measured exactly why: the TypeScript "
-        "remove_field handler emits code that does not parse")
+    ready = [(r["language"], r["contract"], r["operation"])
+             for r in fixable if r["production"]]
+    # EXACTLY one. Not zero (the mechanism must be able to say yes) and not many
+    # (breadth without proof is the thing being refused).
+    assert ready == [("typescript", "openapi", "remove_field")], ready
     wire = [r for r in cc.claim_matrix()
             if cc.required_facts(r["operation"]) == ("detect",)]
     assert wire and all(r["production"] for r in wire), (
@@ -2536,11 +2536,17 @@ def test_production_readiness_cannot_be_declared():
     # on TWO facts; TypeScript validation is now real, so exactly one remains. That
     # the count MOVED is the point -- a predicate whose output never changes when a
     # fact changes is not computing anything.
+    # Stage 6: this cell now has BOTH facts, so there are no blocking reasons left.
+    # That the list went 2 -> 1 -> 0 as each fact landed is how you can tell the
+    # predicate computes over inputs rather than reciting a constant.
     reasons = cc.blocking_reasons("typescript", "openapi", "remove_field")
-    assert len(reasons) == 1, reasons
-    assert any("end-to-end" in r for r in reasons), reasons
-    assert not any("UNABLE_TO_VALIDATE" in r for r in reasons), \
-        "TypeScript validation is wired; this reason should have disappeared"
+    assert reasons == [], reasons
+
+    # A sibling cell differing in ONE dimension must still be blocked, otherwise
+    # readiness leaked across the matrix.
+    assert cc.blocking_reasons("typescript", "proto", "remove_field")
+    assert cc.blocking_reasons("python", "openapi", "remove_field")
+    assert cc.blocking_reasons("typescript", "openapi", "rename_field")
 
     # And a language WITHOUT a runner still reports both.
     unwired = cc.blocking_reasons("go", "openapi", "remove_field")
@@ -2567,7 +2573,14 @@ def test_every_e2e_claim_names_the_test_that_proves_it():
         assert callable(getattr(self_mod, test_name))
 
     # And an unclaimed cell must not read as tested.
-    assert not e2e_tested("typescript", "openapi", "remove_field")
+    # Stage 6: this cell IS now claimed, and the invariant above proves the named
+    # test exists and is callable. What must still hold is that a cell WITHOUT a
+    # fixture is not silently credited.
+    assert e2e_tested("typescript", "openapi", "remove_field")
+    assert E2E_FIXTURES[("typescript", "openapi", "remove_field")] == \
+        "test_e2e_typescript_openapi_remove_field"
+    assert not e2e_tested("python", "openapi", "remove_field")
+    assert not e2e_tested("typescript", "proto", "remove_field")
 
 
 def test_cli_and_production_discover_the_same_consumers():
@@ -3273,9 +3286,10 @@ def test_golden_fixture_is_broken_satisfiable_and_claims_nothing_yet():
        "Removed all references to field 'phoneNumber' (0 lines affected)" -- a
        false claim in a user-facing string. That is written down in expected.json
        so Stage 6 cannot quietly assume the transformation works.
-    3. NOTHING is claimed. E2E_FIXTURES stays empty until a run genuinely satisfies
-       `expect`. A fixture existing is not evidence; the capability registry only
-       counts a fixture that a named, actually-run test satisfied.
+    3. The claim now EXISTS and is earned: test_e2e_typescript_openapi_remove_field
+       runs the whole path against a real compiler, so the registry cites a test
+       rather than a boolean. A fixture existing was never evidence; a fixture a
+       named test satisfies is.
     """
     import json as _json
 
@@ -3320,37 +3334,50 @@ def test_golden_fixture_is_broken_satisfiable_and_claims_nothing_yet():
     m = spec["measured"]
     assert m["fixture_fails_without_a_fix"] is True
     assert m["fixture_is_satisfiable"] is True
-    assert m["ripple_output_parses"] is False
-    assert m["verdict"] == "BROKEN FIX, not an incomplete one"
-    assert len(m["gap"]) == 3
+    # Stage 6 re-measured: the codemod replaced the regex, so the output now parses
+    # and validates. The Stage 4 record is KEPT under stage_4_baseline because it is
+    # the reason the codemod exists -- deleting it would erase why.
+    assert m["ripple_output_parses"] is True
+    assert m["ripple_typecheck_after"] == "VALID"
+    assert m["production_ready"] is True
+    assert m["evidence_test"] == "test_e2e_typescript_openapi_remove_field"
+    baseline = m["stage_4_baseline"]
+    assert baseline["ripple_output_parses"] is False
+    assert "user.};" in baseline["ripple_diff"]
+    assert baseline["verdict"].startswith("BROKEN FIX")
 
-    # Measured here, not trusted from the file. The handler CORRUPTS the object
-    # literal -- `phone: user.phoneNumber,` becomes `phone: user.};` -- because the
-    # destructuring cleanup strips `phoneNumber,` wherever it appears, including as
-    # the tail of a member expression. And it leaves the template-literal reference
-    # untouched. Both report "Removed all references".
+    # Measured here, not trusted from the file. Stage 6 replaced the regex with
+    # app/ts_codemod.py, so the handler now produces the CORRECT fix -- identical to
+    # the hand-written reference -- and refuses shapes it cannot remove safely.
     from app.fix_templates import apply_fix_template
     fixed, explanation = apply_fix_template(
         code=consumer, language="typescript", change_type="removed_field",
         field_name="phoneNumber")
-    assert fixed != consumer, "the handler no longer touches the fixture -- re-measure"
-    assert "phone: user.};" in fixed, (
-        "the corrupting substitution changed shape. Re-run tsc against the output "
-        "and update expected.json rather than relaxing this assertion.")
-    assert "${user.phoneNumber}" in fixed, \
-        "the template-literal reference is still expected to survive untouched"
-    assert "Removed all references" in explanation, \
-        "the false success claim is part of the recorded baseline"
+    assert fixed != consumer
+    assert "user.}" not in fixed, "the corrupting substitution is back"
+    assert "${user.phoneNumber}" not in fixed, "the template reference must be gone"
+    assert "phone: user.phoneNumber" not in fixed, "the payload key must be gone"
+    assert "user.email" in fixed and "user.fullName" in fixed, \
+        "unrelated references must survive"
+    assert "Removed references" in explanation
 
-    # The output is not merely wrong, it does not PARSE. Checked without node: a
-    # bare `user.}` cannot be valid in any TypeScript expression position.
-    assert "user.}" in fixed
+    # And a shape it cannot handle is REFUSED, with the code left alone -- the
+    # explanation must not claim success. "Removed all references ... (0 lines
+    # affected)" was a false claim that read identically to a corruption.
+    judgment = ("const phone = user.phoneNumber;\n"
+                "export const t = phone ? phone : user.email;\n")
+    unchanged, why = apply_fix_template(
+        code=judgment, language="typescript", change_type="removed_field",
+        field_name="phoneNumber")
+    assert unchanged == judgment
+    assert "Could NOT remove" in why, why
 
     # 3. nothing is claimed yet
     from app.capability_claims import E2E_FIXTURES, e2e_tested
-    assert E2E_FIXTURES == {} or not e2e_tested("typescript", "openapi",
-                                               "remove_field"), \
-        "the fixture exists but must not be cited as evidence until a run satisfies it"
+    assert e2e_tested("typescript", "openapi", "remove_field"), \
+        "Stage 6 earned this claim; losing it means the evidence was dropped"
+    assert len(E2E_FIXTURES) == 1, \
+        f"one cell has end-to-end evidence, not {len(E2E_FIXTURES)}"
 
 
 def test_validation_never_turns_unknown_into_valid():
@@ -3439,6 +3466,171 @@ def test_validation_never_turns_unknown_into_valid():
     backend, note = choose_backend()
     assert backend in ("", "docker", "host"), backend
     assert note
+
+
+def test_e2e_typescript_openapi_remove_field():
+    """THE golden path, end to end, against the real toolchain.
+
+    detect -> canonical op -> fix -> APPLY -> tsc --noEmit -> minimal diff
+
+    This is the test named in E2E_FIXTURES, so it is the evidence that makes
+    typescript x openapi x remove_field production-ready. It must therefore run the
+    real thing: no stubs, no monkeypatching, a real container, a real compiler.
+
+    It SKIPS rather than passes when no validation backend exists. A test that
+    quietly passes without a compiler would be the same defect as validated_fix.py
+    returning True from absence of evidence -- and the capability registry would
+    then be citing a test that proved nothing. Skipping is visible; a false pass is
+    not.
+    """
+    import filecmp
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.change_types import canonical_op, category, MECHANICAL
+    from app.fix_templates import apply_fix_template
+    from app.validation import validate, choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "typescript-openapi", "remove-field")
+    consumer = os.path.join(base, "consumer")
+
+    backend, note = choose_backend()
+    if not backend:
+        print(f"      SKIP: no validation backend ({note})")
+        return
+
+    # 1. the operation is mechanical, so a transformation is legitimate at all
+    assert canonical_op("removed_field") == "remove_field"
+    assert category("removed_field") == MECHANICAL
+
+    work_root = tempfile.mkdtemp(prefix="ripple-e2e-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns("node_modules", ".git"))
+        target = os.path.join(work, "src", "checkout.ts")
+
+        # 2. the consumer genuinely does not compile first -- otherwise the rest of
+        #    this test would prove nothing
+        before = validate("typescript", work)
+        assert before.state is ValidationState.INVALID, before.reason
+        assert len(before.errors) == 2, before.errors
+
+        # 3. generate and APPLY the fix (read before write -- the inverted order
+        #    silently produced empty files and two false VALIDs in Stage 5)
+        with open(target) as fh:
+            original = fh.read()
+        fixed, explanation = apply_fix_template(
+            code=original, language="typescript", change_type="removed_field",
+            field_name="phoneNumber")
+        assert fixed != original, "the transformation did nothing"
+        assert "user.}" not in fixed, "the transformation corrupted the file"
+        with open(target, "w") as fh:
+            fh.write(fixed)
+        assert open(target).read() == fixed
+
+        # 4. the real compiler accepts it
+        after = validate("typescript", work)
+        assert after.state is ValidationState.VALID, \
+            f"{after.reason} :: {after.errors[:3]}"
+        assert after.evidence["typecheck_exit"] == 0
+
+        # 5. the diff is MINIMAL -- everything else byte-identical
+        for untouched in ("src/orders.ts", "src/types.ts", "tsconfig.json",
+                          "package.json"):
+            assert filecmp.cmp(os.path.join(consumer, untouched),
+                               os.path.join(work, untouched), shallow=False), \
+                f"{untouched} was modified -- the PR would not be reviewable"
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
+    """AUTO exists now. It must remain impossible to obtain without earning it.
+
+    Before Stage 6 this was easy to guarantee, because AUTO was unreachable for all
+    1800 cells -- nothing validated. Now exactly one cell reaches it, which is the
+    first time the mechanism has had to distinguish rather than simply refuse. That
+    makes this the load-bearing test of the whole plan.
+    """
+    from app import capability_claims as cc
+    from app.capabilities import CONTRACT_ENGINES
+    from app.change_types import CANONICAL_OPS, MECHANICAL
+    from app.routing import pr_level, Level
+    from app import languages
+
+    autos, counts = [], {"AUTO": 0, "REVIEW": 0, "BLOCKED": 0}
+    for lang in sorted(languages.languages()):
+        for contract in sorted(CONTRACT_ENGINES):
+            for op in sorted(CANONICAL_OPS):
+                d = pr_level(lang, contract, op, confidence=0.99, min_confidence=0.5)
+                counts[d.level.value] += 1
+                if d.level is Level.AUTO:
+                    autos.append((lang, contract, op))
+
+    # 1. exactly the golden cell, and nothing else
+    assert autos == [("typescript", "openapi", "remove_field")], autos
+    assert counts["AUTO"] == 1 and counts["REVIEW"] == 1799, counts
+
+    # 2. every AUTO must satisfy the registry AND be mechanical
+    for lang, contract, op in autos:
+        assert cc.production_ready(lang, contract, op), (lang, contract, op)
+        assert not cc.blocking_reasons(lang, contract, op)
+        assert CANONICAL_OPS[op][0] == MECHANICAL, \
+            f"{op} is not mechanical -- a judgment operation must never be AUTO"
+
+    # 3. NO judgment / wire_only / non_breaking operation is AUTO, in any language
+    for lang, contract, op in [(l, c, o) for l in languages.languages()
+                               for c in CONTRACT_ENGINES for o in CANONICAL_OPS
+                               if CANONICAL_OPS[o][0] != MECHANICAL]:
+        assert pr_level(lang, contract, op, 0.99, 0.5).level is not Level.AUTO, \
+            f"{op} ({CANONICAL_OPS[op][0]}) reached AUTO"
+
+    # 4. Removing the e2e evidence must take AUTO away. If it does not, the level is
+    #    decoration rather than a computation over facts.
+    saved = dict(cc.E2E_FIXTURES)
+    cc.E2E_FIXTURES.clear()
+    try:
+        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5)
+        assert d.level is Level.REVIEW, d
+        assert any("end-to-end" in r for r in d.reasons), d.reasons
+    finally:
+        cc.E2E_FIXTURES.update(saved)
+    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5).level is Level.AUTO
+
+    # 5. Same for validation.
+    ts = cc.VALIDATORS["typescript"]
+    cc.VALIDATORS["typescript"] = cc.ValidatorSpec("typescript", ts.toolchain,
+                                                   implemented_by="", note=ts.note)
+    try:
+        d = pr_level("typescript", "openapi", "remove_field", 0.99, 0.5)
+        assert d.level is Level.REVIEW, d
+        assert any("UNABLE_TO_VALIDATE" in r for r in d.reasons), d.reasons
+    finally:
+        cc.VALIDATORS["typescript"] = ts
+    assert pr_level("typescript", "openapi", "remove_field", 0.99, 0.5).level is Level.AUTO
+
+    # 6. Confidence still gates independently -- AUTO is not a bypass.
+    low = pr_level("typescript", "openapi", "remove_field", 0.10, 0.5)
+    assert low.level is Level.BLOCKED and not low.opens_pr
+
+    # 7. The PR body for AUTO must SHOW the evidence, not merely assert it.
+    from app.confidence import format_pr_body
+    body = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
+                          decision=pr_level("typescript", "openapi",
+                                            "remove_field", 0.95, 0.5))
+    first = body.split("\n")[0]
+    assert "Automated fix, validation passed" in first, first
+    assert "tsc --noEmit" in body and "byte-compared" in body
+    assert "audit_capabilities" in body, "the claim must point at what recomputes it"
+
+    # and a REVIEW body must never make that claim
+    review = format_pr_body("Field removed", "acme/api", 0.95, ["grep"], ["ref"],
+                            decision=pr_level("swift", "proto", "removed_field",
+                                              0.95, 0.5))
+    assert "validation passed" not in review
+    assert "human review required" in review.split("\n")[0]
 
 
 if __name__ == "__main__":

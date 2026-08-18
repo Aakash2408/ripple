@@ -61,25 +61,29 @@
     ]
   },
   "measured": {
-    "note": "What Ripple ACTUALLY does today, measured before any claim is made. Stage 4 asserts nothing in the capability registry; E2E_FIXTURES stays empty until a run genuinely satisfies `expect`.",
+    "note": "Re-measured in Stage 6 after app/ts_codemod.py replaced the regex. The Stage 4 record is preserved below as `stage_4_baseline` -- it is why the codemod exists.",
     "as_of": "2026-08-18",
     "fixture_fails_without_a_fix": true,
-    "fixture_fails_with": "2 x TS2339 Property 'phoneNumber' does not exist on type 'User'",
     "fixture_is_satisfiable": true,
-    "satisfiable_with": "2 edits: drop the template placeholder, drop the object-literal entry -> tsc exit 0",
     "ripple_changed_the_file": true,
-    "ripple_output_parses": false,
-    "ripple_typecheck_after": "FAIL",
-    "ripple_typecheck_error": "src/checkout.ts(19,17): error TS1003: Identifier expected",
-    "ripple_explanation": "Removed all references to field 'phoneNumber' (1 lines affected).",
-    "ripple_diff": "-    phone: user.phoneNumber,\n-  };\n+    phone: user.};",
-    "verdict": "BROKEN FIX, not an incomplete one",
-    "gap": [
-      "TEMPLATE LITERAL, not handled: the access pattern is `^\\s*\\S*\\.field\\b.*$`, which only matches a line whose FIRST token is the access. `return `...${user.phoneNumber}`` never matches, so that reference survives.",
-      "OBJECT LITERAL, handled INCORRECTLY: the destructuring cleanup `\\b{field}\\s*,\\s*` strips `phoneNumber,` wherever it appears, including as the tail of the member expression `user.phoneNumber,`. It leaves `phone: user.};` -- unparseable.",
-      "Both paths report success. The explanation says 'Removed all references' in both the no-op and the corrupting case, so the log cannot distinguish them."
+    "ripple_output_parses": true,
+    "ripple_typecheck_after": "VALID",
+    "ripple_edits": [
+      "template interpolation: ${user.phoneNumber}",
+      "object-literal property: phone: user.phoneNumber,"
     ],
-    "why_this_has_not_burned_anyone": "AUTO is unreachable and every PR is labelled 'Proposed Fix (human review required)' with the registry's blockers listed, so a human reads the diff. The REVIEW trust boundary is doing exactly the job it was built for.",
-    "implication_for_stage_6": "The golden cell needs a real syntactic transformation, not a wider regex. Removing a member expression from an interpolation or an object literal requires knowing the surrounding syntax; a context-free substitution cannot do it safely. Validation (Stage 5) is necessary but NOT sufficient -- it would correctly reject this output, leaving the cell BLOCKED rather than AUTO."
+    "ripple_diff_minimal": true,
+    "untouched_verified_by": "byte comparison of src/orders.ts, src/types.ts, tsconfig.json, package.json",
+    "validation_backend": "docker, node:16-alpine, --network none for typecheck",
+    "evidence_test": "test_e2e_typescript_openapi_remove_field",
+    "production_ready": true,
+    "stage_4_baseline": {
+      "ripple_changed_the_file": true,
+      "ripple_output_parses": false,
+      "ripple_diff": "-    phone: user.phoneNumber,\n-  };\n+    phone: user.};",
+      "ripple_typecheck_error": "src/checkout.ts(19,17): error TS1003: Identifier expected",
+      "ripple_explanation": "Removed all references to field 'phoneNumber' (1 lines affected).",
+      "verdict": "BROKEN FIX -- the reason Stage 6 wrote a syntax-aware codemod"
+    }
   }
 }
