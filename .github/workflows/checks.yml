@@ -93,6 +93,19 @@ jobs:
         # corrected to a number, because there is no single right one.
         run: python tools/audit_public_claims.py
 
+      - name: Frozen surface (blocking)
+        # The 30-day push has one objective: ONE real breaking change becoming one
+        # validated, mergeable PR. Ripple already detects across 10 contract types
+        # and 15 languages and has PROVEN zero fix-generating cells -- breadth is
+        # not the gap. So 7 unreachable modules (2,293 lines, 861 statements) are
+        # frozen: they may shrink, be documented, or be deleted; they may not grow
+        # and may not be wired up.
+        #
+        # Measured by AST statement count, not lines, so documenting the freeze
+        # does not fail the build while adding behaviour does. A freeze nobody
+        # enforces lasts about four days.
+        run: python tools/audit_frozen_surface.py
+
       - name: Pipeline governance (blocking)
         # Stage 7 found that pr_level was reachable from ONE of five PR-creating
         # entry points. gitlab_webhook and bitbucket_webhook each inline ~154 lines

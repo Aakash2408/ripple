@@ -703,9 +703,10 @@ python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
 python tools/audit_fail_silent.py --check  # 42 sites, every one classified
 python tools/audit_pipeline_governance.py  # 1 of 5 entry points governed
+python tools/audit_frozen_surface.py       # 7 frozen modules, 861 statements
 ```
 
-All seven gate CI. The fail-silent gate does not demand zero silent paths — 25 are
+All eight gate CI. The fail-silent gate does not demand zero silent paths — 25 are
 correct-but-invisible and making them visible is P0.4/P0.5 work. It demands that
 none is *unexplained*: classified in `tools/fail_silent_triage.py`, no `REAL_BUG`
 left standing, and no function that was fixed allowed to go silent again.
