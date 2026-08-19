@@ -716,7 +716,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 132 tests
+python tests/test_regression.py            # 133 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
