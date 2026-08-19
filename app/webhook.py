@@ -713,43 +713,94 @@ async def bitbucket_webhook(request: FastAPIRequest):
         # Find consumers and create PRs
         prs_created = []
         for change in breaking_changes:
-            # Wire-only breaks (proto field number / thrift field id) have no
-            # source-level fix, so searching consumers is a guaranteed no-op.
-            # Report and skip -- same rule as the GitHub path.
-            if is_wire_only(change.change_type):
-                _log_activity("wire_only_change", {
-                    "platform": "bitbucket",
-                    "spec": spec_path,
-                    "field": change.field_name,
-                    "change_type": change.change_type,
-                    "action": "no source fix exists -- consumers not searched",
-                })
-                continue
-
-            consumers = client.search_code(event["workspace"], event["repo_slug"], change.path)
-            for consumer in consumers[:5]:
-                consumer_path = consumer.get("path", "")
-                if consumer_path == spec_path or not consumer_path:
+            # EVERY change gets a ChangeRun, exactly as GitHub and GitLab do. Before
+            # this, a Bitbucket breaking change could pass through the whole loop and
+            # emit nothing: no consumers, no refusal, no outcome. A change that
+            # terminates in silence is indistinguishable from one that never arrived.
+            with ChangeRun(change_type=_map_change_type(change),
+                           spec=spec_path,
+                           repo=f"{event['workspace']}/{event['repo_slug']}") as run:
+                # Wire-only breaks (proto field number / thrift field id) have no
+                # source-level fix, so searching consumers is a guaranteed no-op.
+                # Report and skip -- same rule as the GitHub path.
+                if is_wire_only(change.change_type):
+                    run.requires_no_change()
+                    _log_activity("wire_only_change", {
+                        "platform": "bitbucket",
+                        "spec": spec_path,
+                        "field": change.field_name,
+                        "change_type": change.change_type,
+                        "action": "no source fix exists -- consumers not searched",
+                    })
                     continue
-                consumer_content = client.get_file(event["workspace"], event["repo_slug"], consumer_path)
-                if consumer_content:
+
+                consumers = client.search_code(event["workspace"], event["repo_slug"], change.path)
+                for consumer in consumers[:5]:
+                    consumer_path = consumer.get("path", "")
+                    if consumer_path == spec_path or not consumer_path:
+                        continue
+                    consumer_content = client.get_file(event["workspace"], event["repo_slug"], consumer_path)
+                    if not consumer_content:
+                        continue
+                    run.consumer_found(consumer_path)
                     from .consumer_finder import ConsumerMatch
-                    from .fix_generator import _generate_with_template
                     consumer_match = ConsumerMatch(
                         file_path=consumer_path, line_number=0, code_snippet="",
                         confidence="high", match_reason="Code search match",
                         language=_detect_lang(consumer_path),
                     )
-                    fixed_code, explanation = _generate_fix_with_rag_fallback(consumer_content, consumer_match, change, org)
-                    if fixed_code != consumer_content:
+                    fixed_code, explanation = _generate_fix_with_rag_fallback(
+                        consumer_content, consumer_match, change, org)
+                    if fixed_code == consumer_content:
+                        run.refused(consumer_path,
+                                    "no fix was generated for this consumer")
+                        continue
+
+                    # THE OUTCOME FUNNEL -- see the GitLab path for why this is
+                    # required for the entry point to count as governed.
+                    _log_fix_generated(
+                        f"{event['workspace']}/{event['repo_slug']}", consumer_path,
+                        True,
+                        explanation[:60] if explanation else "",
+                        change_type=change.change_type,
+                        original_code=consumer_content,
+                        fixed_code=fixed_code,
+                        explanation=explanation or "",
+                    )
+
+                    # THE SAME DECISION GITHUB GETS. tree=None because
+                    # app/repo_workspace.py fetches GITHUB tarballs, so a Bitbucket
+                    # tree cannot be fetched yet -- validated is None and pr_level()
+                    # yields REVIEW, never AUTO, at any confidence. Governing it now
+                    # closes the silent-termination hole; claiming it was validated
+                    # would open a worse one.
+                    decision, _validated = _govern_consumer_fix(
+                        platform="bitbucket",
+                        repo=f"{event['workspace']}/{event['repo_slug']}",
+                        consumer_file=consumer_path,
+                        fixed_code=fixed_code,
+                        tree=None,
+                        language=_detect_lang(consumer_path),
+                        contract=contract_type,
+                        change_type=change.change_type,
+                        confidence=_CODE_SEARCH_CONFIDENCE,
+                        min_confidence=0.5,
+                        run=run,
+                    )
+                    if decision.opens_pr:
                         pr_url = bb_create_fix_pr(
                             client, event["workspace"], event["repo_slug"],
                             consumer_path, fixed_code,
-                            f"Add required field '{change.field_name}' to {change.method} {change.path}",
+                            _fix_title(change),
                         )
                         if pr_url:
                             prs_created.append(pr_url)
+                            run.pr_created(pr_url, consumer_path,
+                                           validated=bool(_validated))
                             limiter.record_pr_opened(org)
+                        else:
+                            run.refused(consumer_path,
+                                        "the pull request could not be created")
         
         results.append({
             "spec": spec_path,
@@ -876,42 +927,98 @@ async def gitlab_webhook(request: FastAPIRequest):
         # Find consumers and create MRs
         mrs_created = []
         for change in breaking_changes:
-            # Wire-only breaks have no source-level fix -- see the GitHub path.
-            if is_wire_only(change.change_type):
-                _log_activity("wire_only_change", {
-                    "platform": "gitlab",
-                    "spec": spec_path,
-                    "field": change.field_name,
-                    "change_type": change.change_type,
-                    "action": "no source fix exists -- consumers not searched",
-                })
-                continue
-
-            # Search for consumers in the same project
-            consumers = client.search_code(event["project_id"], change.path)
-            for consumer in consumers[:5]:
-                consumer_path = consumer.get("path", "")
-                if consumer_path == spec_path:
+            # EVERY change gets a ChangeRun, exactly as the GitHub path does. Before
+            # this, a GitLab breaking change could pass through the whole loop and
+            # emit nothing at all: no consumers found, no refusal, no outcome. A
+            # change that terminates in silence is indistinguishable from one that
+            # never arrived, which is the defect class this repo keeps rediscovering.
+            with ChangeRun(change_type=_map_change_type(change),
+                           spec=spec_path, repo=event["project_name"]) as run:
+                # Wire-only breaks have no source-level fix -- see the GitHub path.
+                if is_wire_only(change.change_type):
+                    run.requires_no_change()
+                    _log_activity("wire_only_change", {
+                        "platform": "gitlab",
+                        "spec": spec_path,
+                        "field": change.field_name,
+                        "change_type": change.change_type,
+                        "action": "no source fix exists -- consumers not searched",
+                    })
                     continue
-                # Fetch consumer content
-                consumer_content = client.get_file(event["project_id"], consumer_path)
-                if consumer_content:
-                    # Generate fix (reuse existing fix generator)
+
+                # Search for consumers in the same project
+                consumers = client.search_code(event["project_id"], change.path)
+                for consumer in consumers[:5]:
+                    consumer_path = consumer.get("path", "")
+                    if consumer_path == spec_path:
+                        continue
+                    # Fetch consumer content
+                    consumer_content = client.get_file(event["project_id"], consumer_path)
+                    if not consumer_content:
+                        continue
+                    run.consumer_found(consumer_path)
                     consumer_match = ConsumerMatch(
                         file_path=consumer_path, line_number=0, code_snippet="",
                         confidence="high", match_reason="Code search match",
                         language=_detect_lang(consumer_path),
                     )
-                    fixed_code, explanation = _generate_fix_with_rag_fallback(consumer_content, consumer_match, change, org)
-                    if fixed_code != consumer_content:
+                    fixed_code, explanation = _generate_fix_with_rag_fallback(
+                        consumer_content, consumer_match, change, org)
+                    if fixed_code == consumer_content:
+                        run.refused(consumer_path,
+                                    "no fix was generated for this consumer")
+                        continue
+
+                    # THE OUTCOME FUNNEL. Required for this entry point to count as
+                    # governed: every attempt ends in a stated outcome. Emitted
+                    # AFTER the no-fix refusal above so the two cannot double-count
+                    # the same consumer -- _log_fix_generated is the only place
+                    # fix_generated is logged, pinned by
+                    # test_fix_generated_is_logged_exactly_once.
+                    _log_fix_generated(
+                        event["project_name"], consumer_path, True,
+                        explanation[:60] if explanation else "",
+                        change_type=change.change_type,
+                        original_code=consumer_content,
+                        fixed_code=fixed_code,
+                        explanation=explanation or "",
+                    )
+
+                    # THE SAME DECISION GITHUB GETS. tree=None because
+                    # app/repo_workspace.py fetches GITHUB tarballs, so a GitLab
+                    # tree cannot be fetched yet -- which means validated is None
+                    # and pr_level() yields REVIEW, never AUTO, at any confidence.
+                    # That is the honest ceiling until a GitLab archive fetcher
+                    # exists; governing it now closes the silent-termination hole,
+                    # and claiming it was validated would open a worse one.
+                    decision, _validated = _govern_consumer_fix(
+                        platform="gitlab",
+                        repo=event["project_name"],
+                        consumer_file=consumer_path,
+                        fixed_code=fixed_code,
+                        tree=None,
+                        language=_detect_lang(consumer_path),
+                        contract=contract_type,
+                        change_type=change.change_type,
+                        confidence=_CODE_SEARCH_CONFIDENCE,
+                        min_confidence=0.5,
+                        run=run,
+                    )
+                    if decision.opens_pr:
                         mr_url = create_fix_mr(
                             client, event["project_id"], consumer_path,
-                            fixed_code, f"Add required field '{change.field_name}' to {change.method} {change.path}",
+                            fixed_code,
+                            _fix_title(change),
                             event["project_name"],
                         )
                         if mr_url:
                             mrs_created.append(mr_url)
+                            run.pr_created(mr_url, consumer_path,
+                                           validated=bool(_validated))
                             limiter.record_pr_opened(org)
+                        else:
+                            run.refused(consumer_path,
+                                        "the merge request could not be created")
         
         results.append({
             "spec": spec_path,
@@ -1577,45 +1684,24 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                                 file_reasons = pred.get("reasons", file_reasons)
                                 break
                     
-                        # VALIDATE THIS FIX, not the fixture for this cell. The
-                        # registry proves typescript x openapi x remove_field has an
-                        # end-to-end fixture that compiles; it says nothing about
-                        # whether THIS patch on THIS repository compiles. Those were
-                        # conflated while the request path could not validate.
-                        _validated, _vdetail = _validate_fix_against_tree(
-                            _tree, consumer_file, fixed_code)
-                        _log_activity("fix_validated", {
-                            "repo": consumer_repo, "file": consumer_file,
-                            "validated": _validated, **_vdetail})
-
-                        # THE ROUTING DECISION. Previously this consulted confidence
-                        # and nothing else, so a cell the registry knew had four
-                        # blockers opened a PR titled "Automated Fix" exactly like a
-                        # validated one. The registry could answer that question the
-                        # whole time and nothing asked it.
-                        decision = pr_level(
+                        # THE DECISION, for every platform, in one place. This used
+                        # to be inline here -- which is precisely why GitLab and
+                        # Bitbucket had none of it. See _govern_consumer_fix.
+                        decision, _validated = _govern_consumer_fix(
+                            platform="github",
+                            repo=consumer_repo,
+                            consumer_file=consumer_file,
+                            fixed_code=fixed_code,
+                            tree=_tree,
                             language=_detect_lang(consumer_file),
                             contract=contract_type,
                             change_type=change.change_type,
                             confidence=file_confidence,
                             min_confidence=min_confidence,
-                            validated=_validated,
+                            run=run,
                         )
                         if not decision.opens_pr:
-                            run.refused(consumer_file, "; ".join(decision.reasons) or "below confidence threshold")
-                            _log_activity("pr_skipped", {
-                                "file": consumer_file,
-                                "confidence": file_confidence,
-                                "min_required": min_confidence,
-                                **decision.as_detail(),
-                            })
                             continue
-                        _log_activity("pr_routing", {
-                            "file": consumer_file,
-                            "contract": contract_type,
-                            "change_type": change.change_type,
-                            **decision.as_detail(),
-                        })
 
                         pr_url = _create_fix_pr(
                             consumer_repo, consumer_file,
@@ -1955,6 +2041,113 @@ def _fetch_consumer_tree(consumer_repo: str, ref: str, token: str) -> tuple:
     except Exception as exc:                        # noqa: BLE001
         # Any other failure is still "we could not check", never "it is fine".
         return None, f"not validated: {type(exc).__name__}: {exc}"
+
+
+#: What a bare code-search hit is worth on a platform with no ensemble.
+#:
+#: The GitHub path carries a real per-file score: detector confidence, raised by
+#: co-change history when the ensemble agrees. GitLab's search_code returns a path
+#: and nothing else -- no score to inherit and no history to consult. Inventing a
+#: high number here would be asserting a confidence nobody measured, which is the
+#: shape that let a four-blocker cell open a PR titled "Automated Fix".
+#:
+#: 0.50 is the MEDIUM tier boundary in app/confidence.py ("PR with review note"),
+#: chosen because it is exactly the weakest score that still clears the default
+#: threshold. Combined with validated=None it can only ever produce REVIEW, so the
+#: value cannot buy AUTO -- it decides whether a human is asked, not whether a
+#: machine is trusted. Raise it only when GitLab gains a real per-file signal.
+_CODE_SEARCH_CONFIDENCE = 0.50
+
+
+def _fix_title(change) -> str:
+    """Delegates to change_types.fix_title -- see the table there.
+
+    Kept as a name in this module because both platform pipelines call it, but the
+    mapping lives beside canonical_op() so app/pr_engine.py can share it without
+    importing the webhook. That mattered: pr_engine was the FOURTH place the phrase
+    "Add required field" was hardcoded for every operation, and it survived longest
+    because the governance audit lists the CLI entry point as exempt.
+    """
+    from .change_types import fix_title
+    return fix_title(change)
+
+
+def _govern_consumer_fix(*, platform: str, repo: str, consumer_file: str,
+                         fixed_code: str, tree, language: str, contract: str,
+                         change_type: str, confidence: float,
+                         min_confidence: float, run) -> tuple:
+    """(decision, validated). THE decision, for every platform.
+
+    WHY THIS IS ONE FUNCTION AND NOT THREE
+    --------------------------------------
+    The governance audit measured the gap plainly: in the GitLab/Bitbucket region
+    of this file, `pr_level`, `_fetch_consumer_tree`, `_validate_fix_against_tree`
+    and `ChangeRun` each appeared ZERO times. Those pipelines fetched a consumer,
+    generated a fix and opened a merge request -- no routing decision, no
+    validation, no recorded terminal state. A breaking change could terminate in
+    SILENCE on a customer's repository.
+
+    That is the same shape as the eight disagreeing language maps and the two
+    154-line inline pipelines: a rule copied per caller drifts, and the copy that
+    drifts is the one nobody is testing. So the decision lives here and platforms
+    pass FACTS -- never a level, and never a pre-formed verdict.
+
+    `tree` IS ALLOWED TO BE None, AND THAT IS THE POINT
+    ---------------------------------------------------
+    app/repo_workspace.py fetches GITHUB tarballs, so a GitLab or Bitbucket tree
+    cannot be fetched at all today. Those platforms therefore arrive with
+    tree=None, `_validate_fix_against_tree` returns None, and pr_level() yields
+    REVIEW -- permanently, by construction, at any confidence.
+
+    That ordering is deliberate: a platform can be GOVERNED and CONTRACT-CHECKED
+    before it can be COMPILED. Governing it now closes the silent-termination hole;
+    pretending it was validated would open a worse one. AUTO on GitLab requires a
+    GitLab archive fetcher, which is separate work.
+
+    Confidence cannot buy AUTO. pr_level() derives the level from validation and
+    registry evidence; a 0.99 detector score with nothing compiled is still REVIEW.
+    """
+    # VALIDATE THIS FIX, not the fixture for this cell. The registry proves the
+    # CELL has an end-to-end fixture that compiles; it says nothing about whether
+    # THIS patch on THIS repository compiles. Those were conflated while the
+    # request path could not validate, and AUTO rested on the weaker claim.
+    validated, vdetail = _validate_fix_against_tree(tree, consumer_file, fixed_code)
+    _log_activity("fix_validated", {
+        "platform": platform, "repo": repo, "file": consumer_file,
+        "validated": validated, **vdetail})
+
+    decision = pr_level(
+        language=language,
+        contract=contract,
+        change_type=change_type,
+        confidence=confidence,
+        min_confidence=min_confidence,
+        validated=validated,
+    )
+
+    if not decision.opens_pr:
+        # RECORD THE REFUSAL. A refusal that emits nothing is indistinguishable
+        # from work that never happened -- the fail-silent shape this repo has
+        # rediscovered at every layer.
+        run.refused(consumer_file,
+                    "; ".join(decision.reasons) or "below confidence threshold")
+        _log_activity("pr_skipped", {
+            "platform": platform,
+            "file": consumer_file,
+            "confidence": confidence,
+            "min_required": min_confidence,
+            **decision.as_detail(),
+        })
+        return decision, validated
+
+    _log_activity("pr_routing", {
+        "platform": platform,
+        "file": consumer_file,
+        "contract": contract,
+        "change_type": change_type,
+        **decision.as_detail(),
+    })
+    return decision, validated
 
 
 def _validate_fix_against_tree(tree: str, consumer_file: str,

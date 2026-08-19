@@ -716,12 +716,12 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 136 tests
+python tests/test_regression.py            # 142 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
 python tools/audit_fail_silent.py --check  # 42 sites, every one classified
-python tools/audit_pipeline_governance.py  # 1 of 5 entry points governed
+python tools/audit_pipeline_governance.py  # 3 of 5 entry points governed
 python tools/audit_frozen_surface.py       # 6 frozen modules, 747 statements
 python tools/audit_codemod_coverage.py     # automation 68.0%, implementation 94.4%
 python tools/audit_negative_corpus.py      # 7 bad fixes (6 historical + 1 observed)

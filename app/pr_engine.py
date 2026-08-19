@@ -23,6 +23,7 @@ import json
 
 from .diff_engine import BreakingChange
 from .fix_generator import GeneratedFix
+from .change_types import fix_title
 
 
 GITHUB_API = "https://api.github.com"
@@ -78,7 +79,14 @@ def create_pr(
     repo = _infer_repo(fix.consumer.file_path)
     
     branch_name = f"ripple/fix-{breaking_change.field_name}-{breaking_change.path.replace('/', '-').strip('-')}"
-    title = f"fix: Add required field '{breaking_change.field_name}' to {breaking_change.method.upper()} {breaking_change.path}"
+    # DERIVED, not hardcoded. This line read
+    #     f"fix: Add required field '{field}' to {method} {path}"
+    # for EVERY operation, so a CLI-driven removal opened a PR announcing an
+    # addition. Fourth occurrence of that shape, and the longest-lived one --
+    # tools/audit_pipeline_governance.py lists this entry point as EXEMPT, so no
+    # gate was watching it. change_types.fix_title is exhaustive over
+    # CANONICAL_OPS and CI-gated.
+    title = f"fix: {fix_title(breaking_change)}"
     
     body = _format_pr_body(fix, breaking_change, source_repo)
     

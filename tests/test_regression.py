@@ -2976,26 +2976,33 @@ def test_registry_governs_routing_and_auto_is_never_unearned():
 
 
 def test_governance_scope_is_exactly_what_was_verified():
-    """The registry governs ONE of five PR-creating entry points.
+    """The registry now governs THREE of five PR-creating entry points.
 
     Stages 3 and 6 were both verified by importing the new module and by tests, and
     neither check asked the question that mattered: how many ways are there into a
-    PR? Five. `pr_level` is reachable from `github_webhook` and nothing else:
+    PR? Five. `pr_level` was reachable from `github_webhook` and nothing else:
 
       gitlab_webhook      154 lines of pipeline inlined in the route handler
       bitbucket_webhook   154 lines, same shape
       app/cli.py:main     pr_engine, with its OWN _format_pr_body
       agent/core.py:main  separate package, imports nothing from app.routing
 
-    So on GitLab and Bitbucket a breaking change CAN still produce silence, because
-    _log_fix_generated is never reached. This test exists so that sentence cannot
-    quietly become false in either direction: a new ungoverned entry point fails,
-    and an exemption left behind after a fix fails too.
+    Both webhooks are now governed: the decision moved into
+    webhook._govern_consumer_fix (ONE pr_level call site in the file, shared by all
+    three platforms) and each opens a ChangeRun and emits the outcome funnel. They
+    remain OFF by default behind RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS -- governed is
+    not enabled -- but being off is now a scope decision rather than a safety one.
 
-    It also records why three earlier audits missed this. The duplication is INLINE
-    IN ROUTE HANDLERS and in a second package, so filename pairs and module-level
-    call graphs -- the two things used to size P0.1 as "~1 day" -- cannot see it.
-    That estimate was wrong in the unusual direction: under-scoped.
+    This test exists so the sentence cannot quietly become false in EITHER
+    direction: a new ungoverned entry point fails, and a platform that regresses out
+    of the governed set fails too. Two remain exempt, and shrinking that list is the
+    unit of progress.
+
+    It also records why three earlier audits missed the original gap. The
+    duplication was INLINE IN ROUTE HANDLERS and in a second package, so filename
+    pairs and module-level call graphs -- the two things used to size P0.1 as "~1
+    day" -- could not see it. That estimate was wrong in the unusual direction:
+    under-scoped.
     """
     sys.path.insert(0, os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
@@ -3004,14 +3011,18 @@ def test_governance_scope_is_exactly_what_was_verified():
     graph = G._call_graph()
     entries = G._entry_points(graph)
 
-    governed = [e for e in entries
-                if not [k for k in G.REQUIRED if k not in G._reachable(graph, e)]]
-    assert governed == ["app/webhook.py:github_webhook"], governed
+    governed = sorted(e for e in entries
+                      if not [k for k in G.REQUIRED
+                              if k not in G._reachable(graph, e)])
+    assert governed == [
+        "app/webhook.py:bitbucket_webhook",
+        "app/webhook.py:github_webhook",
+        "app/webhook.py:gitlab_webhook",
+    ], governed
 
     # Every ungoverned entry point is either SWITCHED OFF or a named exemption,
-    # and every named exemption is still real. The three-way split replaced a
-    # two-way one in Stage 2: gitlab/bitbucket moved from "tolerated gap" to
-    # "actively closed", which is a stronger claim and a different assertion.
+    # and every named exemption is still real. DISABLED is now empty, which is the
+    # progress: those two moved from "actively closed off" to "actually governed".
     ungoverned = sorted(set(entries) - set(governed))
     accounted = sorted(set(G.EXEMPT) | set(G.DISABLED))
     assert ungoverned == accounted, (ungoverned, accounted)
@@ -5229,6 +5240,379 @@ def test_the_line_based_fallback_cannot_bypass_the_diff_contract():
         "the diff contract now ACCEPTS the line-based patch. Either the contract "
         "weakened or the generator improved; find out which before relaxing this."
     )
+
+
+def test_the_governed_decision_is_platform_neutral_and_denies_auto_without_a_tree():
+    """Every platform must reach the SAME decision function, not a copy of it.
+
+    The governance audit measured the gap: in the GitLab/Bitbucket region of
+    webhook.py, `pr_level`, `_fetch_consumer_tree`, `_validate_fix_against_tree`
+    and `ChangeRun` each appeared ZERO times. Those pipelines fetched a consumer,
+    generated a fix and opened a merge request directly -- no routing decision, no
+    validation, and no recorded terminal state, so a breaking change could
+    terminate in silence on a customer's repository.
+
+    Duplicating the decision per platform is what produced that gap, and it is the
+    same shape as the eight disagreeing language maps and the 154-line inline
+    pipelines. So the decision moves into ONE helper that every platform calls.
+
+    THE SECOND ASSERTION IS THE LOAD-BEARING ONE. repo_workspace fetches GITHUB
+    tarballs, so a GitLab tree cannot be fetched at all today -- `tree` is None
+    there. That must yield REVIEW, permanently and by construction, never AUTO:
+    "we could not compile it" must not read as "it is fine". GitLab and Bitbucket
+    can be governed and contract-checked before they can be compiled, and claiming
+    otherwise would recreate the gap being closed here.
+    """
+    from app.webhook import _govern_consumer_fix
+    from app.run_outcome import ChangeRun
+    from app import activity as _activity
+
+    _acts = _activity.all_events()
+    _before = len(_acts)
+
+    # A GitLab-shaped call: a fix was generated, but no tree exists to compile it.
+    run = ChangeRun(change_type="removed_field", spec="user.proto",
+                    repo="acme/billing")
+    decision, validated = _govern_consumer_fix(
+        platform="gitlab",
+        repo="acme/billing",
+        consumer_file="src/client.ts",
+        fixed_code="const x = 1;\n",
+        tree=None,
+        language="typescript",
+        contract="proto",
+        change_type="removed_field",
+        confidence=0.99,          # deliberately maximal -- confidence must not buy AUTO
+        min_confidence=0.5,
+        run=run,
+    )
+
+    assert validated is None, (
+        f"validated={validated!r} with no tree. None is the only honest answer: "
+        f"nothing was compiled."
+    )
+    assert decision.level.value != "AUTO", (
+        f"a platform with no tree reached {decision.level.value} at confidence 0.99. "
+        f"Confidence is not verification -- this is exactly the conflation "
+        f"pr_level() was changed to prevent."
+    )
+    joined = " ".join(decision.reasons).lower()
+    assert "validat" in joined, (
+        f"the decision does not say it was unvalidated: {decision.reasons}. The "
+        f"reason is what a human reads in the PR body."
+    )
+
+    # And the refusal is RECORDED, so nothing terminates in silence.
+    # tools/audit_pipeline_governance.py declares the caller's bare `continue` as an
+    # allowed silent exit BECAUSE of this assertion. If the helper stops recording,
+    # this fails and that allowance stops being true -- which is the whole point of
+    # pinning it here rather than trusting a comment.
+    if not decision.opens_pr:
+        assert run.detail().get("refused"), (
+            "the decision refused to open a PR but the ChangeRun recorded nothing "
+            "-- a silent terminal state is the defect this closes"
+        )
+        assert any("pr_skipped" in str(e.get("action", ""))
+                   for e in _activity.all_events()[_before:]), (
+            f"no pr_skipped activity was logged for the refusal. The governance "
+            f"audit's SILENT_EXIT_OK entry depends on this signal existing; new "
+            f"actions were {[e.get('action') for e in _activity.all_events()[_before:]]}"
+        )
+
+
+def test_a_validated_fix_can_still_reach_auto_through_the_shared_helper():
+    """The helper must not become a blanket downgrade.
+
+    Routing everything through one function is only correct if the GitHub path
+    keeps its behaviour: a fix that really compiled must still earn AUTO. If this
+    ever fails, the shared helper has traded one bug (no governance off GitHub)
+    for a worse one (AUTO unreachable everywhere), and the live run this morning
+    already showed how easy it is to make AUTO unreachable by accident.
+
+    Validation is stubbed rather than run: this pins the DECISION, and a real
+    compile is covered by test_a_hoisted_workspace_validates_at_the_package_not_the_root.
+    """
+    import app.webhook as w
+    from app.run_outcome import ChangeRun
+
+    original = w._validate_fix_against_tree
+    w._validate_fix_against_tree = lambda tree, f, code: (True, {"validation": "VALID"})
+    try:
+        run = ChangeRun(change_type="removed_field", spec="api.yaml",
+                        repo="acme/api")
+        decision, validated = w._govern_consumer_fix(
+            platform="github",
+            repo="acme/billing",
+            consumer_file="src/user.ts",
+            fixed_code="const x = 1;\n",
+            tree="/tmp/does-not-matter",
+            language="typescript",
+            contract="openapi",
+            change_type="removed_field",
+            confidence=0.95,
+            min_confidence=0.5,
+            run=run,
+        )
+    finally:
+        w._validate_fix_against_tree = original
+
+    assert validated is True, f"validated={validated!r} -- the stub returned True"
+    assert decision.level.value == "AUTO", (
+        f"a compiled fix in a proven cell reached {decision.level.value}, not AUTO: "
+        f"{decision.reasons}. The shared helper must not downgrade GitHub."
+    )
+
+
+def test_no_platform_can_open_a_pr_outside_the_governed_path():
+    """GitLab and Bitbucket used to fetch, fix and open a PR with nothing between.
+
+    Measured before this change, in both regions of webhook.py:
+
+        pr_level                       0 occurrences
+        _fetch_consumer_tree           0
+        _validate_fix_against_tree     0
+        ChangeRun                      0
+
+    So a breaking change on either platform could terminate in SILENCE on a
+    customer's repository -- no routing decision, no validation, no recorded
+    outcome -- and the PR was opened the moment the generator returned anything
+    different from the input.
+
+    ONE TABLE, NOT ONE TEST PER PLATFORM. A copied assertion drifts exactly the way
+    the copied pipelines did: whichever copy nobody updates is the one that rots.
+    Adding a platform means adding a row here, and the row fails until that
+    platform is governed.
+
+    THE DOMINANCE CHECK IS THE LOAD-BEARING ONE. `create_fix_mr` appearing in the
+    same function as `_govern_consumer_fix` proves nothing if the PR call can still
+    run when the decision refused -- that would be the original defect wearing a
+    helper call. So every PR-creating call must sit INSIDE a branch testing the
+    decision.
+    """
+    import ast as _ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "app", "webhook.py")) as fh:
+        tree = _ast.parse(fh.read())
+
+    def _name(call):
+        f = call.func
+        return f.id if isinstance(f, _ast.Name) else getattr(f, "attr", "")
+
+    platforms = (
+        ("gitlab_webhook", "create_fix_mr"),
+        ("bitbucket_webhook", "bb_create_fix_pr"),
+    )
+
+    for fn_name, pr_fn in platforms:
+        fn = next((n for n in _ast.walk(tree)
+                   if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                   and n.name == fn_name), None)
+        assert fn is not None, f"{fn_name} is gone -- re-derive this test"
+
+        called = {_name(c) for c in _ast.walk(fn) if isinstance(c, _ast.Call)}
+        assert "_govern_consumer_fix" in called, (
+            f"{fn_name} does not call _govern_consumer_fix, so it still decides "
+            f"for itself whether to open a PR -- the gap this closes."
+        )
+        assert "ChangeRun" in called, (
+            f"{fn_name} does not open a ChangeRun, so a breaking change on that "
+            f"platform can still terminate with no stated outcome."
+        )
+
+        pr_calls = [c for c in _ast.walk(fn)
+                    if isinstance(c, _ast.Call) and _name(c) == pr_fn]
+        assert pr_calls, f"{pr_fn} is gone from {fn_name} -- re-derive this test"
+
+        guarded = []
+        for node in _ast.walk(fn):
+            if not isinstance(node, _ast.If):
+                continue
+            test_src = " ".join(
+                getattr(n, "attr", "") or getattr(n, "id", "")
+                for n in _ast.walk(node.test)
+            )
+            if "opens_pr" not in test_src:
+                continue
+            guarded += [c for c in _ast.walk(node)
+                        if isinstance(c, _ast.Call) and _name(c) == pr_fn]
+
+        assert len(guarded) == len(pr_calls), (
+            f"{fn_name}: {len(pr_calls) - len(guarded)} {pr_fn} call(s) are NOT "
+            f"inside a branch testing the decision. A PR that can be opened when "
+            f"the decision refused is the original defect wearing a helper call."
+        )
+
+        # And no platform may hardcode a change-type verb into its title. Third
+        # occurrence of that shape: the LLM prompt, the PR explanation, the MR title.
+        src_seg = _ast.unparse(fn)
+        assert "Add required field '" not in src_seg, (
+            f"{fn_name} still hardcodes \"Add required field\" as a title, so a "
+            f"REMOVAL opens a PR announcing an addition. Use _fix_title()."
+        )
+
+
+def test_no_title_ever_announces_the_wrong_operation():
+    """A title that names the wrong operation is worse than a vague one.
+
+    FOURTH occurrence of one shape. Each time, something was hardcoded for
+    `add_required_field` and then applied to all twelve operations:
+
+        app/fix_generator.py   the LLM PROMPT said "add the new required field",
+                               so Gemini dutifully ADDED a parameter when asked to
+                               remove one -- the diff contract was the only save
+        app/fix_generator.py   the EXPLANATION said "Added required field", which
+                               would have appeared in a removal PR in a stranger's
+                               repository
+        app/webhook.py         the GitLab/Bitbucket MR TITLE, fixed in this plan
+        app/pr_engine.py       still live at line 81 when this test was written
+
+    So the mapping is exhaustive and CI-gated rather than best-effort. EVERY
+    canonical op must be named explicitly: a thirteenth op added to
+    change_types.CANONICAL_OPS fails here instead of silently inheriting a neutral
+    phrase, which is the mechanism that let "add required field" spread four times.
+
+    The verb assertions are the point. "Remove references to deleted field 'x'"
+    and "Add required field 'x'" are opposite instructions to a human reader, and
+    the diff sits right below the title -- a reader who trusts the title misreads
+    the change.
+    """
+    from app.change_types import fix_title, CANONICAL_OPS, canonical_op
+    from app.diff_engine import BreakingChange
+
+    def mk(change_type):
+        return BreakingChange(
+            change_type=change_type, path="/users", method="GET",
+            field_name="phoneNumber", field_type="string", location="body",
+            severity="breaking", description="x")
+
+    # 1. every canonical op is named EXPLICITLY -- none falls through
+    for op in CANONICAL_OPS:
+        assert canonical_op(op) == op, (
+            f"canonical_op({op!r}) is not idempotent, so this test cannot address "
+            f"ops by name -- re-derive it")
+        title = fix_title(mk(op))
+        assert title, f"{op}: empty title"
+        assert "references to '" not in title, (
+            f"{op} fell through to the NEUTRAL fallback: {title!r}. Every op in "
+            f"CANONICAL_OPS must be named explicitly -- inheriting a default is "
+            f"exactly how 'add required field' spread to four call sites."
+        )
+
+    # 2. a removal must never say "add", and vice versa
+    removals = [op for op in CANONICAL_OPS if op.startswith("remove")]
+    assert removals, "no removal ops found -- re-derive this test"
+    for op in removals:
+        title = fix_title(mk(op)).lower()
+        assert "add" not in title, (
+            f"{op} produced a title containing 'add': {title!r}. This is the exact "
+            f"defect: a removal announcing an addition."
+        )
+    for op in ("add_required", "add_optional"):
+        assert "add" in fix_title(mk(op)).lower(), (
+            f"{op} does not say 'add': {fix_title(mk(op))!r}")
+    for op in ("rename_field", "rename_type"):
+        assert "renam" in fix_title(mk(op)).lower(), (
+            f"{op} does not say 'rename': {fix_title(mk(op))!r}")
+
+    # 3. an UNKNOWN string still gets something neutral rather than raising --
+    #    a webhook must not 500 because a diff engine emitted a new dialect
+    assert fix_title(mk("some_dialect_nobody_mapped")), "unknown op produced nothing"
+
+    # 4. and no module builds a title by hardcoding the operation. pr_engine.py:81
+    #    was the survivor: the CLI path the governance audit lists as EXEMPT, so
+    #    nothing else was watching it.
+    import ast as _ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for module in ("pr_engine.py", "webhook.py"):
+        with open(os.path.join(root, "app", module)) as fh:
+            mod = _ast.parse(fh.read())
+        for node in _ast.walk(mod):
+            if not isinstance(node, _ast.Assign):
+                continue
+            targets = [t.id for t in node.targets if isinstance(t, _ast.Name)]
+            if not any(t in ("title", "commit_msg", "mr_title") for t in targets):
+                continue
+            rendered = _ast.unparse(node.value)
+            assert "Add required field" not in rendered, (
+                f"app/{module} assigns {targets} a hardcoded "
+                f"\"Add required field\" title: {rendered[:110]} -- use fix_title()."
+            )
+
+
+def test_all_three_platforms_are_governed_and_none_is_merely_disabled():
+    """The audit's expectations are the invariant; this pins the new one.
+
+    Before this plan the audit read:
+
+        1 governed, 2 disabled, 2 exempt, 5 total
+
+    and its DISABLED table asserted that gitlab_webhook and bitbucket_webhook
+    "must stay off" -- because each inlined ~154 lines of pipeline that bypassed
+    both the routing decision and the outcome funnel. Switching them off was the
+    right call at the time: an exemption tolerates an ungoverned path, and a
+    breaking change on those paths could terminate in silence.
+
+    They are now governed instead, which is a strictly stronger position than
+    disabled. GOVERNED IS NOT THE SAME AS ENABLED: the experimental_enabled()
+    guard stays, so both remain off by default. What changed is that turning them
+    on is now a deployment decision rather than a safety risk.
+
+    THE POINT OF ASSERTING THIS IN A TEST is that "disabled" was load-bearing. If
+    someone re-inlines a pipeline or drops the pr_level call, the audit must fail
+    rather than quietly returning to two ungoverned platforms with the env var
+    already set in production.
+    """
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run(
+        [sys.executable, os.path.join(root, "tools", "audit_pipeline_governance.py")],
+        capture_output=True, text=True, cwd=root)
+
+    assert out.returncode == 0, (
+        f"the governance audit FAILS:\n{out.stdout[-1500:]}\n{out.stderr[-500:]}")
+
+    text = out.stdout
+    assert "3 governed" in text, (
+        f"the audit does not report 3 governed entry points. It said:\n"
+        f"{[l for l in text.splitlines() if 'governed' in l]}\n"
+        f"All three platforms must reach pr_level and the outcome funnel."
+    )
+    assert "0 disabled" in text, (
+        f"the audit still reports disabled entry points:\n"
+        f"{[l for l in text.splitlines() if 'disabled' in l]}\n"
+        f"A governed platform does not need to be switched off to be safe."
+    )
+    for platform in ("gitlab_webhook", "bitbucket_webhook"):
+        assert platform in text, f"{platform} vanished from the audit entirely"
+
+
+def test_the_disabled_notice_does_not_claim_something_untrue():
+    """The 501 body is customer-facing, and it made a claim about the code.
+
+    app/experimental.py returned, in the response body:
+
+        "the {platform} path additionally bypasses the routing decision and the
+         outcome funnel -- so a breaking change there could terminate in silence"
+
+    That was accurate when written and is now false: both paths call
+    _govern_consumer_fix and open a ChangeRun. A stale reason string is worse than
+    a vague one here, because it is served to whoever tried to connect and it tells
+    them the integration is unsafe rather than merely switched off.
+
+    Same class as the docstring that promised tokens.json survived redeploys while
+    nothing wrote to it: a comment describing an intention rather than the code.
+    """
+    from app.experimental import experimental_disabled
+
+    body = experimental_disabled("gitlab", "webhook").body.decode()
+    for stale in ("bypasses the routing decision", "could terminate in silence"):
+        assert stale not in body, (
+            f"the 501 body still claims {stale!r}, which stopped being true when "
+            f"gitlab_webhook was routed through _govern_consumer_fix."
+        )
+    # it must still say WHY it is off and how to reverse it -- that was the point
+    assert "RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS" in body, (
+        "the notice no longer says how to re-enable the platform")
 
 
 if __name__ == "__main__":

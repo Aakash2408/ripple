@@ -66,12 +66,15 @@ def experimental_disabled(platform: str, surface: str = "") -> JSONResponse:
             "surface": surface or None,
             "reason": (
                 f"The {platform} integration{where} is switched off. For the "
-                f"current push, GitHub is the only production surface: Ripple can "
-                f"detect breaking changes across 10 contract types but has proven "
-                f"zero fix-generating combinations end to end, and the "
-                f"{platform} path additionally bypasses the routing decision and "
-                f"the outcome funnel -- so a breaking change there could terminate "
-                f"in silence rather than in a stated outcome."
+                f"current push, GitHub is the only production surface.\n\n"
+                f"This is a SCOPE decision, not a safety one. The {platform} path "
+                f"is now governed: it routes through the same routing decision and "
+                f"outcome funnel as GitHub, so a breaking change there cannot "
+                f"terminate in silence. What it cannot yet do is COMPILE a fix -- "
+                f"repository archives are fetched from GitHub only, so a "
+                f"{platform} fix is validated=None and can therefore reach REVIEW "
+                f"but never AUTO. Enabling it opens merge requests that a human "
+                f"must approve."
             ),
             "what_still_works": "GitHub App (/webhook) and read-only analysis (/dry-run)",
             "to_re_enable": f"set {_ENV_FLAG}=1",

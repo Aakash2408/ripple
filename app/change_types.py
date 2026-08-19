@@ -317,3 +317,59 @@ def is_fixable(change_type: str) -> bool:
     real changes and could win, then produce nothing.
     """
     return category(change_type) in (MECHANICAL, JUDGMENT)
+
+
+#: What to CALL each operation in a PR or MR title. Exhaustive over CANONICAL_OPS,
+#: and tests/test_regression.py fails if an op is added without a phrase here.
+#:
+#: WHY THIS IS A TABLE AND NOT AN f-STRING AT THE CALL SITE
+#: The phrase "add required field" was hardcoded and then applied to all twelve
+#: operations FOUR separate times:
+#:
+#:   fix_generator   the LLM PROMPT -- so the model ADDED a parameter when asked to
+#:                   remove one, and did exactly as instructed
+#:   fix_generator   the EXPLANATION shown in the PR body
+#:   webhook         the GitLab and Bitbucket MR title
+#:   pr_engine       the CLI title, which survived longest because the governance
+#:                   audit lists that entry point as EXEMPT -- nothing watched it
+#:
+#: A title is not cosmetic. "Remove references to deleted field 'x'" and "Add
+#: required field 'x'" are opposite instructions to a reviewer, printed directly
+#: above the diff. Whoever trusts the title misreads the change.
+_TITLES = {
+    "remove_field":       "Remove references to deleted field '{f}'",
+    "remove_enum_value":  "Remove references to deleted enum value '{f}'",
+    "remove_operation":   "Remove references to deleted operation '{f}'",
+    "remove_type":        "Remove references to deleted type '{f}'",
+    "remove_package":     "Update references to removed package '{f}'",
+    "add_required":       "Add required field '{f}'",
+    "add_optional":       "Add optional field '{f}'",
+    "rename_field":       "Rename field '{f}'",
+    "rename_type":        "Rename type '{f}'",
+    "change_field_type":  "Update type of field '{f}'",
+    "restrict_schema":    "Adapt to restricted schema for '{f}'",
+    # No source edit can fix a wire break, so this title should never reach a PR.
+    # It is mapped anyway: an unmapped op falls to the neutral phrase, and a
+    # silent fallback is how the four occurrences above spread unnoticed.
+    "wire_incompatible":  "Wire-incompatible change to '{f}' -- no source fix exists",
+}
+
+
+def fix_title(change) -> str:
+    """The PR/MR title for a breaking change, DERIVED from its operation.
+
+    Reads DECLARED fields directly rather than via getattr with a default:
+    test_no_phantom_getattr_on_breaking_change caught the first draft of this, and
+    rightly -- a default turns a renamed or absent field into "no field name",
+    producing a plausible wrong title instead of a loud failure.
+
+    An unrecognised change_type gets a neutral phrase rather than raising, because
+    a webhook must not 500 when a diff engine emits a dialect nobody mapped. The
+    exhaustiveness test is what stops that neutral path from becoming the default.
+    """
+    field = change.field_name or "field"
+    where = " ".join(p for p in (change.method, change.path) if p).strip()
+    suffix = f" in {where}" if where else ""
+    phrase = _TITLES.get(canonical_op(change.change_type or ""),
+                         "Update references to '{f}'")
+    return phrase.format(f=field) + suffix

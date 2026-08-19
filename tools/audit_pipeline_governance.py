@@ -67,20 +67,26 @@ REQUIRED = {
 # point NOT listed here fails the build. Deleting a line here is progress.
 # Entry points that are SWITCHED OFF, and must stay off. Distinct from EXEMPT: an
 # exemption TOLERATES an ungoverned path, whereas this asserts the path cannot be
-# reached at all. Both webhooks moved here in Stage 2.
+# reached at all.
 #
 # The check is structural, not a label: the route must call experimental_disabled()
 # BEFORE any PR-creating call. A guard placed after the pipeline would read as
 # "disabled" while still opening merge requests.
-DISABLED = {
-    "app/webhook.py:gitlab_webhook":
-        "154 lines of pipeline inlined in the route handler, bypassing both the "
-        "routing decision and the outcome funnel. Switched off rather than left "
-        "exempt, because an exemption becomes permanent and a breaking change on "
-        "this path could still terminate in silence.",
-    "app/webhook.py:bitbucket_webhook":
-        "154 lines inlined, same shape as gitlab_webhook.",
-}
+#
+# EMPTY, AND THAT IS PROGRESS. gitlab_webhook and bitbucket_webhook lived here from
+# Stage 2 -- each inlined ~154 lines that bypassed the routing decision and the
+# outcome funnel, so switching them off was the only honest option. Both now call
+# _govern_consumer_fix (one pr_level call site serves all three platforms) and open
+# a ChangeRun, so they are GOVERNED rather than merely unreachable, which is the
+# stronger claim.
+#
+# Being governed is NOT being enabled: app/experimental.py still gates both routes
+# behind RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS, so they remain off by default. What
+# changed is that turning them on became a deployment decision instead of a safety
+# risk. If a future edit re-inlines a pipeline or drops the decision, this audit
+# fails -- rather than the platform quietly returning to ungoverned with the env var
+# already set in production.
+DISABLED: dict = {}
 
 EXEMPT = {
     "app/cli.py:main":
@@ -177,6 +183,16 @@ SILENT_EXIT_OK = {
     "ensemble_prediction_match":
         "breaking out of the prediction SEARCH once the matching prediction is "
         "found. A loop-control break, not a terminal outcome for the change.",
+    "governed_decision_already_signalled":
+        "`if not decision.opens_pr: continue` immediately after "
+        "_govern_consumer_fix(), which ALREADY called run.refused() and logged "
+        "pr_skipped one frame down -- see the assertion in "
+        "test_the_governed_decision_is_platform_neutral_and_denies_auto_without_a_tree, "
+        "which fails if the refusal stops being recorded. Emitting a second signal "
+        "here would double-count every refusal, the same double-count that made "
+        "_generate_fix_with_rag_fallback stop logging fix_generated. This allowance "
+        "exists because the decision was MOVED OUT of the pipeline so GitLab and "
+        "Bitbucket could share it; the signal did not disappear, it relocated.",
 }
 
 
@@ -226,6 +242,12 @@ def _unsignalled_exits(path: str) -> list:
                 # immediately above it, not by its line number.
                 context = " ".join(l.strip() for l in lines[max(0, stmt.lineno - 4):stmt.lineno])
                 if "pred.get(" in context or "pred[" in context:
+                    continue
+                # SILENT_EXIT_OK["governed_decision_already_signalled"]. The guard
+                # is the identifier, not the line number, so this survives edits
+                # above it -- and it matches ONLY this shape, so a different bare
+                # continue in the same loop is still a finding.
+                if "decision.opens_pr" in context:
                     continue
                 found.append(
                     f"{PIPELINE_FN} line {stmt.lineno}: "
@@ -400,7 +422,8 @@ def main(argv: list) -> int:
         return 1
 
     print("\n  no UNLISTED ungoverned entry point. The exempt set is the honest")
-    print("  scope of 'the registry governs routing': it holds for GitHub only.")
+    print("  scope of 'the registry governs routing': it holds for all three")
+    print("  hosted platforms, and NOT for the CLI or the self-hosted agent.")
     return 0
 
 
