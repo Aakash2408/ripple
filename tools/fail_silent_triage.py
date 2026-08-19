@@ -316,6 +316,19 @@ TRIAGE: dict[tuple, tuple] = {
     ("tls.py", "make_ssl_context", "swallowed_except", "Exception", 0): (
         LEGITIMATE, SAME_AS("tls.py", "resolve_ca_bundle")),
 
+    ("project_resolution.py", "_is_workspace_root", "swallowed_except",
+     "(OSError, ValueError)", 0): (
+        LEGITIMATE,
+        "Reading a package.json to see whether it declares `workspaces`. An "
+        "unreadable or malformed one is not a workspace root -- and it is still a "
+        "dependency manifest, which _first_dir_with finds separately, so the "
+        "fallback path is unaffected. Raising here would make one broken package.json "
+        "anywhere above a file abort resolution for the whole repository."),
+    ("project_resolution.py", "_is_workspace_root", "swallowed_except", "OSError", 1): (
+        LEGITIMATE,
+        "Same, reading Cargo.toml for a [workspace] section. Absence of the marker is "
+        "the answer; an unreadable file cannot supply one."),
+
     ("webhook.py", "_validate_fix_against_tree", "swallowed_except", "OSError", 0): (
         LEGITIMATE,
         "Restoring the consumer file after validation, in a finally. If the write "
