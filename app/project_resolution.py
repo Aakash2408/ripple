@@ -84,6 +84,75 @@ class Project:
                 and os.path.normpath(self.deps_root) != os.path.normpath(self.root)}
 
 
+#: Files that mark a directory as a WORKSPACE ROOT -- where dependencies install for
+#: every package beneath it. Checked before the nearest dependency manifest, because
+#: those are different questions and confusing them breaks real monorepos.
+_WORKSPACE_MARKERS = ("pnpm-workspace.yaml", "pnpm-workspace.yml",
+                      "lerna.json", "turbo.json", "nx.json", "rush.json",
+                      "go.work")
+
+
+def _is_workspace_root(directory: str) -> str:
+    """The marker naming `directory` a workspace root, or "".
+
+    A package.json counts only when it declares `workspaces` -- every package in a
+    monorepo has a package.json, and treating the nearest one as the install root is
+    the bug this function exists to fix.
+    """
+    import json
+
+    for marker in _WORKSPACE_MARKERS:
+        if os.path.isfile(os.path.join(directory, marker)):
+            return marker
+
+    manifest = os.path.join(directory, "package.json")
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest) as fh:
+                if json.load(fh).get("workspaces"):
+                    return "package.json (workspaces)"
+        except (OSError, ValueError):
+            # An unreadable or malformed package.json is not a workspace root. It is
+            # still a dependency manifest, which _first_dir_with finds separately.
+            pass
+
+    cargo = os.path.join(directory, "Cargo.toml")
+    if os.path.isfile(cargo):
+        try:
+            with open(cargo) as fh:
+                if "[workspace]" in fh.read():
+                    return "Cargo.toml ([workspace])"
+        except OSError:
+            pass
+    return ""
+
+
+def _install_root(tree: str, project_root: str, deps_names) -> tuple:
+    """(directory, why) where dependencies actually install for this project.
+
+    THE DISTINCTION THAT BROKE A REAL REPO
+    `deps_root` used to be "nearest ancestor with a dependency manifest". In a
+    monorepo every package has a package.json, so that resolved to the package
+    itself -- and `npm install` there succeeded with nothing to install, after which
+    ./node_modules/.bin/tsc did not exist:
+
+        deps_root = packages/reporting   -> install exit 0, then tsc NOT FOUND
+        workspace root + subdir          -> works
+
+    A package manifest and an install root are different things. The workspace root
+    is checked FIRST; the nearest dependency manifest is the fallback for a plain
+    single-package repository.
+    """
+    for directory in _walk_up(tree, project_root):
+        marker = _is_workspace_root(directory)
+        if marker:
+            return directory, f"workspace root via {marker}"
+    directory, present = _first_dir_with(tree, project_root, deps_names)
+    if directory:
+        return directory, f"nearest dependency manifest ({', '.join(present)})"
+    return "", ""
+
+
 def _walk_up(tree: str, start_dir: str):
     """Directories from `start_dir` up to and including `tree`. Never above it.
 
@@ -137,7 +206,7 @@ def resolve(tree: str, rel_path: str) -> Project | None:
         # not a project a compiler can be pointed at.
         return None
 
-    deps_root, deps_found = _first_dir_with(tree, root, deps_names)
+    deps_root, deps_why = _install_root(tree, root, deps_names)
 
     rel = os.path.relpath(root, real_tree)
     rel = "" if rel == "." else rel
@@ -146,13 +215,12 @@ def resolve(tree: str, rel_path: str) -> Project | None:
               f"(found {', '.join(found)})")
     if hoisted:
         reason += (f"; dependencies resolve from "
-                   f"{os.path.relpath(deps_root, real_tree)} -- a hoisted workspace")
+                   f"{os.path.relpath(deps_root, real_tree)} -- {deps_why}")
     elif not deps_root:
         reason += "; no dependency manifest found, so a toolchain may not install"
 
     project = Project(root=root, language=language,
-                      found=tuple(found) + tuple(deps_found if hoisted else ()),
-                      deps_root=deps_root, reason=reason)
+                      found=tuple(found), deps_root=deps_root, reason=reason)
     object.__setattr__(project, "_rel", rel)
     return project
 

@@ -63,6 +63,12 @@ def _build(tree: str) -> None:
     _write(tree, "hoist/packages/api/tsconfig.json")
     _write(tree, "hoist/packages/api/src/user.ts", "export const u = 1;\n")
 
+    # 3b. A plain directory of packages -- NO `workspaces` key. Dependencies really
+    #     do live in the package, so this must not read as hoisted.
+    _write(tree, "plain/packages/api/package.json")
+    _write(tree, "plain/packages/api/tsconfig.json")
+    _write(tree, "plain/packages/api/src/user.ts", "export const u = 1;\n")
+
     # 4. POLYGLOT: a .ts file living under a Go module.
     _write(tree, "poly/go.mod", "module example.com/x\n")
     _write(tree, "poly/main.go", "package main\n")
@@ -87,9 +93,19 @@ def _build(tree: str) -> None:
 
 CASES = [
     ("flat repo", "flat/src/a.ts", "flat", False),
-    ("monorepo package", "mono/packages/api/src/user.ts", "mono/packages/api", False),
-    ("monorepo sibling", "mono/packages/web/src/page.tsx", "mono/packages/web", False),
+    # `mono/package.json` declares `workspaces`, so dependencies resolve from the
+    # WORKSPACE ROOT even though the package has its own package.json. These were
+    # labelled self-contained before workspace detection existed -- that label was an
+    # artifact of treating the nearest package.json as the install root, which made
+    # npm install succeed with nothing to install and then left tsc missing.
+    ("monorepo package", "mono/packages/api/src/user.ts", "mono/packages/api", True),
+    ("monorepo sibling", "mono/packages/web/src/page.tsx", "mono/packages/web", True),
     ("hoisted workspace", "hoist/packages/api/src/user.ts", "hoist/packages/api", True),
+    # A plain DIRECTORY of packages -- no `workspaces` key anywhere. Dependencies
+    # really do live in the package, so this must NOT be reported as hoisted. It
+    # exercises the fallback branch that the workspace cases no longer reach.
+    ("packages dir, no workspaces", "plain/packages/api/src/user.ts",
+     "plain/packages/api", False),
     ("nested project", "nested/inner/src/deep.ts", "nested/inner", False),
     ("python project", "py/pkg/mod.py", "py", False),
     ("go module", "gomod/cmd/main.go", "gomod", False),

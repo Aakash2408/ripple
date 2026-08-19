@@ -4847,7 +4847,11 @@ def test_project_resolution_never_falls_back_to_the_repo_root():
         w("mono/packages/api/src/user.ts", "x")
         w("mono/packages/web/package.json"); w("mono/packages/web/tsconfig.json")
         w("mono/packages/web/src/page.tsx", "x")
-        w("hoist/package.json"); w("hoist/packages/api/tsconfig.json")
+        # A REAL workspace root declares `workspaces`. Without it this is just a
+        # package.json, and the install root is found by the fallback path -- which
+        # is a different code path and a weaker assertion.
+        w("hoist/package.json", '{"workspaces": ["packages/*"]}')
+        w("hoist/packages/api/tsconfig.json")
         w("hoist/packages/api/src/user.ts", "x")
         w("poly/go.mod", "module x\n"); w("poly/scripts/tool.ts", "x")
         w("loose/src/orphan.ts", "x")
@@ -4885,7 +4889,13 @@ def test_project_resolution_never_falls_back_to_the_repo_root():
         assert hoisted.deps_root and \
             os.path.normpath(hoisted.deps_root) != os.path.normpath(hoisted.root), \
             "the hoisted workspace was not reported as hoisted"
-        assert "hoisted" in hoisted.reason, hoisted.reason
+        # Assert the PROPERTY, not the prose. The reason text names which mechanism
+        # found the install root (workspace marker vs nearest manifest) and changed
+        # when workspace detection was added -- an assertion on wording fails for
+        # the wrong reason.
+        assert "dependencies resolve from" in hoisted.reason, hoisted.reason
+        assert "workspaces" in hoisted.reason or "workspace root" in hoisted.reason, \
+            f"the install root was not identified as a workspace: {hoisted.reason}"
         assert hoisted.as_detail()["deps_root_differs"] is True
 
         # A self-contained package must NOT be flagged as hoisted.

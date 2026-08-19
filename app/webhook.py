@@ -1979,6 +1979,22 @@ def _validate_fix_against_tree(tree: str, consumer_file: str,
         return None, {"validation": "SKIPPED",
                       "validation_reason": f"cannot read {consumer_file}: {exc}"}
 
+    # A NO-OP HAS NOTHING TO VALIDATE, and validating it is actively dangerous.
+    #
+    # The production caller already guards this (`if fixed_code != consumer_content`),
+    # but a helper that answers True for unchanged code is a footgun: a file the
+    # codemod REFUSED, which happens to compile as-is, would come back VALID and
+    # reach AUTO for a fix that does not exist. Observed exactly that while proving
+    # out the billing-api monorepo -- the harness called this directly and
+    # packages/checkout returned AUTO with zero edits.
+    #
+    # Guarding here rather than trusting the caller is the same reasoning that moved
+    # the trailing-newline fix to where all paths converge.
+    if fixed_code == original:
+        return None, {"validation": "SKIPPED",
+                      "validation_reason": "nothing changed, so there is nothing to "
+                                           "validate -- a no-op is not a fix"}
+
     # deps_root is where dependencies install and may be an ANCESTOR of the project
     # in a hoisted pnpm/yarn workspace. project_subdir tells tsc which project to
     # check; without it tsc reads the workspace ROOT tsconfig, which either excludes
