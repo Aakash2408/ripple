@@ -4999,5 +4999,67 @@ def test_a_hoisted_workspace_validates_at_the_package_not_the_root():
             _sh.rmtree(tree, ignore_errors=True)
 
 
+def test_the_production_image_does_not_pay_for_a_gpu_it_does_not_have():
+    """requirements.txt is the production image, and it was 94% CUDA.
+
+    Measured in the real image rather than estimated:
+
+        with    sentence-transformers + chromadb   site-packages 5.4 GB
+                nvidia 2.7G  torch 1.2G  triton 691M     = 4.6 GB of GPU stack
+        without                                    site-packages 348 MB
+
+    On a container with no GPU, to serve a RAG store holding zero patterns. That
+    layer is rebuilt on every Railway deploy and it is the only build step large
+    enough to fail on time or disk.
+
+    `chromadb` was pinned and imported NOWHERE -- the sole occurrence in the tree
+    is a comment.
+
+    THE SECOND ASSERTION IS THE ONE THAT MATTERS. Dropping sentence-transformers
+    alone would fall through TWO tiers of Embedder.__init__ to bag-of-words, and
+    the guarded `except (ImportError, Exception)` would make that invisible --
+    exactly the fail-silent shape this repo keeps rediscovering. scikit-learn must
+    be present so the degradation is one honest step, not a silent collapse.
+
+    This is a gate, not a comment. A verbal decision not to reinstall a 5 GB
+    dependency lasts about four days.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "requirements.txt")) as fh:
+        pinned = {
+            line.split("=")[0].split(">")[0].split("<")[0].strip().lower()
+            for line in fh
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+    # 1. the GPU stack and the phantom dependency stay out
+    for banned, why in (
+        ("sentence-transformers", "drags torch + nvidia + triton = 4.6 GB"),
+        ("chromadb", "imported nowhere in the tree"),
+        ("torch", "no GPU in the container, and nothing imports it directly"),
+    ):
+        assert banned not in pinned, (
+            f"{banned} is back in requirements.txt ({why}). If this is "
+            f"deliberate, measure the image first: it was 5.4 GB with it and "
+            f"348 MB without, and Railway rebuilds that layer every deploy."
+        )
+
+    # 2. the fallback tier is real, so removing tier 1 costs ONE step not two
+    assert "scikit-learn" in pinned, (
+        "scikit-learn is missing, so Embedder falls past the TF-IDF tier to "
+        "bag-of-words -- and the guarded except makes that silent."
+    )
+
+    # 3. and the tiers themselves still exist, so this test keeps meaning something
+    rag = os.path.join(root, "app", "rag_engine.py")
+    with open(rag) as fh:
+        body = fh.read()
+    for tier in ("sentence_transformers", "TfidfVectorizer", "_bow_embed"):
+        assert tier in body, (
+            f"Embedder no longer references {tier} -- the three-tier fallback "
+            f"this test protects has changed shape, so re-derive it."
+        )
+
+
 if __name__ == "__main__":
     sys.exit(_main())

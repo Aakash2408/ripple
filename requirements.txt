@@ -2,6 +2,30 @@ fastapi>=0.100.0
 uvicorn>=0.23.0
 pyyaml>=6.0
 anthropic>=0.30.0
-sentence-transformers>=2.2.0
-chromadb>=0.4.0
 cryptography>=41.0.0
+
+# --- embeddings: the TF-IDF tier, deliberately ---------------------------------
+# Embedder in app/rag_engine.py degrades in three tiers:
+#     sentence-transformers  ->  sklearn TF-IDF  ->  bag-of-words
+#
+# `sentence-transformers` used to be pinned here and it is NOT free. Measured in
+# the real image, not estimated:
+#
+#     with    sentence-transformers + chromadb   site-packages 5.4 GB
+#             of which  nvidia 2.7G  torch 1.2G  triton 691M   = 4.6 GB of CUDA
+#     without                                    site-packages 348 MB
+#
+# So 94% of the production image was a GPU stack, on a container that has no GPU,
+# to serve a RAG store holding ZERO patterns. Railway builds that layer on every
+# deploy; a 5.4 GB pip step is the marginal resource in this build and it is the
+# only step large enough to fail on time or disk.
+#
+# `chromadb` was pinned too and is imported NOWHERE in the codebase -- grep the
+# tree: the only occurrence is a comment. It was paying for kubernetes and
+# onnxruntime for nothing.
+#
+# scikit-learn is added on purpose. Dropping sentence-transformers without it
+# would fall through TWO tiers to bag-of-words, silently -- the guarded except in
+# Embedder.__init__ makes that invisible. This keeps the fallback one honest step
+# down, and tests/test_regression.py asserts the heavy deps stay out.
+scikit-learn>=1.3.0
