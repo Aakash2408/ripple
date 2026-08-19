@@ -5061,5 +5061,175 @@ def test_the_production_image_does_not_pay_for_a_gpu_it_does_not_have():
         )
 
 
+def test_a_consumer_tree_is_never_fetched_at_the_spec_repos_sha():
+    """The first live end-to-end run failed here, and the log accused the wrong thing.
+
+        tree_unavailable  billing-api
+          "HTTP 404 fetching the archive -- the token cannot read this repository"
+
+    webhook.py passed `after_sha` -- a commit in the SPEC repository -- as the git
+    ref for the CONSUMER repository's tarball. Measured against the real API:
+
+        ref=HEAD        200
+        ref=main        200
+        ref=8b7c869     404      <- the spec repo's commit
+        ref=deadbeef    404      <- indistinguishable from a nonexistent ref
+
+    So validation could not run in production for ANY repository, whatever the
+    registry derived -- and the contents API had read the same file seconds earlier
+    with the same token, which is what makes the "token" wording a false lead.
+
+    Asserted structurally because the alternative is a live network call. The call
+    site must not pass a spec-repo SHA; the consumer's own default-branch HEAD is
+    the only ref that means anything here, because that is the tree the PR targets.
+    """
+    import ast as _ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "app", "webhook.py")) as fh:
+        tree = _ast.parse(fh.read())
+
+    calls = [
+        node for node in _ast.walk(tree)
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Name)
+        and node.func.id == "_fetch_consumer_tree"
+    ]
+    assert calls, "_fetch_consumer_tree is no longer called -- re-derive this test"
+
+    banned = {"after_sha", "before_sha", "base_sha", "commit_sha", "sha"}
+    for call in calls:
+        passed = [a.id for a in call.args if isinstance(a, _ast.Name)]
+        leaked = banned.intersection(passed)
+        assert not leaked, (
+            f"_fetch_consumer_tree is being passed {sorted(leaked)} -- that is a "
+            f"commit in the SPEC repository and does not exist in the consumer's, "
+            f"so GitHub 404s the archive and nothing can be validated."
+        )
+
+
+def test_a_404_on_the_archive_is_not_reported_as_an_auth_failure():
+    """One string covered 401, 403 and 404, and it sent me to the wrong place.
+
+    A 404 on an archive means the repository or the REF is absent. 401/403 mean
+    auth. Collapsing them produced "the token cannot read this repository" for a
+    ref that simply did not exist -- so the first thing I checked was the App's
+    repository permissions, which were fine.
+
+    Same family as the 404-vs-403 caching bug this repo has now hit five times:
+    distinct HTTP codes carry distinct meanings and must not be merged.
+    """
+    from app.repo_workspace import _http_reason
+
+    not_found = _http_reason(404)
+    denied = _http_reason(401)
+    forbidden = _http_reason(403)
+
+    assert not_found != denied, "404 and 401 still produce the same explanation"
+    assert not_found != forbidden, "404 and 403 still produce the same explanation"
+    assert "token" not in not_found.lower(), (
+        f"a 404 is still blamed on the token: {not_found!r} -- it means the repo "
+        f"or the ref is absent, which is what actually happened in production."
+    )
+    assert "ref" in not_found.lower(), (
+        f"the 404 explanation does not mention the ref: {not_found!r}. Naming the "
+        f"likely cause is the whole point -- the wording is the diagnostic."
+    )
+    assert "token" in denied.lower() and "token" in forbidden.lower(), (
+        "401/403 should still name the token; they really are auth failures"
+    )
+
+
+def test_the_line_based_fallback_cannot_bypass_the_diff_contract():
+    """The first live run opened a PR containing code that cannot compile.
+
+    `generate_fix()` applies the diff contract at fix_generator.py:132. But
+    webhook.py:72 imports the PRIVATE `_generate_with_template` and calls it
+    directly at line 2188, reaching around that guard -- so the weakest generator
+    in the codebase ran unverified, and it fires EXACTLY WHEN the hardened
+    template refuses. A deliberate refusal became a silent downgrade.
+
+    What it produced on a real file, in a real repository:
+
+        -    email: string,
+        -    phoneNumber: string,          removed the PARAMETER
+        +    email: string
+             const request: CreateUserRequest = { name, email, phoneNumber };
+                                                                ^^^ still there
+
+        -    body: JSON.stringify(body),   an unrelated function
+        +    body: JSON.stringify(body)
+
+    The stray comma comes from a whole-file `re.sub(r',\\s*(\\n\\s*[}\\])])', ...)`.
+    The contract catches all of it -- two orphan commas and a destroyed doc
+    comment -- so the guard belongs INSIDE the generator, not in one caller.
+
+    THE SECOND HALF IS THE IMPORTANT PART. The hardened path already refuses this
+    file. What is asserted is that the refusal SURVIVES: the weak fallback must
+    not be able to overturn it.
+    """
+    from app.fix_generator import _remove_field_references
+    from app import diff_contract
+
+    original = (
+        '/**\n'
+        ' * Every reference here is a JUDGMENT call.\n'
+        ' */\n'
+        'export interface CreateUserRequest {\n'
+        '  name: string;\n'
+        '  email: string;\n'
+        '  phoneNumber: string;\n'
+        '}\n'
+        '\n'
+        'async function post<T>(url: string, body: unknown): Promise<T> {\n'
+        '  const response = await fetch(url, {\n'
+        '    method: "POST",\n'
+        '    body: JSON.stringify(body),\n'
+        '  });\n'
+        '  return (await response.json()) as T;\n'
+        '}\n'
+        '\n'
+        'export class UserClient {\n'
+        '  async createUser(\n'
+        '    name: string,\n'
+        '    email: string,\n'
+        '    phoneNumber: string,\n'
+        '  ): Promise<User> {\n'
+        '    const request: CreateUserRequest = { name, email, phoneNumber };\n'
+        '    return post<User>("/users", request);\n'
+        '  }\n'
+        '}\n'
+    )
+
+    fixed, note = _remove_field_references(original, "phoneNumber", "typescript")
+
+    # 1. the refusal survives -- the weak generator does not get to overturn it
+    assert fixed == original, (
+        "the line-based fallback still returns a patch the diff contract "
+        f"rejects. note={note!r}\n"
+        "Every reference in this file is a judgment shape (parameter, shorthand), "
+        "so the only correct answer is to change nothing."
+    )
+
+    # 2. and it says WHY, rather than going quiet
+    assert note, "the fallback returned no explanation at all"
+    assert any(w in note.lower() for w in ("refus", "contract", "unsafe")), (
+        f"the explanation does not say the patch was rejected: {note!r}"
+    )
+
+    # 3. the contract really does reject that patch -- so test 1 is not vacuous
+    #    (if the fallback ever stops producing it, this pins WHY it was banned)
+    from app.fix_generator import _remove_field_references_unchecked as _raw
+    raw, _ = _raw(original, "phoneNumber", "typescript")
+    assert raw != original, (
+        "the unchecked generator no longer changes this file, so test 1 passes "
+        "for a different reason than intended -- re-derive it."
+    )
+    verdict = diff_contract.check(original, raw, "phoneNumber", "typescript")
+    assert not verdict.ok, (
+        "the diff contract now ACCEPTS the line-based patch. Either the contract "
+        "weakened or the generator improved; find out which before relaxing this."
+    )
+
+
 if __name__ == "__main__":
     sys.exit(_main())

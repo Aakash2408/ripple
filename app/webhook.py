@@ -1466,8 +1466,21 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                 # existed the pipeline read files one at a time so tsc could never
                 # run -- which is why AUTO was unreachable in production for every
                 # language, not just the ones with no codemod.
+                #
+                # THE REF IS THE CONSUMER'S OWN HEAD, NOT `after_sha`. That was the
+                # defect the first live end-to-end run found: `after_sha` is a commit
+                # in the SPEC repository, so GitHub 404s the consumer's archive and
+                # NOTHING could be validated in production, for any language.
+                # Measured against the real API:
+                #
+                #     ref=HEAD      200        ref=8b7c869 (spec repo)   404
+                #     ref=main      200        ref=deadbeef              404
+                #
+                # HEAD is also the right ref on the merits, not just the working one:
+                # it is the tree the PR will target, and it is the same revision the
+                # contents API served the consumer file from.
                 _tree, _tree_note = _fetch_consumer_tree(
-                    consumer_repo, after_sha, token)
+                    consumer_repo, "HEAD", token)
                 if _tree_note:
                     _log_activity("tree_unavailable", {
                         "repo": consumer_repo, "reason": _tree_note})

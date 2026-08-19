@@ -531,11 +531,80 @@ def _call_site_hints(breaking_change: BreakingChange) -> tuple[str, ...]:
 
 
 def _remove_field_references(original_code: str, field_name: str, language: str) -> tuple[str, str]:
+    """Line-based removal, VERIFIED. The unchecked engine is below.
+
+    WHY THIS WRAPPER EXISTS
+    -----------------------
+    generate_fix() applies the diff contract at line 132. But app/webhook.py:72
+    imports the private `_generate_with_template` and calls it directly at line
+    2188, reaching around that guard -- so on the first live end-to-end run the
+    weakest generator in this codebase ran completely unverified.
+
+    Worse, it fires EXACTLY WHEN the hardened template refuses (line 396). A
+    deliberate refusal therefore became a silent downgrade to line deletion. What
+    it opened as a PR, on a real repository:
+
+        -    email: string,
+        -    phoneNumber: string,          removed the PARAMETER
+        +    email: string
+             const request: CreateUserRequest = { name, email, phoneNumber };
+                                                                ^^^ still there
+
+        -    body: JSON.stringify(body),   a DIFFERENT function
+        +    body: JSON.stringify(body)
+
+    The stray comma is the whole-file `re.sub` below; the contract also caught a
+    destroyed doc comment. Only "no tree, so no validation -> REVIEW" stopped
+    that reaching AUTO, which is luck rather than design.
+
+    So the check lives HERE, at the single convergence point, rather than in one
+    caller. A guard a caller can decline to invoke is not a guard -- the same
+    reason the trailing-newline fix had to move out of the monkeypatched branch.
+
+    UNSCANNED LANGUAGES PASS THROUGH, DELIBERATELY. The gate is
+    source_regions.SCANNED because scanning Go with the TypeScript comment rules
+    produces confident nonsense in both directions. Go and Java therefore still
+    get an unverified fallback fix -- but neither has a validator, so
+    routing.pr_level() can never grant them AUTO. They are REVIEW by
+    construction, and the note says the patch was not contract-checked.
+    """
+    candidate, explanation = _remove_field_references_unchecked(
+        original_code, field_name, language)
+    if candidate == original_code:
+        return original_code, explanation
+
+    from .source_regions import SCANNED as _SCANNED
+    lang = (language or "").lower()
+    if lang not in _SCANNED:
+        return candidate, f"{explanation} (not contract-checked: no scanner for {lang or 'unknown'})"
+
+    from .diff_contract import check as _diff_check
+    verdict = _diff_check(original_code, candidate, field_name, language=lang)
+    if verdict.ok:
+        return candidate, explanation
+
+    # The refusal SURVIVES. Returning the original is what every other rejected
+    # path does, and the caller already reads "unchanged" as "no fix".
+    first = (verdict.violations[0] if verdict.violations else "unspecified")[:160]
+    return original_code, (
+        f"refused: the line-based fallback violated the diff contract ({first}). "
+        f"No reference matched a shape that can be removed safely, so the code is "
+        f"unchanged."
+    )
+
+
+def _remove_field_references_unchecked(original_code: str, field_name: str, language: str) -> tuple[str, str]:
     """
     Remove all references to a deleted field from consumer code.
     Works across all languages by:
     1. Removing lines that contain the field name in common patterns
     2. Cleaning up dangling commas and empty blocks
+
+    NOT FOR DIRECT USE. This is the raw engine: it deletes any line mentioning the
+    field, with no shape analysis, and then rewrites trailing commas across the
+    WHOLE FILE. Call _remove_field_references() instead, which verifies the result
+    against the diff contract. This name is public only so a test can pin what the
+    verified wrapper is protecting against.
     """
     lines = original_code.split("\n")
     removed_lines = []

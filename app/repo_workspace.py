@@ -100,6 +100,31 @@ def _tarball_url(repo: str, ref: str) -> str:
     return f"https://api.github.com/repos/{repo}/tarball/{ref}"
 
 
+def _http_reason(code: int) -> str:
+    """Why the archive fetch failed, in words that belong in a PR body.
+
+    One string used to cover 401, 403 AND 404: "the token cannot read this
+    repository". The first live end-to-end run hit a 404 because the caller asked
+    for a ref from a DIFFERENT repository, and that wording sent the investigation
+    straight to the GitHub App's permissions -- which were correct, and had just
+    served the same file through the contents API seconds earlier.
+
+    Same family as the 404-vs-403 caching bug this repo has now hit five times:
+    a 404 is a statement about EXISTENCE, 401/403 about PERMISSION, and merging
+    them turns a diagnostic into a red herring. Naming the likely cause is the
+    whole value of the message.
+    """
+    if code == 404:
+        return ("no such repository or ref -- this is NOT an auth failure. The "
+                "usual cause is asking for a ref that does not exist in THIS "
+                "repository (for example a commit from the spec repo)")
+    if code in (401, 403):
+        return "the token cannot read this repository"
+    if code == 429:
+        return "rate limited, so this says nothing about the repository"
+    return "transient"
+
+
 def _download(url: str, token: str, limits: Limits, dest: str) -> int:
     """Stream to `dest`, aborting the moment the compressed cap is passed.
 
@@ -128,8 +153,7 @@ def _download(url: str, token: str, limits: Limits, dest: str) -> int:
                 out.write(chunk)
     except urllib.error.HTTPError as exc:
         raise WorkspaceUnavailable(
-            f"HTTP {exc.code} fetching the archive -- "
-            f"{'the token cannot read this repository' if exc.code in (401, 403, 404) else 'transient'}"
+            f"HTTP {exc.code} fetching the archive -- {_http_reason(exc.code)}"
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise WorkspaceUnavailable(
