@@ -2398,6 +2398,52 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
         # every fix (handler.go x2, UserClient.ts x2, ...) and inflated the
         # dashboard's fixes_generated counter.
         return fixed_code, f"[template] {explanation}"
+
+    # LAST RESORT: the LLM, and ONLY through generate_fix().
+    #
+    # This docstring promised "4. Claude LLM (ONLY if 1-3 all fail)" while the code
+    # never called it -- generate_fix() was never referenced in this file, so the
+    # `use_llm and _llm_key()` gate was unreachable from every platform and setting
+    # a key in production changed nothing. A real webhook run confirmed it: every
+    # fix source was [template] or [RAG/template], never [llm].
+    #
+    # CALLED THROUGH generate_fix(), NEVER _generate_with_llm() DIRECTLY. The diff
+    # contract that verifies an LLM patch lives in generate_fix at line ~132; going
+    # straight to the generator would bypass it, which is precisely the mistake the
+    # line-based fallback made -- it reached around its own wrapper's guard and
+    # opened a PR containing code that could not compile.
+    #
+    # SELF-HOSTED OR NOTHING, BY DEFAULT. The gate is is_configured(), which is true
+    # when a key exists OR when ANTHROPIC_BASE_URL names a non-Anthropic host -- a
+    # locally run model (Ollama, llama.cpp, a LiteLLM proxy, a sidecar on the private
+    # network) authenticates nothing, so keying this on a token would make a
+    # self-hosted deployment fall silently through to the template. Reaching the real
+    # Anthropic API still requires a key, so source cannot go to a third party by
+    # accident. With neither, nothing is attempted and no code leaves the process.
+    #
+    # Three further guards apply inside: the operation must be in the
+    # _LLM_INSTRUCTIONS allowlist (judgment ops are deliberately absent), the patch
+    # must satisfy the diff contract, and AUTO still requires a real compile -- so an
+    # LLM fix can at most earn REVIEW on a platform with no validator.
+    from .llm_config import is_configured as _llm_ready
+    if not _llm_ready():
+        return content, ""
+    try:
+        from .fix_generator import generate_fix as _generate_fix
+        fix = _generate_fix(consumer, change, use_llm=True, original_code=content)
+    except Exception as exc:                                    # noqa: BLE001
+        # Never let a model outage or a bad key fail the webhook -- but say so,
+        # rather than silently reporting "no fix", which is how the RAG subsystem
+        # stayed broken for months.
+        _log_activity("llm_unavailable", {
+            "file": getattr(consumer, "file_path", ""),
+            "err": f"{type(exc).__name__}: {str(exc)[:160]}",
+            "falling_back_to": "no fix",
+        })
+        return content, ""
+    if fix and fix.fixed_code and fix.fixed_code != content:
+        return fix.fixed_code, f"[llm] {fix.explanation}"
+    return content, ""
     
     return content, ""
 

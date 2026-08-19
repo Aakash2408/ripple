@@ -156,6 +156,104 @@ def _reachable_from_entry() -> set:
     return seen
 
 
+#: Safety-relevant code whose reachability is a FUNCTION-level question.
+#:
+#: WHY MODULE GRANULARITY IS NOT ENOUGH
+#: app/fix_generator.py is imported by app/webhook.py for other reasons, so LAYERS
+#: would report it REACHABLE -- and always would have, including for the months the
+#: LLM branch inside it was dead. Measured:
+#:
+#:     app/webhook.py   generate_fix imported: True   referenced anywhere: False
+#:     app/cli.py       calls generate_fixes -> generate_fix   the ONLY live route
+#:
+#: The gate `if use_llm and _llm_key()` lives inside generate_fix(), so setting an
+#: API key in production changed nothing, and a real webhook run confirmed it: every
+#: fix source was [template] or [RAG/template], never [llm]. A module-level gate is
+#: structurally blind to that, which is why the coarseness -- not the wiring -- was
+#: the defect. Reachability here is computed from the CALL GRAPH, reusing the one in
+#: audit_pipeline_governance rather than writing a second: this repository's dominant
+#: failure is one concept implemented twice.
+FUNCTION_LAYERS = {
+    ("fix_generator", "_generate_with_llm"): {
+        "role": "the ONLY path on which customer source code leaves the machine. "
+                "Reached from webhook._generate_fix_with_rag_fallback via "
+                "generate_fix() -- never directly, because the diff contract that "
+                "verifies an LLM patch lives in generate_fix and calling the "
+                "generator straight would bypass it. Gated on a CONFIGURED BACKEND: "
+                "with none, nothing is attempted and no source leaves the process",
+        "reachable": True,
+        "consequence": None,
+        #: The path is declared HOP BY HOP, each hop module-qualified.
+        #:
+        #: The first version asked "is the bare name `_generate_with_llm` in the
+        #: transitive closure of bare callee names?" and a MUTATION EXPOSED IT: with
+        #: the wiring deleted the gate still passed. Cause -- app/capabilities.py:227
+        #: also defines `generate_fix`, and the governance audit's call graph stores
+        #: callees as BARE names, so reaching that unrelated function expanded
+        #: fix_generator.generate_fix too and the LLM branch looked reachable no
+        #: matter what production did.
+        #:
+        #: A gate that cannot be made to fail is not a gate. Each hop is now checked
+        #: inside the CALLER'S OWN MODULE, so a same-named function elsewhere cannot
+        #: satisfy it.
+        "path": (
+            ("webhook", "_generate_fix_with_rag_fallback"),
+            ("fix_generator", "generate_fix"),
+            ("fix_generator", "_generate_with_llm"),
+        ),
+    },
+}
+
+
+def _calls_within(module: str, caller: str, callee: str) -> bool:
+    """Does `module.caller()` contain a call to `callee`, by name?
+
+    Deliberately per-module. Resolving imports fully is a bigger job than this gate
+    needs, but scoping the question to ONE function in ONE file removes the
+    cross-module bare-name collision that made the first version unfalsifiable.
+    """
+    path = os.path.join(APP, f"{module}.py")
+    if not os.path.isfile(path):
+        return False
+    tree = ast.parse(open(path).read(), filename=path)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == caller), None)
+    if fn is None:
+        return False
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
+            if name == callee:
+                return True
+        # `from .fix_generator import generate_fix as _generate_fix` inside the
+        # function body renames the callee; follow the alias so an aliased import
+        # does not read as "not wired". Same blind spot the module-level scanner
+        # had with `from . import x`.
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == callee and a.asname:
+                    for sub in ast.walk(fn):
+                        if isinstance(sub, ast.Call):
+                            g = sub.func
+                            nm = g.id if isinstance(g, ast.Name) else getattr(g, "attr", "")
+                            if nm == a.asname:
+                                return True
+    return False
+
+
+def _function_reachable(target: tuple, spec: dict) -> bool:
+    """Every declared hop must really call the next one, in the caller's module."""
+    hops = spec.get("path") or ()
+    if len(hops) < 2:
+        raise ValueError(f"{target}: 'path' needs at least two hops to verify")
+    for (mod, caller), (_next_mod, callee) in zip(hops, hops[1:]):
+        if not _calls_within(mod, caller, callee):
+            return False
+    return True
+
+
 def main(argv: list) -> int:
     reachable = _reachable_from_entry()
 
@@ -199,6 +297,39 @@ def main(argv: list) -> int:
     print(f"  app modules reachable from {ENTRY}   {len(reachable)}")
     wired = sum(1 for n in LAYERS if n in reachable)
     print(f"  safety layers wired                  {wired} of {len(LAYERS)}")
+
+    # --- function-level layers ------------------------------------------------
+    # Same two-directional rule as above. A branch inside an imported module is
+    # invisible to module granularity, so it is declared and checked separately.
+    entry_fn = f"app/{ENTRY}.py:github_webhook"
+    for (mod, fn), spec in sorted(FUNCTION_LAYERS.items()):
+        try:
+            actually = _function_reachable((mod, fn), spec)
+        except Exception as exc:                                # noqa: BLE001
+            failures.append(
+                f"{mod}.{fn}: the declared path could not be verified ({exc}), so "
+                f"function-level reachability is UNKNOWN. Absence of evidence is "
+                f"not evidence -- this is a failure, not a pass.")
+            continue
+        declared = spec["reachable"]
+        state = "REACHABLE" if actually else "unreachable"
+        print(f"\n  app/{mod}.py:{fn}()")
+        print(f"    role       {spec['role'][:150]}")
+        print(f"    production {state}   (declared "
+              f"{'reachable' if declared else 'unreachable'})")
+        if not declared and not spec["consequence"]:
+            failures.append(
+                f"{mod}.{fn}: declared unreachable with no `consequence` -- "
+                f"'not wired' is not a finding until the cost is stated")
+        elif not declared:
+            print(f"    cost       {spec['consequence'][:150]}")
+        if actually != declared:
+            failures.append(
+                f"{mod}.{fn}: declared "
+                f"{'reachable' if declared else 'unreachable'} but production "
+                f"{'cannot reach it' if declared else 'NOW reaches it'}. Update the "
+                f"declaration -- module granularity cannot see this, so nothing "
+                f"else will tell you.")
 
     if failures:
         print(f"\n  {len(failures)} FAILURE(S):")

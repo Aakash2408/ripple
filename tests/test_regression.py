@@ -5615,5 +5615,168 @@ def test_the_disabled_notice_does_not_claim_something_untrue():
         "the notice no longer says how to re-enable the platform")
 
 
+def test_the_llm_is_reachable_from_the_webhook_but_only_with_a_key():
+    """The LLM path existed, was correct, and production could not reach it.
+
+    Measured before this change:
+
+        app/webhook.py   generate_fix imported: True   referenced anywhere: False
+                         calls _generate_fix_with_rag_fallback instead
+                           -> generate_fix_rag()        no LLM gate
+                           -> _generate_with_template() no LLM gate
+        app/cli.py       calls generate_fixes -> generate_fix   the ONLY live route
+
+    The gate `if use_llm and _llm_key()` lives inside generate_fix(), so setting a
+    key in production changed nothing. Confirmed by a real webhook run: every fix
+    source was [template] or [RAG/template], never [llm]. Sixth appearance of
+    built-tested-CI-gated-unreachable in this repo, and the reachability gate could
+    not see it because fix_generator is imported for other reasons -- module
+    granularity is structurally blind to a branch inside a reachable module.
+
+    THE ROOT CAUSE WAS NOT AN OVERSIGHT. generate_fix() read the consumer file from
+    DISK, which is CLI-shaped; the webhook holds content fetched from an API and has
+    no file to open, so the call would have raised IOError and returned None anyway.
+
+    BYO-KEY IS THE DEFAULT-OFF POSITION. With no key, nothing is attempted and no
+    source leaves the machine -- so "production fixes are deterministic and your
+    code never reaches a model" stays literally true unless a customer opts in.
+    """
+    import inspect
+    import app.webhook as w
+    from app.fix_generator import generate_fix
+
+    # 1. the webhook must actually REACH the guarded function
+    src = inspect.getsource(w._generate_fix_with_rag_fallback)
+    assert "generate_fix(" in src, (
+        "_generate_fix_with_rag_fallback does not call generate_fix, so the LLM "
+        "branch and the diff contract that guards it are both unreachable from "
+        "every platform. Its own docstring already claimed 'Claude LLM (ONLY if "
+        "1-3 all fail)' -- a docstring describing an intention, not the code."
+    )
+
+    # 2. it must pass content, not rely on a file existing on disk
+    params = inspect.signature(generate_fix).parameters
+    assert "original_code" in params, (
+        "generate_fix still only reads from disk. The webhook has no file to open, "
+        "so the call raises IOError and returns None -- unreachable in practice "
+        "even once it is called.")
+    assert params["original_code"].default is None, (
+        "original_code must default to None so the CLI keeps reading from disk")
+
+    # 3. NO BACKEND -> NO ATTEMPT, and a KEYLESS LOCAL backend DOES count.
+    #    is_configured() is key-OR-self-hosted, because a locally run model
+    #    authenticates nothing; gating on a token alone made a self-hosted
+    #    deployment fall silently through to the template.
+    import os as _os
+    _keys = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+    saved = {k: _os.environ.get(k) for k in _keys}
+
+    def _attempts() -> bool:
+        called = []
+        import app.fix_generator as fg
+        real = fg._generate_with_llm
+        fg._generate_with_llm = lambda *a, **k: called.append(1) or ("", "")
+        try:
+            class _C:
+                file_path = "x.ts"
+                language = "typescript"
+            from app.diff_engine import BreakingChange
+            ch = BreakingChange(change_type="removed_field", path="/users",
+                                method="GET", field_name="phoneNumber",
+                                field_type="string", location="body",
+                                severity="breaking", description="x")
+            # CONTENT THE DETERMINISTIC PATH REFUSES. `const a = user.phoneNumber;`
+            # would be fixed by the template and the LLM would never be reached --
+            # which is correct behaviour and would make this test assert nothing.
+            # A constructor parameter plus a shorthand property is the shape
+            # ts_codemod declines, so this exercises the LAST RESORT specifically.
+            refused = (
+                "export class C {\n"
+                "  constructor(private phoneNumber: string) {}\n"
+                "  build() { return { phoneNumber }; }\n"
+                "}\n"
+            )
+            w._generate_fix_with_rag_fallback(refused, _C(), ch, "")
+        finally:
+            fg._generate_with_llm = real
+        return bool(called)
+
+    try:
+        from app.llm_config import is_configured, is_self_hosted
+
+        for k in _keys:
+            _os.environ.pop(k, None)
+        assert not is_configured(), "is_configured() is true with nothing set"
+        assert not _attempts(), (
+            "the LLM was invoked with NO backend configured. Default-off is the "
+            "whole position: without it, customer source can reach a model that "
+            "nobody chose.")
+
+        # a self-hosted endpoint, NO key -- this is the local-model deployment
+        _os.environ["ANTHROPIC_BASE_URL"] = "http://ripple-llm.railway.internal:11434"
+        assert is_self_hosted() and is_configured(), (
+            "a keyless self-hosted base_url is not recognised as configured, so a "
+            "local model would silently never be used")
+        assert _attempts(), (
+            "with a self-hosted backend configured the LLM was still not attempted "
+            "-- the gate and the deployment disagree")
+
+        # the real Anthropic API with NO key must remain OFF: source must never
+        # reach a third party by accident
+        _os.environ["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+        assert not is_configured(), (
+            "a keyless configuration pointing at api.anthropic.com counts as "
+            "configured -- that would send source to a third party with no "
+            "credential and no decision")
+    finally:
+        for k, v in saved.items():
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
+
+    # 4. the diff contract still guards the LLM branch -- wiring must not bypass it
+    gsrc = inspect.getsource(generate_fix)
+    assert "_diff_check" in gsrc or "diff_contract" in gsrc, (
+        "generate_fix no longer applies the diff contract, so an LLM patch could "
+        "reach a PR unverified -- the defect the line-based fallback had.")
+
+
+def test_the_llm_path_is_declared_in_the_reachability_gate():
+    """Module-level reachability is structurally blind to this, so it is declared.
+
+    app/fix_generator.py is imported by app/webhook.py for other reasons, so the
+    existing LAYERS table reports it reachable and always would have -- including
+    while the LLM branch inside it was dead. That coarseness is exactly why this
+    went unnoticed, and the fix is a FUNCTION-level declaration rather than a
+    finer-grained guess.
+
+    The gate fails in BOTH directions, as the module-level one does: a declared-
+    reachable function becoming unreachable is a regression, and a declared-
+    unreachable one becoming reachable forces someone to delete the consequence
+    text and state what is now true.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import audit_safety_reachability as R
+
+    assert hasattr(R, "FUNCTION_LAYERS"), (
+        "the reachability gate has no FUNCTION_LAYERS table, so a safety-relevant "
+        "branch inside an imported module cannot be declared at all")
+    key = ("fix_generator", "_generate_with_llm")
+    assert key in R.FUNCTION_LAYERS, (
+        f"{key} is not declared. The LLM branch is safety-relevant: it is the only "
+        f"path on which customer source leaves the machine.")
+    entry = R.FUNCTION_LAYERS[key]
+    assert entry.get("role"), "the declaration has no stated role"
+    if entry.get("reachable"):
+        assert not entry.get("consequence"), (
+            "a reachable layer must not still carry a consequence for being "
+            "unreachable -- delete it and say what is true now")
+    else:
+        assert entry.get("consequence"), (
+            "an unreachable layer must name its cost, or the declaration is just "
+            "a note")
+
+
 if __name__ == "__main__":
     sys.exit(_main())

@@ -34,29 +34,44 @@ def generate_fix(
     consumer: ConsumerMatch,
     breaking_change: BreakingChange,
     use_llm: bool = True,
+    original_code: str | None = None,
 ) -> Optional[GeneratedFix]:
     """
     Generate a fix for a consumer affected by a breaking change.
-    
+
     Strategy:
-    1. Read the full consumer file
-    2. Send to Claude: "This API changed. Fix this consumer code."
-    3. Return the fixed code + diff
+    1. Obtain the consumer's current code
+    2. LLM if a key is configured and the operation is briefed, else the template
+    3. Verify against the diff contract, then return the fixed code + diff
+
+    `original_code` EXISTS BECAUSE THIS FUNCTION WAS CLI-SHAPED. It only ever read
+    from disk, so app/webhook.py -- which holds content fetched from a platform API
+    and has no local file -- could not call it: the open() would raise IOError and
+    it would return None. That is why the LLM branch, the one thing gated by
+    `use_llm and _llm_key()`, was unreachable from every webhook. Passing content
+    explicitly is what makes the guarded path usable from a request, and the
+    default of None keeps the CLI reading from disk exactly as before.
     """
-    # Read the consumer file
-    try:
-        with open(consumer.file_path, "r") as f:
-            original_code = f.read()
-    except IOError:
-        return None
+    # Read the consumer file only when the caller has not supplied its content.
+    if original_code is None:
+        try:
+            with open(consumer.file_path, "r") as f:
+                original_code = f.read()
+        except IOError:
+            return None
     
     # Gate on the SAME resolution the call site uses. Reading
     # ANTHROPIC_API_KEY here while _generate_with_llm builds its client from
     # llm_config.api_key() meant an ANTHROPIC_AUTH_TOKEN setup fell through to
     # the template silently -- the gate and the call disagreed about whether a
     # key existed.
-    from .llm_config import api_key as _llm_key
-    if use_llm and _llm_key():
+    #
+    # is_configured() rather than api_key(): a SELF-HOSTED model authenticates
+    # nothing, so keying the gate on a token would make a local deployment fall
+    # through to the template for the same reason. Reaching the real Anthropic API
+    # still requires a key, so nothing can be sent to a third party by accident.
+    from .llm_config import is_configured as _llm_ready
+    if use_llm and _llm_ready():
         fixed_code, explanation = _generate_with_llm(
             original_code, consumer, breaking_change
         )

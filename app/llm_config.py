@@ -72,8 +72,30 @@ def is_anthropic() -> bool:
     return urlparse(base_url()).netloc.endswith("anthropic.com")
 
 
+def is_self_hosted() -> bool:
+    """True when ANTHROPIC_BASE_URL points somewhere other than Anthropic.
+
+    A locally run model -- Ollama, llama.cpp's server, a LiteLLM proxy, or a
+    sidecar service on a private network -- authenticates nothing. Requiring a key
+    for those would make a self-hosted deployment silently fall through to the
+    deterministic template, which is the shape where the gate and the call site
+    disagreed about whether a key existed.
+    """
+    return bool(os.environ.get("ANTHROPIC_BASE_URL", "").strip()) and not is_anthropic()
+
+
 def is_configured() -> bool:
-    return bool(api_key())
+    """Is there a backend to talk to at all?
+
+    KEY *OR* SELF-HOSTED, NOT KEY ALONE. This returned bool(api_key()), so a local
+    model reachable at ANTHROPIC_BASE_URL was indistinguishable from no LLM at all.
+
+    The asymmetry is deliberate and is the safety property: reaching the real
+    Anthropic API still requires a key, so no source code can be sent to a
+    third-party provider by accident. A keyless configuration is only accepted when
+    the operator has explicitly named a different host -- i.e. their own.
+    """
+    return bool(api_key()) or is_self_hosted()
 
 
 def backend_label() -> str:
