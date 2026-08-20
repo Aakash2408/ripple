@@ -52,6 +52,28 @@ from typing import Optional
 
 
 # --------------------------------------------------------------- data model
+#: Who taught us this, ordered. A LOWER rank may never replace a HIGHER one's
+#: prescriptive content.
+#:
+#: WHY A RANK AND NOT A TIMESTAMP
+#: add_pattern() merged by identity and only ever set `source_file` when empty, so
+#: `strategy` was decided by whichever write happened FIRST and never revisited.
+#: That is arbitrary rather than a rule: a guess folded in from the corpus could
+#: permanently define the approach for a field a reviewer had already corrected by
+#: hand, and the store would get less accurate as it saw more data.
+#:
+#:   human_edit    a reviewer changed Ripple's patch before merging it
+#:   merged_clean  merged with zero human edits -- the world confirmed it
+#:   rejected      closed unmerged -- confirmed negative
+#:   inferred      derived from similarity/clustering; never observed
+PROVENANCE_RANK = {
+    "human_edit": 3,
+    "merged_clean": 2,
+    "rejected": 1,
+    "inferred": 0,
+}
+
+
 @dataclass
 class FixPattern:
     """An aggregated fix strategy, scored by retrieve_fix_pattern().
@@ -74,6 +96,9 @@ class FixPattern:
     reject_count: int = 0       # PRs using this pattern that were closed
     last_used: float = 0.0      # epoch seconds
     example_count: int = 1      # how many observed examples folded in
+    #: Who taught us this -- see PROVENANCE_RANK. Defaults to the LOWEST rank so an
+    #: unlabelled write can never outrank an observed one by omission.
+    provenance: str = "inferred"
 
 
 @dataclass
@@ -162,17 +187,81 @@ class PatternStore:
         raw = f"{change_type}|{language}|{field_name}"
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
+    @staticmethod
+    def _merge_ratio(p) -> float:
+        total = (p.merge_count or 0) + (p.reject_count or 0)
+        return (p.merge_count / total) if total else 0.0
+
+    @classmethod
+    def _may_replace_strategy(cls, incoming, existing) -> bool:
+        """May `incoming` redefine `existing`'s prescriptive content?
+
+        Rank decides first. At EQUAL rank the better merge ratio wins, except that
+        ratios within 0.1 count as equal and the newer write takes it -- lifted from
+        the semantic-conflict rule in KiroCrew's memory store, and worth copying
+        because without the epsilon two near-identical confidences flip the stored
+        strategy back and forth on every webhook.
+
+        THE RATIO ONLY DISCRIMINATES WHEN BOTH SIDES HAVE OBSERVATIONS. A fresh
+        write carries no counters, so comparing its 0.0 against an accumulated
+        0.5 rejected it -- which meant a NEW human correction could not replace an
+        older one, and the ladder's top rank was effectively frozen after its first
+        write. A correction is an instruction, not a statistical claim: with no
+        evidence on the incoming side the ranks are equal and the newer wins.
+        """
+        new_rank = PROVENANCE_RANK.get(incoming.provenance, 0)
+        old_rank = PROVENANCE_RANK.get(existing.provenance, 0)
+        if new_rank != old_rank:
+            return new_rank > old_rank
+
+        incoming_total = (incoming.merge_count or 0) + (incoming.reject_count or 0)
+        existing_total = (existing.merge_count or 0) + (existing.reject_count or 0)
+        if not incoming_total or not existing_total:
+            return True        # no comparable evidence -> equal -> newer wins
+
+        delta = cls._merge_ratio(incoming) - cls._merge_ratio(existing)
+        return True if abs(delta) <= 0.1 else delta > 0
+
     def add_pattern(self, pattern) -> str:
-        """Add or merge a pattern by identity (change_type/language/field)."""
+        """Add or merge a pattern by identity (change_type/language/field).
+
+        COUNTERS AND STRATEGY ARE TREATED DIFFERENTLY, ON PURPOSE.
+
+        merge_count / reject_count / example_count are OBSERVATIONS of the world and
+        accumulate from any source, including a lower-ranked one -- a rejection is a
+        fact regardless of who noticed it. `strategy` (and the rename/retype fields
+        that go with it) is an OPINION, and only an equal-or-higher provenance may
+        replace it.
+
+        Conflating the two would mean either discarding real outcome evidence or
+        letting a corpus guess redefine a fix a human already corrected.
+        """
         with self._lock:
             self.load()
             for existing in self.patterns:
                 if existing.pattern_id == pattern.pattern_id:
+                    # --- evidence: always accumulates -------------------------
                     existing.example_count += pattern.example_count
                     existing.merge_count += pattern.merge_count
                     existing.reject_count += pattern.reject_count
                     existing.last_used = max(existing.last_used, pattern.last_used)
-                    if not existing.source_file:
+
+                    # --- opinion: gated by the ladder -------------------------
+                    if self._may_replace_strategy(pattern, existing):
+                        if pattern.strategy:
+                            existing.strategy = pattern.strategy
+                        if pattern.new_field_name:
+                            existing.new_field_name = pattern.new_field_name
+                        if pattern.new_type:
+                            existing.new_type = pattern.new_type
+                        if pattern.source_file:
+                            existing.source_file = pattern.source_file
+                        if PROVENANCE_RANK.get(pattern.provenance, 0) >= \
+                                PROVENANCE_RANK.get(existing.provenance, 0):
+                            existing.provenance = pattern.provenance
+                    elif not existing.source_file:
+                        # A representative file is not prescriptive, so a lower rank
+                        # may still fill it in when nothing is there.
                         existing.source_file = pattern.source_file
                     return existing.pattern_id
             self.patterns.append(pattern)

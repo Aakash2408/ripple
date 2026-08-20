@@ -633,6 +633,12 @@ async def bitbucket_webhook(request: FastAPIRequest):
     # Rate limit
     org = event["workspace"]
     limiter = get_rate_limiter()
+    # Total admission fetches for THIS webhook, across every consumer search.
+    # Separate ceiling from _CANDIDATE_WINDOW: the window bounds how far down one
+    # search result we look, this bounds the total cost of the whole delivery.
+    # Same reason the GitHub path carries tree_budget -- without it a wide scope
+    # issues hundreds of rapid requests and the connection is dropped mid-run.
+    _admission_budget = {"remaining": int(os.environ.get("RIPPLE_ADMISSION_BUDGET", "60"))}
     allowed, reason = limiter.check(org)
     if not allowed:
         return {"status": "rate_limited", "reason": reason}
@@ -734,14 +740,30 @@ async def bitbucket_webhook(request: FastAPIRequest):
                     })
                     continue
 
-                consumers = client.search_code(event["workspace"], event["repo_slug"], change.path)
-                for consumer in consumers[:5]:
-                    consumer_path = consumer.get("path", "")
-                    if consumer_path == spec_path or not consumer_path:
-                        continue
-                    consumer_content = client.get_file(event["workspace"], event["repo_slug"], consumer_path)
-                    if not consumer_content:
-                        continue
+                # ADMISSION BEFORE THE CUT -- see the GitLab path for why the order
+                # matters. `consumers[:5]` let the platform's search relevance
+                # decide which files Ripple would read at all.
+                candidates = [
+                    c.get("path", "")
+                    for c in client.search_code(event["workspace"],
+                                                event["repo_slug"], change.path)
+                    if c.get("path") and c.get("path") != spec_path
+                ]
+                admitted = _admit_consumers(
+                    candidates,
+                    lambda p: client.get_file(event["workspace"],
+                                             event["repo_slug"], p),
+                    field_name=change.field_name,
+                    language_of=_detect_lang,
+                    max_consumers=5,
+                    budget=_admission_budget,
+                )
+                _log_activity("consumers_admitted", {
+                    "platform": "bitbucket", "field": change.field_name,
+                    "candidates": len(candidates), "admitted": len(admitted),
+                    "strengths": [round(s, 2) for _p, _c, s in admitted],
+                })
+                for consumer_path, consumer_content, _strength in admitted:
                     run.consumer_found(consumer_path)
                     from .consumer_finder import ConsumerMatch
                     consumer_match = ConsumerMatch(
@@ -797,6 +819,13 @@ async def bitbucket_webhook(request: FastAPIRequest):
                             prs_created.append(pr_url)
                             run.pr_created(pr_url, consumer_path,
                                            validated=bool(_validated))
+                            _record_pr_provenance(
+                                pr_url, platform="bitbucket",
+                                repo=f"{event['workspace']}/{event['repo_slug']}",
+                                change=change, consumer_file=consumer_path,
+                                language=_detect_lang(consumer_path),
+                                explanation=explanation, validated=_validated,
+                                level=decision.level.value)
                             limiter.record_pr_opened(org)
                         else:
                             run.refused(consumer_path,
@@ -850,6 +879,12 @@ async def gitlab_webhook(request: FastAPIRequest):
     # Rate limit check
     org = event["project_name"].split("/")[0] if "/" in event["project_name"] else "unknown"
     limiter = get_rate_limiter()
+    # Total admission fetches for THIS webhook, across every consumer search.
+    # Separate ceiling from _CANDIDATE_WINDOW: the window bounds how far down one
+    # search result we look, this bounds the total cost of the whole delivery.
+    # Same reason the GitHub path carries tree_budget -- without it a wide scope
+    # issues hundreds of rapid requests and the connection is dropped mid-run.
+    _admission_budget = {"remaining": int(os.environ.get("RIPPLE_ADMISSION_BUDGET", "60"))}
     allowed, reason = limiter.check(org)
     if not allowed:
         return {"status": "rate_limited", "reason": reason}
@@ -946,16 +981,31 @@ async def gitlab_webhook(request: FastAPIRequest):
                     })
                     continue
 
-                # Search for consumers in the same project
-                consumers = client.search_code(event["project_id"], change.path)
-                for consumer in consumers[:5]:
-                    consumer_path = consumer.get("path", "")
-                    if consumer_path == spec_path:
-                        continue
-                    # Fetch consumer content
-                    consumer_content = client.get_file(event["project_id"], consumer_path)
-                    if not consumer_content:
-                        continue
+                # Search for consumers in the same project.
+                #
+                # ADMISSION BEFORE THE CUT. This used to be `consumers[:5]`, so
+                # GitLab's own search relevance decided which five files Ripple
+                # would even READ and nothing scored them -- a real reference at
+                # position 6 was dropped without ever being fetched. Now a bounded
+                # window is read, scored with the real matcher, admitted on match
+                # strength, ranked, and only then capped.
+                candidates = [c.get("path", "")
+                              for c in client.search_code(event["project_id"], change.path)
+                              if c.get("path") and c.get("path") != spec_path]
+                admitted = _admit_consumers(
+                    candidates,
+                    lambda p: client.get_file(event["project_id"], p),
+                    field_name=change.field_name,
+                    language_of=_detect_lang,
+                    max_consumers=5,
+                    budget=_admission_budget,
+                )
+                _log_activity("consumers_admitted", {
+                    "platform": "gitlab", "field": change.field_name,
+                    "candidates": len(candidates), "admitted": len(admitted),
+                    "strengths": [round(s, 2) for _p, _c, s in admitted],
+                })
+                for consumer_path, consumer_content, _strength in admitted:
                     run.consumer_found(consumer_path)
                     consumer_match = ConsumerMatch(
                         file_path=consumer_path, line_number=0, code_snippet="",
@@ -1015,6 +1065,13 @@ async def gitlab_webhook(request: FastAPIRequest):
                             mrs_created.append(mr_url)
                             run.pr_created(mr_url, consumer_path,
                                            validated=bool(_validated))
+                            _record_pr_provenance(
+                                mr_url, platform="gitlab",
+                                repo=event["project_name"], change=change,
+                                consumer_file=consumer_path,
+                                language=_detect_lang(consumer_path),
+                                explanation=explanation, validated=_validated,
+                                level=decision.level.value)
                             limiter.record_pr_opened(org)
                         else:
                             run.refused(consumer_path,
@@ -1723,6 +1780,12 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
                             # so RESOLVED stays unreachable for the same reason AUTO does.
                             run.pr_created(pr_url, consumer_file,
                                            validated=bool(_validated))
+                            _record_pr_provenance(
+                                pr_url, platform="github", repo=consumer_repo,
+                                change=change, consumer_file=consumer_file,
+                                language=_detect_lang(consumer_file),
+                                explanation=explanation, validated=_validated,
+                                level=decision.level.value)
                             # Track for lifecycle (pending -> merged -> reverted)
                             try:
                                 from .pr_lifecycle import (
@@ -2072,6 +2135,252 @@ def _fix_title(change) -> str:
     return fix_title(change)
 
 
+#: How many search hits to consider before admitting. The platform's search order
+#: is a relevance guess made without reading the files, so looking only at its top
+#: few makes that guess final. Bounded because admission needs evidence and evidence
+#: needs a fetch.
+_CANDIDATE_WINDOW = 25
+
+#: Match strength required to admit a candidate at all. Below this the file mentions
+#: the word without referencing the field -- prose, a changelog, a comment.
+_ADMIT_FLOOR = 0.5
+
+
+#: Relevance-vs-diversity balance for the cap allocation. 0.6 matches the value
+#: KiroCrew's episodic MMR settled on; 1.0 disables diversity entirely.
+_MMR_LAMBDA = 0.6
+
+
+def _path_tokens(path: str) -> set:
+    """Tokens for path similarity: the DIRECTORY only, filename excluded.
+
+    The question MMR is answering is "is this the same package as one I already
+    picked", and the filename is noise against it. Measured on a real case:
+
+        picked  packages/checkout/src/client.ts
+        cart.ts        jaccard 0.667   <- SAME package, should be ~1.0
+        summary.ts     jaccard 0.429   <- different package
+
+    Including `client` / `cart` / `summary` made two files in one package look
+    two-thirds similar instead of identical, and that compressed gap let a 0.94
+    strength beat a 0.70 from an uncovered package -- so every slot went to
+    `checkout` and the `reporting` reviewer was never told. Dropping the filename
+    gives 1.0 vs 0.5 and the trade works as intended.
+
+    Directory segments are kept whole rather than split on separators for the same
+    reason: `packages` and `src` appear in every candidate, so they add a constant
+    to every pair and only dilute the part that discriminates.
+    """
+    import posixpath
+    directory = posixpath.dirname((path or "").lower())
+    return {seg for seg in directory.split("/") if seg}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def _mmr_rerank(scored: list, limit: int, lambda_: float = _MMR_LAMBDA) -> list:
+    """Greedy Maximal Marginal Relevance over PATH similarity.
+
+    WHAT THIS DOES AND DOES NOT DO
+    ------------------------------
+    It does NOT improve recall. Admission (see _admit_consumers) recovers candidates
+    the platform's search order hid -- files that were never fetched and so were
+    genuinely lost. This function only runs when MORE candidates were admitted than
+    the cap allows, and every one of them is a real consumer that needs fixing.
+    Dropping one is a loss either way; MMR only decides which loss.
+
+    The choice it makes is breadth over depth: covering two packages beats five
+    files in one. A reviewer in `reporting` never hearing that the contract changed
+    is worse than a reviewer in `checkout` getting three PRs instead of five,
+    because Ripple opens one PR per file and the extra PRs land in front of the same
+    person.
+
+    JACCARD OVER PATH TOKENS, NOT CONTENT. Two files in one package usually share
+    the fix and the reviewer. Two files with similar CONTENT in different packages
+    are two genuine consumers that both need changing, so content similarity would
+    suppress exactly what should be kept.
+
+    NO EMBEDDINGS. Set overlap on path segments needs no model, no vector store and
+    no network -- which matters because the production image was deliberately cut
+    from 5.4 GB to 348 MB by removing an embedding stack.
+
+    Below the cap this is the identity function on the strength ordering: with
+    nothing being dropped there is no trade to make, and second-guessing the ranking
+    would only add noise.
+    """
+    ranked = sorted(scored or [], key=lambda row: row[2], reverse=True)
+    if len(ranked) <= limit or limit <= 0:
+        return ranked[:limit] if limit > 0 else []
+    if lambda_ >= 1.0:
+        return ranked[:limit]
+
+    remaining = list(ranked)
+    # The strongest candidate is always taken first. A diversity pass that can
+    # displace the best match is a bug, not a preference.
+    picked = [remaining.pop(0)]
+    picked_tokens = [_path_tokens(picked[0][0])]
+
+    while remaining and len(picked) < limit:
+        best_i, best_score = 0, None
+        for i, (path, _content, strength) in enumerate(remaining):
+            tokens = _path_tokens(path)
+            redundancy = max((_jaccard(tokens, t) for t in picked_tokens),
+                             default=0.0)
+            score = lambda_ * strength - (1.0 - lambda_) * redundancy
+            if best_score is None or score > best_score:
+                best_i, best_score = i, score
+        chosen = remaining.pop(best_i)
+        picked.append(chosen)
+        picked_tokens.append(_path_tokens(chosen[0]))
+    return picked
+
+
+def _admit_consumers(candidates, fetch, *, field_name: str, language_of,
+                     max_consumers: int, budget: dict,
+                     candidate_window: int = _CANDIDATE_WINDOW) -> list:
+    """Read a bounded window of candidates, ADMIT on match strength, then cap.
+
+    WHY THE ORDER MATTERS
+    ---------------------
+    GitLab and Bitbucket did:
+
+        consumers = client.search_code(...)
+        for consumer in consumers[:5]:
+
+    so the platform's own search relevance decided which five files Ripple would
+    even READ, and nothing scored them. A file that genuinely references the changed
+    field could sit at position 6 and never be fetched, while five weak hits above
+    it consumed every slot. The loss was invisible: Ripple never saw the file it
+    dropped.
+
+    KiroCrew's memory store solves the same shape by admitting on the RAW score
+    BEFORE the decay ranking, the MMR pass and the `limit` cut, exactly so "a highly
+    relevant but old memory cannot be ordered past `limit` by a cluster of
+    recent-but-irrelevant rows". Ordering is a preference; admission is a
+    correctness property. Doing them in the wrong order loses candidates silently,
+    which is the worst way to lose them.
+
+    THE BUDGET IS NOT ADVISORY
+    --------------------------
+    Admission costs one fetch per candidate considered, so a wide installation scope
+    would otherwise issue hundreds of rapid requests and have the connection dropped
+    mid-run -- the same failure the GitHub path's `tree_budget` already guards. The
+    window and the budget are two separate ceilings on purpose: the window bounds how
+    far down one repo's list we look, the budget bounds the total across repos.
+
+    Returns [(path, content, strength)] ordered strongest first, at most
+    `max_consumers` long. Content is returned because it was already fetched --
+    re-reading it in the caller would double the API cost of the admission.
+    """
+    from .smart_consumer_finder import find_matches_in_file
+
+    scored = []
+    for path in list(candidates or [])[:candidate_window]:
+        if budget is not None and budget.get("remaining", 0) <= 0:
+            _log_activity("admission_budget_exhausted", {
+                "field": field_name, "considered": len(scored),
+                "note": "remaining candidates were never read, so they are unknown "
+                        "rather than rejected",
+            })
+            break
+        if budget is not None:
+            budget["remaining"] -= 1
+        try:
+            content = fetch(path)
+        except Exception:                                       # noqa: BLE001
+            content = ""
+        if not content:
+            continue
+        try:
+            matches = find_matches_in_file(
+                content, path, field_name, language_of(path))
+        except Exception as exc:                                # noqa: BLE001
+            _log_activity("admission_scoring_failed", {
+                "file": path, "err": f"{type(exc).__name__}: {str(exc)[:120]}"})
+            continue
+        if not matches:
+            continue
+        strength = max(getattr(m, "confidence", 0.0) or 0.0 for m in matches)
+        if strength < _ADMIT_FLOOR:
+            continue
+        scored.append((path, content, strength))
+
+    # Rank AFTER admission; allocate the cap via MMR so one package cannot consume
+    # every slot. Placed HERE rather than at each call site: both platforms go
+    # through this function, and a step every caller must remember is the shape that
+    # let the line-based fallback bypass the diff contract.
+    return _mmr_rerank(scored, max_consumers)
+
+
+def _record_pr_provenance(pr_url: str, *, platform: str, repo: str, change,
+                          consumer_file: str, language: str, explanation: str,
+                          validated, level: str) -> None:
+    """Remember what produced this PR, so its outcome can be attributed later.
+
+    ONE writer, three call sites -- the shape that stopped the governed decision
+    from drifting. A copied ledger write would rot on whichever platform nobody
+    updates, and an unattributable merge teaches Ripple nothing.
+
+    `source` is derived from the explanation prefix the generators already emit
+    ("[RAG/...]", "[template]", "[llm]") rather than passed in, because the caller
+    that knows the prefix is the caller that would forget the argument. A template
+    fix has no pattern to credit on merge -- that is a fact the outcome handler
+    needs stated, not a gap for it to infer.
+    """
+    from . import pr_ledger
+
+    expl = explanation or ""
+    if expl.startswith("[RAG/"):
+        source, pattern_id = "pattern", _pattern_id_from_explanation(expl)
+    elif expl.startswith("[llm]"):
+        source, pattern_id = "llm", ""
+    else:
+        source, pattern_id = "template", ""
+
+    try:
+        pr_ledger.record_open(
+            pr_url,
+            pattern_id=pattern_id,
+            source=source,
+            change_type=_map_change_type(change),
+            language=language,
+            field_name=change.field_name,
+            consumer_file=consumer_file,
+            repo=repo,
+            validated=validated,
+            level=level,
+        )
+    except Exception as exc:                                    # noqa: BLE001
+        # Never fail an opened PR because the ledger could not be written -- but
+        # say so, because a silent miss is an outcome that can never be attributed
+        # and the whole point of this module is that such misses are visible.
+        _log_activity("provenance_write_failed", {
+            "platform": platform, "pr": pr_url,
+            "err": f"{type(exc).__name__}: {str(exc)[:120]}",
+        })
+
+
+def _pattern_id_from_explanation(explanation: str) -> str:
+    """Best-effort pattern id out of a "[RAG/pattern] ..." explanation.
+
+    Returns "" when the prefix carries no id, which the outcome handler treats as
+    "attributable to no pattern" rather than guessing one. Stage 3 replaces this
+    with the id threaded through from the retriever; until then an empty id is
+    honest and a wrong id would corrupt a real pattern's counters.
+    """
+    import re as _re
+    match = _re.match(r"\[RAG/([^\]]+)\]", explanation or "")
+    if not match:
+        return ""
+    token = match.group(1).strip()
+    return "" if token in ("template", "cluster", "pattern") else token
+
+
 def _govern_consumer_fix(*, platform: str, repo: str, consumer_file: str,
                          fixed_code: str, tree, language: str, contract: str,
                          change_type: str, confidence: float,
@@ -2240,85 +2549,248 @@ def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:
     return ""
 
 
-def _handle_pr_merged(payload: dict, pr: dict) -> dict:
+def _outcome_is_contaminated(pr: dict, row) -> tuple:
+    """(contaminated, reason). Can this outcome be used as a training example?
+
+    A merge only teaches something when you can tell WHICH part of the final state
+    was Ripple's fix. When you cannot, the honest move is to record the outcome and
+    derive nothing -- an unattributable sample becomes confident noise, which is
+    worse than an absent one.
+
+    KiroCrew's analogue is refusing to synthesise a skill from any session that
+    touched credentials: discard the sample entirely rather than partially trust it.
+
+    Deliberately conservative on missing data. An absent `changed_files` or an
+    absent commit count reads as contaminated, the same direction as
+    `validated=None -> REVIEW` -- "we could not check" must never pass as "it is
+    fine".
     """
-    When a Ripple-generated PR gets merged, learn from it.
-    This is how Ripple gets smarter over time — every merge confirms a pattern.
+    if not row:
+        return True, "no provenance row -- attribution would be a guess"
+
+    commits = pr.get("commits")
+    if not isinstance(commits, int):
+        return True, "commit count absent -- cannot tell a clean merge from a squash"
+    if commits > 2:
+        return True, f"squashed or extended into {commits} commits"
+
+    changed = pr.get("changed_files")
+    if not isinstance(changed, int):
+        return True, "changed_files absent -- cannot bound the edit to the fix"
+    if changed > 1:
+        return True, (f"{changed} files changed but Ripple proposed 1 "
+                      f"({row.get('consumer_file', '?')}) -- edits went beyond the "
+                      f"field's references")
+    return False, ""
+
+
+def _derive_pattern_from_clean_merge(row: dict, repo: str) -> str:
+    """Create a FixPattern from a clean merge that had no pattern to credit.
+
+    WHY THIS EXISTS. A template-generated fix carries no pattern_id, and the
+    deterministic template produces nearly every fix Ripple makes. Without this the
+    store would only ever accumulate evidence about patterns it ALREADY had, while
+    the ledger filled up with merges it learned nothing from.
+
+    Provenance is `merged_clean`, not `inferred`: the approach was confirmed on a
+    real repository by a human accepting it unchanged. That rank is what stops a
+    later corpus guess from redefining it.
+
+    Returns the pattern id, or "" when the row lacks the identity fields.
     """
-    # Only learn from Ripple's own PRs
-    pr_body = pr.get("body", "")
-    if "Generated by" not in pr_body and "Ripple" not in pr_body:
-        return {"status": "ignored", "reason": "not a Ripple PR"}
-    
+    from .rag_store import rag_store, FixPattern
+
+    change_type = row.get("change_type") or ""
+    language = row.get("language") or ""
+    field_name = row.get("field_name") or ""
+    if not change_type or not language:
+        return ""
+
+    pid = rag_store.make_pattern_id(change_type, language, field_name)
+    rag_store.add_pattern(FixPattern(
+        pattern_id=pid,
+        change_type=change_type,
+        language=language,
+        field_name=field_name,
+        strategy=f"{change_type} in {language} -- merged unchanged by a reviewer",
+        source_file=row.get("consumer_file", "") or "",
+        repo=repo,
+        merge_count=1,
+        last_used=_time.time(),
+        example_count=1,
+        provenance="merged_clean",
+    ))
+    rag_store.save()
+    return pid
+
+
+def _pr_had_human_edits(pr: dict) -> bool:
+    """Did anyone other than Ripple touch this PR before it merged?
+
+    Ripple pushes exactly one commit. More than one commit, or any commit whose
+    author is not the App, means a human intervened -- and a merge a human had to
+    rescue is NOT evidence the pattern worked. Counting it as a success is how a
+    learning loop becomes confidently wrong.
+
+    Defaults to True when the payload carries no commit information: an unknown
+    provenance must not be credited as a clean merge. Same direction as
+    `validated=None -> REVIEW`.
+    """
+    commits = pr.get("commits")
+    if isinstance(commits, int):
+        if commits != 1:
+            return True
+    elif commits is None:
+        return True
+
+    for commit in pr.get("commit_list", []) or []:
+        login = ((commit.get("author") or {}).get("login") or "").lower()
+        if login and "ripple" not in login and not login.endswith("[bot]"):
+            return True
+    return False
+
+
+def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
+    """The four outcome classes, attributed through the provenance ledger.
+
+    THE LEDGER IS THE IDENTITY CHECK. This used to be
+
+        if "Generated by" not in pr_body and "Ripple" not in pr_body:
+
+    a substring scan of text a human writes, which matches any PR that merely
+    MENTIONS Ripple -- so a stranger's merge could raise a real pattern's
+    confidence. No ledger row now means not ours, and the honest response is to
+    record nothing.
+
+    THE CALL THIS REPLACES WAS BROKEN, NOT MISSING. `_handle_pr_merged` called
+    `learn_from_merged_pr(trigger_diff=..., fix_diff=..., language=...,
+    field_name=..., change_type=..., store=...)` against a function whose entire
+    signature is `(pattern_id)`. Every merged PR raised TypeError, the bare except
+    swallowed it, and no activity event fired because the log line sat after the
+    failing call. The RAG store's 0 patterns were the symptom.
+    """
+    from . import pr_ledger
+
+    pr_url = pr.get("html_url") or pr.get("url") or ""
     repo = payload.get("repository", {}).get("full_name", "")
-    org = repo.split("/")[0] if "/" in repo else "unknown"
-    
-    try:
-        from .rag_engine import RagStore, FixExample
-        from .rag_retriever import learn_from_merged_pr
-        
-        store = RagStore(collection_name=f"ripple_{org}")
-        
-        # Extract fix info from PR
-        title = pr.get("title", "")
-        files_changed = [f.get("filename", "") for f in pr.get("files", [])] if "files" in pr else []
-        
-        # Record the successful pattern
-        learn_from_merged_pr(
-            trigger_diff=title,
-            fix_diff=f"Merged: {title} ({len(files_changed)} files)",
-            language=_detect_lang(files_changed[0]) if files_changed else "unknown",
-            field_name=_extract_field_from_title(title),
-            change_type=_extract_change_type_from_title(title),
-            store=store,
-        )
-        
-        _log_activity("pr_merged_learned", {"pr": pr.get("number"), "repo": repo})
-        return {
-            "status": "learned",
-            "pr": pr.get("number"),
-            "repo": repo,
-            "message": f"Ripple learned from merged PR #{pr.get('number')}. Pattern confidence boosted.",
-        }
-    except Exception as e:
-        return {"status": "learn_error", "reason": str(e)[:100]}
+    row = pr_ledger.lookup(pr_url)
+
+    if row is None:
+        # Unattributable. Record NOTHING -- a guess corrupts a real pattern.
+        _log_activity("pr_closed_unattributed", {
+            "pr": pr.get("number"), "repo": repo, "merged": merged,
+            "reason": "no provenance row -- not a Ripple PR, or opened before the "
+                      "ledger existed",
+        })
+        return {"status": "unattributed", "pr": pr.get("number"), "repo": repo}
+
+    if not merged:
+        outcome = "rejected"
+    elif _pr_had_human_edits(pr):
+        outcome = "merged_with_edits"
+    else:
+        outcome = "merged_clean"
+
+    pr_ledger.record_outcome(pr_url, outcome, {
+        "repo": repo, "pattern_id": row.get("pattern_id", ""),
+        "source": row.get("source", ""), "level": row.get("level", ""),
+        "validated": row.get("validated"),
+    })
+
+    # Only a CLEAN merge or a rejection moves a pattern's counters. A
+    # merged-with-edits outcome is recorded above but deliberately does not
+    # increment merge_count: the pattern did not work as proposed.
+    #
+    # A contaminated sample is recorded and then dropped: the ledger's audit trail
+    # stays true while the pattern store learns nothing it cannot attribute.
+    contaminated, contamination_reason = _outcome_is_contaminated(pr, row)
+    pattern_id = row.get("pattern_id") or ""
+    credited = False
+    derived = ""
+
+    if contaminated:
+        _log_activity("outcome_not_learnable", {
+            "pr": pr.get("number"), "repo": repo, "outcome": outcome,
+            "reason": contamination_reason,
+        })
+    elif outcome == "merged_with_edits" and pattern_id:
+        # The reviewer's edit is the higher-value artefact, and capturing its
+        # CONTENT needs the PR diff, which this handler does not fetch. What it can
+        # do without guessing is raise the pattern's provenance so no later corpus
+        # guess overwrites a strategy a human has already been through.
+        try:
+            from .rag_store import rag_store
+            for p in rag_store.patterns:
+                if p.pattern_id == pattern_id:
+                    p.provenance = "human_edit"
+                    rag_store.save()
+                    break
+            _log_activity("pattern_protected_by_human_edit", {
+                "pr": pr.get("number"), "pattern": pattern_id,
+                "note": "provenance raised to human_edit; the edit CONTENT was not "
+                        "captured (needs the PR diff)",
+            })
+        except Exception as exc:                                # noqa: BLE001
+            _log_activity("learn_error", {
+                "pr": pr.get("number"), "pattern": pattern_id,
+                "err": f"{type(exc).__name__}: {str(exc)[:160]}"})
+    elif pattern_id and outcome in ("merged_clean", "rejected"):
+        try:
+            from .rag_retriever import learn_from_merged_pr, learn_from_rejected_pr
+            if outcome == "merged_clean":
+                learn_from_merged_pr(pattern_id)
+            else:
+                learn_from_rejected_pr(pattern_id)
+            credited = True
+        except Exception as exc:                                # noqa: BLE001
+            # LOGGED, not swallowed. The previous handler returned a status nobody
+            # reads and emitted no event, which is why a TypeError on every merge
+            # went unnoticed for the life of the feature.
+            _log_activity("learn_error", {
+                "pr": pr.get("number"), "repo": repo, "outcome": outcome,
+                "pattern": pattern_id,
+                "err": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+    elif outcome == "merged_clean" and not pattern_id:
+        # The common case: a template fix, merged unchanged. This is the evidence
+        # that CREATES the pattern -- without it the store only ever learns about
+        # patterns it already had.
+        try:
+            derived = _derive_pattern_from_clean_merge(row, repo)
+            credited = bool(derived)
+        except Exception as exc:                                # noqa: BLE001
+            _log_activity("learn_error", {
+                "pr": pr.get("number"), "repo": repo, "outcome": outcome,
+                "step": "derive_from_clean_merge",
+                "err": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+
+    _log_activity("pr_outcome_recorded", {
+        "pr": pr.get("number"), "repo": repo, "outcome": outcome,
+        "source": row.get("source", ""), "pattern": pattern_id or derived,
+        "counters_updated": credited,
+        "derived_pattern": bool(derived),
+        "contaminated": contaminated,
+        **({"contamination_reason": contamination_reason} if contaminated else {}),
+    })
+    return {"status": "recorded", "outcome": outcome, "pr": pr.get("number"),
+            "repo": repo, "counters_updated": credited,
+            "contaminated": contaminated,
+            "derived_pattern": derived or ""}
+
+
+def _handle_pr_merged(payload: dict, pr: dict) -> dict:
+    """A closed-and-merged PR. See _record_pr_terminal for the outcome classes."""
+    return _record_pr_terminal(pr, payload, merged=True)
 
 
 def _handle_pr_rejected(payload: dict, pr: dict) -> dict:
-    """
-    When a Ripple-generated PR gets closed without merge, record as negative signal.
-    This reduces confidence in the pattern that generated it.
-    """
-    pr_body = pr.get("body", "")
-    if "Generated by" not in pr_body and "Ripple" not in pr_body:
-        return {"status": "ignored", "reason": "not a Ripple PR"}
-    
-    repo = payload.get("repository", {}).get("full_name", "")
-    org = repo.split("/")[0] if "/" in repo else "unknown"
-    
-    try:
-        from .rag_engine import RagStore
-        from .rag_retriever import learn_from_rejected_pr
-        
-        store = RagStore(collection_name=f"ripple_{org}")
-        title = pr.get("title", "")
-        
-        learn_from_rejected_pr(
-            trigger_diff=title,
-            field_name=_extract_field_from_title(title),
-            change_type=_extract_change_type_from_title(title),
-            store=store,
-        )
-        
-        _log_activity("pr_rejected_learned", {"pr": pr.get("number"), "repo": repo})
-        return {
-            "status": "learned_negative",
-            "pr": pr.get("number"),
-            "repo": repo,
-            "message": f"Pattern confidence reduced for rejected PR #{pr.get('number')}.",
-        }
-    except Exception as e:
-        return {"status": "learn_error", "reason": str(e)[:100]}
+    """A closed-without-merge PR: a negative signal, if it is attributable."""
+    return _record_pr_terminal(pr, payload, merged=False)
+
+
+
+
 
 
 def _extract_field_from_title(title: str) -> str:

@@ -189,6 +189,34 @@ jobs:
         # and a dangling SAME_AS each exit 1.
         run: python tools/audit_fail_silent.py --check
 
+      - name: Learning loop round trip (blocking)
+        # Drives real pull_request.closed payloads through the SAME handler the
+        # webhook calls, then re-reads the stores in a SEPARATE interpreter.
+        #
+        # Two processes, not importlib.reload(), because module-level state
+        # survives inside one interpreter -- reload cannot distinguish "persisted
+        # to the volume" from "still in memory", and the volume was mounted
+        # precisely because outcomes were vanishing on redeploy.
+        #
+        # It pins the properties, not just the plumbing: a rescued merge must not
+        # raise merge_count, an inferred write must not overwrite a human
+        # correction, a contaminated sample must record an outcome and derive
+        # nothing, and a PR Ripple never opened must teach nothing at all.
+        # The learn_from_merged_pr edge existed and raised TypeError on every
+        # merged PR for the life of the feature, swallowed by except Exception --
+        # a reachability gate proves an edge exists, this proves it works.
+        run: python tools/verify_learning_loop.py both
+
+      - name: Discovery recall and breadth
+        # Measures admission-before-cut and the MMR rerank against declared
+        # ground truth, so the two claims stay separate and honest:
+        #   recall  moves (0.00 -> 1.00) when prose floods the platform's search
+        #           order -- consumers[:5] never FETCHED the real files
+        #   breadth moves (1 -> 3) when one package dominates, with recall FLAT
+        # MMR is a reallocation, not a recall gain. This gate fails if that
+        # distinction is ever quietly restated as an improvement in both.
+        run: python tools/measure_discovery.py
+
       - name: Consumer-matcher vectors
         # The PropBench replay harness (judgment-engine/tools/replay.py) measures
         # this matcher against real merged PRs, but it CANNOT gate CI here: it

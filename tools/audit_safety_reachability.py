@@ -174,6 +174,29 @@ def _reachable_from_entry() -> set:
 #: audit_pipeline_governance rather than writing a second: this repository's dominant
 #: failure is one concept implemented twice.
 FUNCTION_LAYERS = {
+    ("rag_retriever", "learn_from_merged_pr"): {
+        "role": "the LEARNING edge -- the only path by which a real-world outcome "
+                "reaches the pattern store. Reached from webhook._handle_pr_merged "
+                "via _record_pr_terminal, attributed through the pr_ledger "
+                "provenance row rather than a substring scan of the PR body",
+        "reachable": True,
+        "consequence": None,
+        #: Declared hop by hop for the same reason as the LLM path: module
+        #: granularity cannot see this. app/rag_retriever.py is imported by
+        #: webhook for retrieval, so a module-level check reports it REACHABLE and
+        #: always would have -- including while the outcome call raised TypeError
+        #: on every single merged PR and the RAG store sat at 0 patterns.
+        #:
+        #: That defect is why the hop test alone is not enough here: the edge
+        #: EXISTED and was broken. test_every_learning_call_matches_the_function_
+        #: it_calls binds each call site against the real signature, which is the
+        #: half a reachability gate structurally cannot check.
+        "path": (
+            ("webhook", "_handle_pr_merged"),
+            ("webhook", "_record_pr_terminal"),
+            ("rag_retriever", "learn_from_merged_pr"),
+        ),
+    },
     ("fix_generator", "_generate_with_llm"): {
         "role": "the ONLY path on which customer source code leaves the machine. "
                 "Reached from webhook._generate_fix_with_rag_fallback via "
