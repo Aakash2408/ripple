@@ -6785,5 +6785,48 @@ def test_admission_refusals_are_logged_not_silent():
         f"the refusal reason does not say why, got {after[-3:]}")
 
 
+def test_the_store_constants_still_match_their_recorded_derivation():
+    """A documented number that drifts from the code is a stale claim.
+
+    Both constants were guesses until they were measured, and the measurement is
+    recorded in the comment block above each one. That block is prose: nothing
+    stops someone restoring a round number and leaving the derivation asserting
+    a different value, which is how "148 tests" survived in the README after the
+    count changed.
+
+    Two things are cross-checkable without re-running the measurement (which
+    needs PropBench, absent in CI -- gating on it would be a gate that never
+    runs):
+
+      the documented p90 must equal ARCHIVE_AFTER_DAYS
+      MAX_ACTIVE_PATTERNS must equal pr_ledger._MAX_ROWS, which is the stated
+      reason it is 5000 rather than a number of its own
+    """
+    import pathlib
+    import re
+
+    from app import pr_ledger
+    from app.rag_store import ARCHIVE_AFTER_DAYS, MAX_ACTIVE_PATTERNS
+
+    src = (pathlib.Path(__file__).parent.parent / "app" / "rag_store.py").read_text()
+
+    m = re.search(r"p90\s+(\d+)d", src)
+    assert m, ("the ARCHIVE_AFTER_DAYS rationale no longer records a measured "
+               "p90 -- if the measurement was dropped, the constant is a guess "
+               "again and should say so")
+    documented_p90 = int(m.group(1))
+    assert documented_p90 == ARCHIVE_AFTER_DAYS, (
+        f"ARCHIVE_AFTER_DAYS is {ARCHIVE_AFTER_DAYS} but its rationale records a "
+        f"measured p90 of {documented_p90} -- one of the two is stale. Re-run "
+        f"tools/measure_store_constants.py rather than editing the prose.")
+
+    assert MAX_ACTIVE_PATTERNS == pr_ledger._MAX_ROWS, (
+        f"MAX_ACTIVE_PATTERNS={MAX_ACTIVE_PATTERNS} and "
+        f"pr_ledger._MAX_ROWS={pr_ledger._MAX_ROWS} have diverged. The measured "
+        f"finding was that cost does not bind below ~25k rows, so the cap exists "
+        f"to bound growth and is deliberately ONE number across both persisted "
+        f"stores. If they should now differ, say why in both docstrings.")
+
+
 if __name__ == "__main__":
     sys.exit(_main())
