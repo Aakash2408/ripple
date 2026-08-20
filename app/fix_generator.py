@@ -324,10 +324,15 @@ def _generate_with_llm(
               f"{breaking_change.change_type!r}; using the template instead")
         return _generate_with_template(original_code, consumer, breaking_change)
 
-    from .llm_config import api_key as _llm_key, base_url as _llm_base, model as _llm_model
+    from .llm_config import client_api_key as _llm_client_key, base_url as _llm_base, model as _llm_model
     # base_url passed explicitly rather than relying on the SDK reading the env,
     # so the configured backend is visible at the call site.
-    client = anthropic.Anthropic(api_key=_llm_key(), base_url=_llm_base())
+    #
+    # client_api_key() rather than api_key(): the SDK refuses to construct with an
+    # empty credential even against a server that authenticates nothing, so a
+    # keyless self-hosted model failed here AFTER is_configured() had opened the
+    # gate -- and fell silently through to the template.
+    client = anthropic.Anthropic(api_key=_llm_client_key(), base_url=_llm_base())
 
     prompt = f"""You are a code assistant. An API has a breaking change. Fix the consumer code.
 

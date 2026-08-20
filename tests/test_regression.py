@@ -5778,5 +5778,102 @@ def test_the_llm_path_is_declared_in_the_reachability_gate():
             "a note")
 
 
+def test_a_keyless_self_hosted_backend_can_actually_construct_a_client():
+    """is_configured() opened the gate and the call site then refused to call.
+
+    Found by running it against a real local model (Ollama in Docker, serving
+    native Anthropic /v1/messages at localhost:11434). The gate said yes:
+
+        api_key()        ''
+        is_self_hosted() True
+        is_configured()  True
+
+    and then the request failed:
+
+        LLM error: "Could not resolve authentication method. Expected one of
+        api_key, auth_token, or credentials to be set. Or for one of the
+        `X-Api-Key` or `Authorization` headers to be explicitly omitted"
+
+    The Anthropic SDK refuses to construct with an empty api_key even when
+    base_url points at a server that authenticates nothing. So yesterday's fix
+    moved the disagreement one layer down rather than removing it: the GATE
+    accepts keyless self-hosted, the CLIENT cannot do keyless.
+
+    That is the third time this exact shape has appeared in this module's area --
+    llm_config.py exists BECAUSE three call sites each decided independently how to
+    reach the model, and its own comment warns that a gate reading one thing while
+    the call site reads another sends a real configuration silently to the
+    template. Hence one resolution point: client_api_key().
+
+    THE THIRD ASSERTION IS THE SAFETY ONE. A placeholder must NEVER be handed out
+    when nothing is configured, or an unconfigured deployment would start sending
+    source code to api.anthropic.com with a fake credential instead of doing
+    nothing.
+    """
+    import os as _os
+    from app import llm_config as c
+
+    keys = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+    saved = {k: _os.environ.get(k) for k in keys}
+    try:
+        # 1. keyless self-hosted -> a NON-EMPTY value, so the SDK can construct
+        for k in keys:
+            _os.environ.pop(k, None)
+        _os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:11434"
+        assert c.is_self_hosted() and c.is_configured(), "precondition broken"
+        got = c.client_api_key()
+        assert got, (
+            "client_api_key() is empty for a keyless self-hosted backend, so "
+            "anthropic.Anthropic(api_key=...) raises 'Could not resolve "
+            "authentication method' and every self-hosted fix silently falls "
+            "through to the template."
+        )
+
+        # 2. a real key always wins -- the placeholder must not shadow it
+        _os.environ["ANTHROPIC_AUTH_TOKEN"] = "sk-real-token"
+        assert c.client_api_key() == "sk-real-token", (
+            f"a configured token was replaced by {c.client_api_key()!r}")
+
+        # 3. NOTHING configured -> NO placeholder. This is the safety property:
+        #    a fake credential must never let an unconfigured deployment reach a
+        #    third-party API.
+        for k in keys:
+            _os.environ.pop(k, None)
+        assert not c.is_configured(), "precondition broken"
+        assert not c.client_api_key(), (
+            f"client_api_key() handed out {c.client_api_key()!r} with nothing "
+            f"configured. That would let an unconfigured install talk to "
+            f"api.anthropic.com with a placeholder instead of doing nothing."
+        )
+    finally:
+        for k, v in saved.items():
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
+
+    # 4. and no call site may construct a client from api_key() directly -- that
+    #    is the bug. They must go through client_api_key().
+    import ast as _ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for module in ("fix_generator.py", "natural_language.py"):
+        path = os.path.join(root, "app", module)
+        if not os.path.isfile(path):
+            continue
+        src = open(path).read()
+        tree = _ast.parse(src)
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            for kw in node.keywords or []:
+                if kw.arg not in ("api_key", "x-api-key"):
+                    continue
+                rendered = _ast.unparse(kw.value)
+                assert "client_api_key" in rendered or "api_key()" not in rendered, (
+                    f"app/{module} passes {rendered} as api_key -- use "
+                    f"llm_config.client_api_key() so a keyless self-hosted "
+                    f"backend can construct."
+                )
+
+
 if __name__ == "__main__":
     sys.exit(_main())

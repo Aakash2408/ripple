@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 # Read through llm_config so an ANTHROPIC_BASE_URL override reaches this caller
 # too. The URL used to be a module-level constant pinned to api.anthropic.com,
 # which meant this site silently ignored the override every other site honoured.
-from app.llm_config import api_key as _llm_api_key, messages_url as _llm_messages_url, model as _llm_model
+from app.llm_config import (api_key as _llm_api_key,
+                            client_api_key as _llm_client_key,
+                            is_configured as _llm_configured,
+                            messages_url as _llm_messages_url,
+                            model as _llm_model)
 
 VALID_ACTIONS = {"add", "remove", "rename", "deprecate"}
 VALID_TARGETS = {"field", "endpoint", "type", "parameter", "header", "schema"}
@@ -86,8 +90,12 @@ def _regex_parse(text: str) -> Optional[ChangeIntent]:
 
 
 def _claude_parse(text: str) -> Optional[ChangeIntent]:
-    """Parse intent using Claude API."""
-    if not _llm_api_key():
+    """Parse intent using the configured LLM."""
+    # is_configured() rather than api_key(): a self-hosted backend authenticates
+    # nothing, so gating on a token made a keyless local model indistinguishable
+    # from no LLM -- the same disagreement fix_generator hit at its client
+    # construction. Both now resolve through llm_config.
+    if not _llm_configured():
         return None
 
     prompt = f"""Parse this developer intent into structured fields.
@@ -107,7 +115,7 @@ JSON:"""
         resp = requests.post(
             _llm_messages_url(),
             headers={
-                "x-api-key": _llm_api_key(),
+                "x-api-key": _llm_client_key(),
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },

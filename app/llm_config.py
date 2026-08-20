@@ -72,6 +72,43 @@ def is_anthropic() -> bool:
     return urlparse(base_url()).netloc.endswith("anthropic.com")
 
 
+def client_api_key() -> str:
+    """The credential to hand an SDK client. Use this, never api_key(), at a call site.
+
+    WHY THIS IS SEPARATE FROM api_key()
+    api_key() answers "did the operator supply a token". This answers "what should
+    the client be constructed with", and for a self-hosted backend those differ.
+
+    The Anthropic SDK refuses to construct with an empty api_key:
+
+        Could not resolve authentication method. Expected one of api_key,
+        auth_token, or credentials to be set.
+
+    even when base_url points at a server that authenticates nothing. Measured
+    against a real local model (Ollama serving native /v1/messages at
+    localhost:11434): is_configured() returned True, the gate opened, and every
+    request then failed and fell through to the deterministic template -- so the
+    self-hosted path looked configured and silently did nothing.
+
+    That is the same disagreement this module was created to end, one layer lower:
+    the GATE accepted keyless self-hosted while the CALL SITE could not do keyless.
+    A placeholder resolves it, and it is safe because a self-hosted endpoint ignores
+    the header.
+
+    NOTHING IS HANDED OUT WHEN NOTHING IS CONFIGURED. If there is no key and no
+    self-hosted base_url, this returns "" -- so an unconfigured deployment cannot
+    start talking to api.anthropic.com with a fake credential. The placeholder is
+    granted ONLY because the operator named their own host.
+    """
+    real = api_key()
+    if real:
+        return real
+    if is_self_hosted():
+        # Any non-empty value satisfies the SDK; the local server ignores it.
+        return "self-hosted-no-auth"
+    return ""
+
+
 def is_self_hosted() -> bool:
     """True when ANTHROPIC_BASE_URL points somewhere other than Anthropic.
 
