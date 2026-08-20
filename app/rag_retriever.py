@@ -5,7 +5,21 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app.rag_store import rag_store, FixPattern, StructuredPattern
+from app.rag_store import rag_store, FixPattern, StructuredPattern, is_admissible
+
+#: Why patterns were refused admission on recent retrievals.
+#:
+#: Bounded and in-memory. It exists because a silently skipped pattern is
+#: indistinguishable from a pattern that never matched -- the same invisibility
+#: that hid `consumers[:5]` dropping real consumers for months. Read via
+#: recent_refusals(); the retrieval path never fails on a full buffer.
+_REFUSAL_LOG_MAX = 200
+_refusals: list = []
+
+
+def recent_refusals(limit: int = 50) -> list:
+    """The most recent admission refusals, newest last."""
+    return _refusals[-limit:]
 
 
 from app.languages import detect as _language_from_path  # noqa: E402
@@ -71,20 +85,25 @@ def _multi_signal_score(
         score += 0.1
 
     # Success rate (merge_count / total attempts)
+    #
+    # ABSENCE SCORES ZERO. This used to award +0.1 when there was no data at
+    # all, which is exactly what a 50% merge rate earns -- so a corpus guess
+    # that had never been tried tied a pattern with a real, observed
+    # 1-merge/1-reject record. Same shape as KiroCrew's un-embedded row keeping
+    # an unweighted keyword score: a signal you do not have cannot be a reason
+    # to rank higher.
     total = pattern.merge_count + pattern.reject_count
     if total > 0:
         success_rate = pattern.merge_count / total
         score += 0.2 * success_rate
-    else:
-        score += 0.1  # no data = neutral
 
     # Recency bonus (decays over 30 days)
+    #
+    # Same rule: no timestamp contributes 0.0, where it used to earn +0.05.
     if pattern.last_used:
         age_days = (time.time() - pattern.last_used) / 86400
         recency = max(0.0, 1.0 - (age_days / 30))
         score += 0.15 * recency
-    else:
-        score += 0.05
 
     # Cross-repo penalty
     if repo and pattern.repo and pattern.repo != repo:
@@ -100,11 +119,26 @@ def retrieve_fix_pattern(
     repo: Optional[str] = None,
     store=None,
 ) -> Optional[tuple[FixPattern, float]]:
-    """Retrieve best fix pattern using multi-signal scoring. Returns top candidate."""
+    """Retrieve best fix pattern using multi-signal scoring. Returns top candidate.
+
+    ADMISSION RUNS FIRST, then ranking -- the same order Stage 4 established for
+    consumer discovery, and for the same reason. Eligibility is a correctness
+    property; placement among eligible candidates is a preference. Blending them
+    here was not a subtle mis-weighting: change_type (0.4) + language (0.25) +
+    the field-name boost (0.15) reaches 0.80, clearing the 0.7 floor with zero
+    evidence, so the 0.2-weighted evidence term could never veto anything. A
+    pattern rejected five times and never merged was retrieved and used.
+    """
     active = store if store is not None else rag_store
     candidates: list[tuple[FixPattern, float]] = []
 
     for pattern in active.patterns:
+        ok, why = is_admissible(pattern)
+        if not ok:
+            _refusals.append({"pattern_id": pattern.pattern_id, "reason": why})
+            del _refusals[:-_REFUSAL_LOG_MAX]
+            continue
+
         score = _multi_signal_score(pattern, change_type, language, repo)
 
         # Boost if field name appears in pattern context

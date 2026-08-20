@@ -6444,5 +6444,346 @@ def test_every_add_pattern_caller_persists():
           "the reason.")
 
 
+def test_a_missing_signal_scores_zero_not_a_bonus():
+    """Absence of evidence must not out-rank evidence.
+
+    The scorer gave +0.1 when a pattern had no merge/reject data and +0.05 when
+    it had no last_used -- so a corpus guess that had never been tried scored
+    0.90, exactly tying a pattern with a real 50% merge rate, and beat a pattern
+    with a poor-but-real record. That is the same shape as KiroCrew's un-embedded
+    row keeping an unweighted keyword score: a signal you do not have cannot be
+    a reason to rank higher.
+
+    Ordering must be strict: proven > mixed > untried.
+    """
+    import time as _t
+    from app.rag_retriever import _multi_signal_score
+    from app.rag_store import FixPattern
+
+    now = _t.time()
+
+    def pat(**kw):
+        base = dict(pattern_id="p", change_type="field_removed",
+                    language="typescript", field_name="f", strategy="s",
+                    last_used=now)
+        base.update(kw)
+        return FixPattern(**base)
+
+    proven = _multi_signal_score(pat(merge_count=5), "field_removed",
+                                 "typescript", None)
+    mixed = _multi_signal_score(pat(merge_count=1, reject_count=1),
+                                "field_removed", "typescript", None)
+    untried = _multi_signal_score(pat(), "field_removed", "typescript", None)
+    no_recency = _multi_signal_score(pat(merge_count=5, last_used=0.0),
+                                     "field_removed", "typescript", None)
+
+    # A MARGIN, not a bare >. _multi_signal_score reads time.time() itself on
+    # every call, so the call made first gets marginally more recency -- when
+    # this test was written with a bare `mixed > untried` it PASSED by 4e-13
+    # against the un-fixed scorer, purely from evaluation order, and would have
+    # flipped if the two lines were swapped. The evidence term is weighted 0.2,
+    # so a real gap between a 50% record and no record is 0.1.
+    MARGIN = 0.05
+    assert proven - mixed >= MARGIN, (
+        f"a 100% record must outrank a 50% one by more than float noise: "
+        f"proven={proven:.4f} mixed={mixed:.4f}")
+    assert mixed - untried >= MARGIN, (
+        f"evidence must strictly order patterns, got mixed={mixed:.4f} "
+        f"untried={untried:.4f} (gap {mixed - untried:.2e}) -- an untried "
+        f"pattern is being paid a consolation bonus for having no record")
+    assert proven - no_recency >= MARGIN, (
+        f"a pattern with no last_used scored {no_recency:.4f} against "
+        f"{proven:.4f} for the same pattern with a timestamp -- missing "
+        f"recency must contribute 0.0, not a consolation bonus")
+
+
+def test_a_pattern_that_never_worked_is_refused_not_merely_ranked_down():
+    """Evidence must be able to VETO, because it cannot outweigh identity.
+
+    change_type (0.4) + language (0.25) + the field-name boost (0.15) = 0.80,
+    already above the 0.7 retrieval floor, with zero evidence and zero recency.
+    The evidence term is weighted 0.2, so no track record however bad can pull an
+    identity match below the floor: a pattern rejected five times and never
+    merged was still retrieved and used to generate a fix.
+
+    So applicability and trust are separate questions -- the same split Stage 4
+    made for consumers, where admission is a correctness property and ranking is
+    a preference. A pattern that has been tried and has never once merged is not
+    a low-ranked candidate; it is a known-bad one.
+    """
+    import time as _t
+    from app.rag_retriever import retrieve_fix_pattern
+    from app.rag_store import FixPattern, PatternStore
+
+    now = _t.time()
+
+    def store_with(**kw):
+        base = dict(pattern_id="p", change_type="field_removed",
+                    language="typescript", field_name="phoneNumber",
+                    strategy="s", last_used=now)
+        base.update(kw)
+        st = PatternStore("test_veto")
+        st._loaded = True
+        st.patterns = [FixPattern(**base)]
+        st.structured_patterns = []
+        return st
+
+    never_worked = retrieve_fix_pattern(
+        "field_removed", "typescript", "phoneNumber",
+        store=store_with(merge_count=0, reject_count=5))
+    assert never_worked is None, (
+        "a pattern with 0 merges and 5 rejections was retrieved -- it has been "
+        f"tried five times and never once worked, got {never_worked}")
+
+    # One merge keeps it in the running: a mixed record is a ranking question.
+    mixed = retrieve_fix_pattern(
+        "field_removed", "typescript", "phoneNumber",
+        store=store_with(merge_count=1, reject_count=5))
+    assert mixed is not None, (
+        "a pattern with a poor but non-zero merge record must stay retrievable "
+        "-- vetoing on a ratio would invent a threshold; vetoing on 'never once "
+        "worked' states a fact")
+
+
+def test_an_aged_out_pattern_is_archived_not_deleted():
+    """Old patterns leave retrieval but their evidence is retained.
+
+    A pattern that worked in March against a codebase that has since changed
+    should not outrank a fresh one, and the 0.15 recency weight cannot achieve
+    that on its own (see the veto test -- identity alone clears the floor).
+    KiroCrew runs active -> stale -> archived with pin exemptions; this is the
+    archived step.
+
+    Deleting would destroy the outcome evidence that took a real merged PR to
+    earn, so archived rows stay on disk and stay in stats.
+    """
+    import time as _t
+    from app.rag_store import FixPattern, PatternStore, ARCHIVE_AFTER_DAYS
+    from app.rag_retriever import retrieve_fix_pattern
+
+    now = _t.time()
+    ancient = now - (ARCHIVE_AFTER_DAYS + 10) * 86400
+
+    st = PatternStore("test_archive")
+    st._loaded = True
+    st.structured_patterns = []
+    st.patterns = [FixPattern(
+        pattern_id="old", change_type="field_removed", language="typescript",
+        field_name="phoneNumber", strategy="s", merge_count=3,
+        last_used=ancient, provenance="merged_clean")]
+
+    got = retrieve_fix_pattern("field_removed", "typescript", "phoneNumber",
+                               store=st)
+    assert got is None, (
+        f"a pattern last used {ARCHIVE_AFTER_DAYS + 10} days ago was retrieved: "
+        f"{got}")
+    assert len(st.patterns) == 1, (
+        "the aged pattern was DELETED -- archiving must retain the row so the "
+        "merged-PR evidence that earned it is not destroyed")
+
+
+def test_a_human_correction_is_pinned_and_never_ages_out():
+    """The top of the ladder does not expire.
+
+    KiroCrew exempts pinned memories from decay and cap eviction. Ripple's
+    analogue is provenance == "human_edit": a reviewer's correction is the
+    highest-authority thing in the store, and letting it age out would mean the
+    store forgets exactly what it was most sure of -- and, worse, would reopen
+    the slot to the inferred write the ladder exists to block.
+    """
+    import time as _t
+    from app.rag_store import FixPattern, PatternStore, ARCHIVE_AFTER_DAYS
+    from app.rag_retriever import retrieve_fix_pattern
+
+    now = _t.time()
+    ancient = now - (ARCHIVE_AFTER_DAYS * 10) * 86400
+
+    st = PatternStore("test_pin")
+    st._loaded = True
+    st.structured_patterns = []
+    st.patterns = [FixPattern(
+        pattern_id="human", change_type="field_removed", language="typescript",
+        field_name="phoneNumber", strategy="a human fixed this",
+        merge_count=1, last_used=ancient, provenance="human_edit")]
+
+    got = retrieve_fix_pattern("field_removed", "typescript", "phoneNumber",
+                               store=st)
+    assert got is not None, (
+        "a human correction aged out of retrieval -- human_edit is pinned")
+
+
+def test_the_pattern_cap_archives_the_oldest_and_spares_human_edits():
+    """A bounded store must evict by archiving, and must not evict a human.
+
+    Without a cap the store grows without limit on the mounted volume -- the
+    same failure pr_ledger caps at 5000 rows. Eviction takes the oldest
+    last_used first, and skips human_edit rows entirely, so a busy install
+    cannot silently discard the corrections it was most confident about.
+    """
+    import time as _t
+    from app.rag_store import FixPattern, PatternStore, MAX_ACTIVE_PATTERNS
+
+    now = _t.time()
+    st = PatternStore("test_cap")
+    st._loaded = True
+    st.structured_patterns = []
+
+    # One pinned human correction, deliberately the OLDEST row in the store.
+    st.patterns = [FixPattern(
+        pattern_id="human", change_type="field_removed", language="typescript",
+        field_name="human_field", strategy="human", merge_count=1,
+        last_used=now - 9_000_000, provenance="human_edit")]
+
+    for i in range(MAX_ACTIVE_PATTERNS + 25):
+        st.add_pattern(FixPattern(
+            pattern_id=f"p{i}", change_type="field_removed",
+            language="typescript", field_name=f"field{i}",
+            strategy="s", merge_count=1, last_used=now - i,
+            provenance="merged_clean"))
+
+    assert len(st.patterns) <= MAX_ACTIVE_PATTERNS, (
+        f"store holds {len(st.patterns)} active patterns, cap is "
+        f"{MAX_ACTIVE_PATTERNS} -- unbounded growth on the volume")
+    assert st.archived, (
+        "patterns were evicted with no archive -- outcome evidence that took "
+        "real merged PRs to earn was destroyed")
+    assert any(p.provenance == "human_edit" for p in st.patterns), (
+        "the human correction was evicted despite being pinned -- it was the "
+        "oldest row, which is exactly the case the pin exists for")
+    assert not any(p.provenance == "human_edit" for p in st.archived), (
+        "a human_edit row was archived; pinned rows are exempt from the cap")
+
+
+def test_archived_patterns_survive_a_reload():
+    """Archive-not-delete is worthless if the archive is not persisted."""
+    import json
+    import os
+    import tempfile
+    import time as _t
+
+    scratch = tempfile.mkdtemp(prefix="ripple_archive_persist_")
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = scratch
+    try:
+        import importlib
+
+        import app.rag_store as rs
+        importlib.reload(rs)
+
+        st = rs.PatternStore("persist_check")
+        st._loaded = True
+        st.patterns = []
+        st.archived = [rs.FixPattern(
+            pattern_id="gone", change_type="field_removed",
+            language="typescript", field_name="f", strategy="s",
+            merge_count=7, last_used=_t.time(), provenance="merged_clean")]
+        st.save()
+
+        raw = json.loads((st._path).read_text())
+        assert "archived" in raw, (
+            "save() dropped the archive, so every archived row is deleted on "
+            "the next write -- archive-not-delete in name only")
+
+        fresh = rs.PatternStore("persist_check")
+        fresh.load()
+        assert len(fresh.archived) == 1, (
+            f"archive did not survive a reload, got {len(fresh.archived)} rows")
+        assert fresh.archived[0].merge_count == 7, (
+            "the archived row lost its evidence on the round trip")
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+        import importlib
+
+        import app.rag_store as rs2
+        importlib.reload(rs2)
+        import shutil
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_a_dormant_pattern_revives_when_a_new_merge_arrives():
+    """Dormancy is derived at query time, so it must be reversible.
+
+    The docstring on is_admissible() claims a dormant pattern revives on a new
+    merge. That claim needs a test: yesterday a gate's PASS message asserted
+    "ladder held" while never attempting the write the ladder blocks, and a
+    mutation sailed through it. A property asserted only in prose is not held.
+
+    Reversibility is the reason dormancy stays derived instead of physically
+    moving rows: a pattern goes quiet because nothing needed it, not because it
+    was ever wrong, and the evidence it carries is still valid the moment the
+    same change_type/language/field comes back.
+    """
+    import time as _t
+    from app.rag_store import (ARCHIVE_AFTER_DAYS, FixPattern, PatternStore,
+                               is_admissible)
+    from app.rag_retriever import retrieve_fix_pattern
+
+    now = _t.time()
+    st = PatternStore("test_revive")
+    st._loaded = True
+    st.structured_patterns = []
+    st.patterns = [FixPattern(
+        pattern_id="dormant", change_type="field_removed", language="typescript",
+        field_name="phoneNumber", strategy="s", merge_count=3,
+        last_used=now - (ARCHIVE_AFTER_DAYS + 30) * 86400,
+        provenance="merged_clean")]
+
+    assert retrieve_fix_pattern("field_removed", "typescript", "phoneNumber",
+                                store=st) is None, "should start dormant"
+    assert st.patterns, (
+        "the dormant row left `patterns`, so it can never revive -- dormancy "
+        "must not physically evict")
+
+    # A new clean merge for the same identity lands via the normal write path.
+    st.add_pattern(FixPattern(
+        pattern_id="dormant", change_type="field_removed", language="typescript",
+        field_name="phoneNumber", strategy="s", merge_count=1,
+        last_used=_t.time(), provenance="merged_clean"))
+
+    ok, why = is_admissible(st.patterns[0])
+    assert ok, f"pattern did not revive after a fresh merge: {why}"
+    revived = retrieve_fix_pattern("field_removed", "typescript", "phoneNumber",
+                                   store=st)
+    assert revived is not None, "revived pattern is still not retrievable"
+    assert revived[0].merge_count == 4, (
+        f"revival lost the accumulated evidence, merge_count="
+        f"{revived[0].merge_count} (expected 3 dormant + 1 new)")
+
+
+def test_admission_refusals_are_logged_not_silent():
+    """A refused pattern must be distinguishable from one that never matched.
+
+    `consumers[:5]` dropped real consumers for months with no log, no metric and
+    no way to notice, because a candidate that was never fetched leaves no
+    trace. Admission refusal has the same hazard: skipping a pattern silently
+    looks exactly like having no pattern.
+    """
+    import time as _t
+    from app.rag_store import FixPattern, PatternStore
+    from app.rag_retriever import recent_refusals, retrieve_fix_pattern
+
+    st = PatternStore("test_refusal_log")
+    st._loaded = True
+    st.structured_patterns = []
+    st.patterns = [FixPattern(
+        pattern_id="never_worked", change_type="field_removed",
+        language="typescript", field_name="phoneNumber", strategy="s",
+        merge_count=0, reject_count=4, last_used=_t.time())]
+
+    before = len(recent_refusals(500))
+    retrieve_fix_pattern("field_removed", "typescript", "phoneNumber", store=st)
+    after = recent_refusals(500)
+
+    assert len(after) > before, (
+        "a pattern was refused admission with nothing recorded -- the refusal "
+        "is invisible to the dashboard and to anyone debugging why no pattern "
+        "was used")
+    assert any("never merged" in (r.get("reason") or "") for r in after[-3:]), (
+        f"the refusal reason does not say why, got {after[-3:]}")
+
+
 if __name__ == "__main__":
     sys.exit(_main())

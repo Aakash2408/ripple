@@ -73,6 +73,81 @@ PROVENANCE_RANK = {
     "inferred": 0,
 }
 
+#: A pattern this stale leaves retrieval. It is NOT deleted -- see `archived`.
+#:
+#: A pattern that worked in March against a codebase that has since been
+#: refactored should not rank alongside a fresh one, and the scorer's 0.15
+#: recency weight cannot achieve that alone: change_type (0.4) + language (0.25)
+#: + the field-name boost (0.15) already clears the 0.7 retrieval floor with
+#: zero evidence and zero recency. Age has to gate admission, not nudge ranking.
+ARCHIVE_AFTER_DAYS = 90
+
+#: Ceiling on ACTIVE patterns. Without it the store grows without limit on the
+#: mounted volume -- the failure pr_ledger caps at 5000 rows. Eviction archives
+#: the oldest rather than dropping them, because a counter here was earned by a
+#: real merged PR and cannot be recomputed.
+MAX_ACTIVE_PATTERNS = 2000
+
+#: Provenance values exempt from ageing and from cap eviction.
+#:
+#: KiroCrew exempts pinned memories from decay and cap eviction; this is the
+#: analogue. A reviewer's correction is the highest-authority row in the store,
+#: and expiring it would both forget what we were most sure of and reopen the
+#: slot to the inferred write the ladder exists to block.
+PINNED_PROVENANCE = frozenset({"human_edit"})
+
+
+def is_admissible(pattern, now: float = 0.0) -> tuple:
+    """May this pattern be retrieved at all? Returns (bool, reason).
+
+    ADMISSION IS SEPARATE FROM RANKING, for the same reason it is in consumer
+    discovery: whether a candidate is eligible is a correctness question, and
+    where it places among eligible candidates is a preference. Blending the two
+    is what let a pattern rejected five times and never merged still be used --
+    the evidence term is weighted 0.2 and identity alone reaches 0.80, so no
+    track record however bad could pull it under the floor.
+
+    Two grounds for refusal, both facts rather than thresholds:
+
+      never worked   tried at least once, merged zero times. Not a weak
+                     candidate -- a known-bad one. A pattern with even ONE merge
+                     stays eligible and is ranked on its rate, because vetoing
+                     on a ratio would invent a cutoff nobody can defend.
+
+      dormant        last used more than ARCHIVE_AFTER_DAYS ago, unless pinned.
+
+    NOTE the deliberate asymmetry between the two lifecycle mechanisms, which
+    are easy to conflate because both remove a pattern from retrieval:
+
+      DORMANCY is derived here, at query time, and is REVERSIBLE. The row stays
+      in `patterns`, so if a new merge arrives for the same identity,
+      add_pattern() bumps last_used and the pattern silently revives. That is
+      the right behaviour -- a pattern is dormant because nothing needed it, not
+      because it was wrong.
+
+      CAP EVICTION physically moves rows into `archived` and does not revive.
+
+    So a dormant row is NOT in `archived`, and the reason string must not claim
+    it is.
+    """
+    import time as _t
+
+    now = now or _t.time()
+
+    if (pattern.merge_count or 0) == 0 and (pattern.reject_count or 0) > 0:
+        return False, (f"tried {pattern.reject_count} time(s), never merged")
+
+    if pattern.provenance in PINNED_PROVENANCE:
+        return True, "pinned"
+
+    if pattern.last_used:
+        age_days = (now - pattern.last_used) / 86400
+        if age_days > ARCHIVE_AFTER_DAYS:
+            return False, (f"dormant: last used {age_days:.0f}d ago "
+                           f"(> {ARCHIVE_AFTER_DAYS}d), revives on a new merge")
+
+    return True, ""
+
 
 @dataclass
 class FixPattern:
@@ -147,6 +222,13 @@ class PatternStore:
         self.collection_name = collection_name
         self.patterns: list = []
         self.structured_patterns: list = []
+        #: Rows aged out or evicted by the cap. Retained, never retrieved.
+        #:
+        #: Deleting would destroy evidence that a real merged PR earned and that
+        #: cannot be recomputed from anything on disk. Archiving keeps it
+        #: auditable and leaves the door open to reviving a pattern if the same
+        #: change_type/language/field comes back.
+        self.archived: list = []
         self._lock = threading.Lock()
         self._loaded = False
 
@@ -166,10 +248,15 @@ class PatternStore:
                 self.structured_patterns = [
                     StructuredPattern(**s) for s in data.get("structured_patterns", [])
                 ]
+                # `.get` with a default, so a store written before archiving
+                # existed loads as "nothing archived yet" rather than crashing
+                # into the corrupt-store branch and silently emptying itself.
+                self.archived = [FixPattern(**p) for p in data.get("archived", [])]
         except (IOError, OSError, ValueError, TypeError):
             # A corrupt store must degrade to empty, not crash the webhook.
             self.patterns = []
             self.structured_patterns = []
+            self.archived = []
 
     def save(self) -> None:
         """Called by learn_from_merged_pr / learn_from_rejected_pr."""
@@ -177,9 +264,56 @@ class PatternStore:
             self._path.write_text(json.dumps({
                 "patterns": [asdict(p) for p in self.patterns],
                 "structured_patterns": [asdict(s) for s in self.structured_patterns],
+                "archived": [asdict(p) for p in self.archived],
             }))
         except (IOError, OSError):
             pass
+
+    # ---- lifecycle
+    def _enforce_cap(self) -> int:
+        """Archive the oldest non-pinned rows until the store is under the cap.
+
+        Caller must hold the lock. Returns how many rows moved.
+
+        Oldest-by-last_used first, which is the same ordering pr_ledger evicts
+        by. Pinned rows are skipped entirely -- the cap test deliberately makes
+        the human correction the OLDEST row in the store, because that is
+        precisely the case the pin exists for.
+        """
+        overflow = len(self.patterns) - MAX_ACTIVE_PATTERNS
+        if overflow <= 0:
+            return 0
+
+        evictable = [p for p in self.patterns
+                     if p.provenance not in PINNED_PROVENANCE]
+        evictable.sort(key=lambda p: p.last_used or 0.0)
+        doomed = {id(p) for p in evictable[:overflow]}
+        if not doomed:
+            # Every row is pinned. Refuse to evict rather than break the pin --
+            # an unbounded store of human corrections is a smaller problem than
+            # silently discarding one, and the count is visible in stats().
+            return 0
+
+        self.archived.extend(p for p in self.patterns if id(p) in doomed)
+        self.patterns = [p for p in self.patterns if id(p) not in doomed]
+        return len(doomed)
+
+    def stats(self) -> dict:
+        """Lifecycle counts, so archiving is visible rather than inferred."""
+        import time as _t
+
+        self.load()
+        now = _t.time()
+        admissible = sum(1 for p in self.patterns if is_admissible(p, now)[0])
+        return {
+            "active": len(self.patterns),
+            "retrievable": admissible,
+            "aged_or_vetoed": len(self.patterns) - admissible,
+            "archived": len(self.archived),
+            "pinned": sum(1 for p in self.patterns
+                          if p.provenance in PINNED_PROVENANCE),
+            "cap": MAX_ACTIVE_PATTERNS,
+        }
 
     # ---- mutation
     @staticmethod
@@ -265,6 +399,7 @@ class PatternStore:
                         existing.source_file = pattern.source_file
                     return existing.pattern_id
             self.patterns.append(pattern)
+            self._enforce_cap()
             return pattern.pattern_id
 
     def ingest_examples(self, examples) -> dict:
@@ -316,9 +451,27 @@ class PatternStore:
         return stats
 
     def _rebuild_clusters(self) -> None:
-        """Derive cluster archetypes from the current patterns."""
+        """Derive cluster archetypes from the RETRIEVABLE patterns.
+
+        Uses is_admissible(), the same predicate retrieval uses, rather than a
+        second notion of "counts". A cluster's avg_confidence is consulted to
+        decide something now, so it should reflect the patterns that could
+        actually be retrieved now -- otherwise a pattern that has aged out of
+        retrieval keeps depressing (or inflating) the cell it left, and a
+        never-merged pattern that admission refuses still votes on confidence.
+
+        The consequence, stated because it is a real trade: archiving a row
+        changes the cell's avg_confidence. That is intended -- confidence is a
+        claim about present behaviour, not a permanent historical average -- and
+        the archived evidence remains on disk and in stats().
+        """
+        import time as _t
+
+        now = _t.time()
         groups = {}
         for p in self.patterns:
+            if not is_admissible(p, now)[0]:
+                continue
             groups.setdefault((p.change_type, p.language), []).append(p)
 
         clusters = []
