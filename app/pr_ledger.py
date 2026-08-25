@@ -122,29 +122,84 @@ def _persist() -> None:
 def record_open(pr_url: str, *, pattern_id: str, source: str, change_type: str,
                 language: str, field_name: str, consumer_file: str,
                 repo: str, validated, level: str) -> None:
-    """Remember what produced this PR. Called when the PR is opened.
+    """Remember what produced this PR. Called ONCE PER CONSUMER FILE.
 
     `source` distinguishes the generator -- "pattern" (a stored FixPattern, so
     `pattern_id` is real), "template" (deterministic codemod, no pattern yet) or
     "llm". A template-generated fix has nothing to credit on merge, which is a
     fact the outcome handler needs rather than a gap it has to infer.
+
+    THIS MERGES RATHER THAN OVERWRITES, and that is the whole point.
+
+    Ripple opens ONE PR per repo covering ALL of that repo's consumers: the branch
+    name is derived from the FIELD, so the second consumer hits the existing branch,
+    appends a commit, and gets back the SAME pr_url. Live proof -- billing-api PR #5
+    is 2 commits / 2 files / 1 PR.
+
+    This function used to assign `_rows[pr_url] = {...}`, so N consumers wrote N
+    rows to one key and only the LAST survived. Every other consumer was silently
+    dropped, and contamination then read the merge as "N files changed but Ripple
+    proposed 1" and refused to learn from it -- which is the common case, so the
+    store could never gain a pattern.
+
+    Merging here keeps the three per-consumer call sites untouched. Restructuring
+    the loops to accumulate before writing would put the same obligation in three
+    places, which is exactly how the diff contract ended up wired in one caller and
+    bypassed by another.
+
+    ABSENCE NEVER OVERWRITES PRESENCE. Consumers of one field can come from
+    different generators, and `_pattern_id_from_explanation` returns "" for a
+    template fix -- so a plain dict update would let a later empty pattern_id erase
+    a real one and make the merge unattributable. Same rule as the provenance
+    ladder.
     """
     if not pr_url:
         return
     with _lock:
         _load()
-        _rows[pr_url] = {
-            "pattern_id": pattern_id or "",
-            "source": source,
-            "change_type": change_type,
-            "language": language,
-            "field_name": field_name,
-            "consumer_file": consumer_file,
-            "repo": repo,
-            "validated": validated,
-            "level": level,
-            "opened_at": time.time(),
-        }
+        existing = _rows.get(pr_url)
+
+        if existing is None:
+            _rows[pr_url] = {
+                "pattern_id": pattern_id or "",
+                "source": source,
+                "change_type": change_type,
+                "language": language,
+                "field_name": field_name,
+                "consumer_file": consumer_file,
+                #: Every file Ripple proposed under this PR. Contamination is
+                #: bounded against this set, not against a count of 1.
+                "proposed_files": [consumer_file] if consumer_file else [],
+                "repo": repo,
+                "validated": validated,
+                "level": level,
+                "opened_at": time.time(),
+            }
+        else:
+            files = list(existing.get("proposed_files") or [])
+            if consumer_file and consumer_file not in files:
+                files.append(consumer_file)
+            existing["proposed_files"] = files
+
+            # Fill only what is missing; never replace a real value with an empty
+            # one. `opened_at` keeps the FIRST write's time so eviction order
+            # reflects when the PR was actually opened.
+            if not existing.get("pattern_id") and pattern_id:
+                existing["pattern_id"] = pattern_id
+            if not existing.get("consumer_file") and consumer_file:
+                existing["consumer_file"] = consumer_file
+            for key, value in (("source", source), ("change_type", change_type),
+                               ("language", language), ("field_name", field_name),
+                               ("repo", repo), ("level", level)):
+                if not existing.get(key) and value:
+                    existing[key] = value
+            # `validated` is tri-state: None means "could not check", which must
+            # not be upgraded by a later consumer that happened to validate. Only
+            # a False may sharpen it -- one unvalidated file makes the PR's claim
+            # weaker, never stronger.
+            if existing.get("validated") is not False and validated is False:
+                existing["validated"] = False
+
         if len(_rows) > _MAX_ROWS:
             for key in sorted(_rows, key=lambda k: _rows[k].get("opened_at", 0.0)
                               )[:len(_rows) - _MAX_ROWS]:

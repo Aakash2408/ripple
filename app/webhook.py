@@ -2568,19 +2568,41 @@ def _outcome_is_contaminated(pr: dict, row) -> tuple:
     if not row:
         return True, "no provenance row -- attribution would be a guess"
 
+    expected = _proposed_count(row)
+
     commits = pr.get("commits")
     if not isinstance(commits, int):
         return True, "commit count absent -- cannot tell a clean merge from a squash"
-    if commits > 2:
-        return True, f"squashed or extended into {commits} commits"
+    # ONE MORE THAN RIPPLE PUSHED, and this tolerance is a judgement rather than
+    # a derived number, so it is named as one.
+    #
+    # Contamination and human-edit detection ask DIFFERENT questions and so carry
+    # different commit tolerances. `_pr_had_human_edits` fires at > expected,
+    # because Ripple pushes one commit per consumer file and anything beyond that
+    # is someone else. Contamination asks whether the final state can still be
+    # ATTRIBUTED to the fix -- and a single reviewer follow-up commit, touching
+    # only files Ripple proposed, is attributable: that file's merged state IS the
+    # corrected fix, which is the higher-value artefact we want to learn.
+    #
+    # A pile-up of commits on those same files is different: the end state is then
+    # a mixture we cannot separate into fix and not-fix, and the file bound below
+    # cannot see it because the paths are unchanged.
+    #
+    # At expected == 1 this is exactly the previous `commits > 2`, so generalising
+    # the bound fixes the multi-consumer bug WITHOUT quietly re-deciding what
+    # counts as attributable.
+    if commits > expected + 1:
+        return True, (f"{commits} commits but Ripple pushed {expected} -- more "
+                      f"than one follow-up, so the merged state cannot be split "
+                      f"into fix and not-fix")
 
     changed = pr.get("changed_files")
     if not isinstance(changed, int):
         return True, "changed_files absent -- cannot bound the edit to the fix"
-    if changed > 1:
-        return True, (f"{changed} files changed but Ripple proposed 1 "
-                      f"({row.get('consumer_file', '?')}) -- edits went beyond the "
-                      f"field's references")
+    if changed > expected:
+        return True, (f"{changed} files changed but Ripple proposed {expected} "
+                      f"({', '.join((row.get('proposed_files') or ['?'])[:3])}) "
+                      f"-- edits went beyond the field's references")
     return False, ""
 
 
@@ -2624,28 +2646,109 @@ def _derive_pattern_from_clean_merge(row: dict, repo: str) -> str:
     return pid
 
 
-def _pr_had_human_edits(pr: dict) -> bool:
+def _proposed_count(row) -> int:
+    """How many files Ripple proposed under this PR. Never zero.
+
+    Ripple opens ONE PR per repo covering ALL its consumers and pushes one commit
+    per consumer file, so this is the expected upper bound on both the commit count
+    and the changed-file count of a clean merge.
+
+    A row written before `proposed_files` existed falls back to 1, which is the old
+    behaviour -- a legacy row must degrade to the STRICTER bound, never to an
+    unbounded one, or the migration itself would silently start crediting merges it
+    cannot attribute.
+    """
+    if not row:
+        return 1
+    files = row.get("proposed_files")
+    if isinstance(files, list) and files:
+        return len(files)
+    return 1
+
+
+def _fetch_pr_commit_authors(repo: str, number, token: str):
+    """Logins of every commit author on a PR, or None when it cannot be known.
+
+    WHY THIS EXISTS AT ALL. `_pr_had_human_edits` used to read
+    `pr["commit_list"]` -- a key nothing in production ever wrote. Grepping the
+    repository found it set only inside tests, and the handler never called this
+    endpoint. So the author half of the human-edit check was dead code, and
+    `commits != 1` was the only guard actually running.
+
+    That is why this landed together with the looser commit bound rather than
+    after it. Bounding commits by the proposed set is correct, but on its own it
+    would let a human who amends or rebases Ripple's commits keep the count intact
+    and be credited as a clean merge. Loosening the count while the author check
+    was dead would have made the system less safe.
+
+    Returns None on any failure, which the caller treats as "a human touched it".
+    Failure therefore degrades to learning NOTHING, never to learning wrongly.
+    """
+    if not repo or number is None or not token:
+        return None
+    try:
+        data = _github_api("GET", f"/repos/{repo}/pulls/{number}/commits", token)
+    except Exception:                                            # noqa: BLE001
+        # Deliberately broad and deliberately silent-but-conservative: any
+        # failure returns None, and None means "assume a human edited it".
+        return None
+    if not isinstance(data, list):
+        return None
+    authors = []
+    for commit in data:
+        if not isinstance(commit, dict):
+            continue
+        login = ((commit.get("author") or {}).get("login") or "")
+        if not login:
+            # An unmatched GitHub account still names someone in the commit
+            # metadata; falling back keeps an unattributed human visible rather
+            # than reading as "no author".
+            login = (((commit.get("commit") or {}).get("author") or {})
+                     .get("name") or "")
+        authors.append(login)
+    return authors
+
+
+def _pr_had_human_edits(pr: dict, row, commit_authors) -> bool:
     """Did anyone other than Ripple touch this PR before it merged?
 
-    Ripple pushes exactly one commit. More than one commit, or any commit whose
-    author is not the App, means a human intervened -- and a merge a human had to
-    rescue is NOT evidence the pattern worked. Counting it as a success is how a
-    learning loop becomes confidently wrong.
+    Pure: it decides, it does not fetch. `commit_authors` comes from
+    `_fetch_pr_commit_authors` at the single convergence point in
+    `_record_pr_terminal`, so no caller has to remember the fetch -- the shape
+    that stopped the diff contract from being wired in one path and bypassed in
+    another.
 
-    Defaults to True when the payload carries no commit information: an unknown
-    provenance must not be credited as a clean merge. Same direction as
-    `validated=None -> REVIEW`.
+    A merge a human had to rescue is NOT evidence the pattern worked. Counting it
+    as a success is how a learning loop becomes confidently wrong.
+
+    TWO INDEPENDENT SIGNALS, because either alone has a blind spot:
+
+      count   more commits than files Ripple proposed means commits were added.
+              Ripple pushes one commit per consumer file, so a 2-consumer PR
+              legitimately has 2 commits -- the old `commits != 1` read that as a
+              human and refused to learn from the common case.
+
+      author   a rebase or amend keeps the count identical and changes the
+               author, which the count can never see.
+
+    Unknown authors default to True, the same direction as
+    `validated=None -> REVIEW`: "we could not check" must never pass as "it is
+    fine".
     """
+    expected = _proposed_count(row)
+
     commits = pr.get("commits")
-    if isinstance(commits, int):
-        if commits != 1:
-            return True
-    elif commits is None:
+    if not isinstance(commits, int):
+        return True
+    if commits > expected:
         return True
 
-    for commit in pr.get("commit_list", []) or []:
-        login = ((commit.get("author") or {}).get("login") or "").lower()
-        if login and "ripple" not in login and not login.endswith("[bot]"):
+    if commit_authors is None:
+        return True
+
+    for login in commit_authors:
+        name = (login or "").lower()
+        if name and "ripple" not in name and not name.endswith("[bot]"):
             return True
     return False
 
@@ -2686,10 +2789,27 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
 
     if not merged:
         outcome = "rejected"
-    elif _pr_had_human_edits(pr):
-        outcome = "merged_with_edits"
     else:
-        outcome = "merged_clean"
+        # THE FETCH LIVES HERE, once, and only on the path where it can change
+        # the answer. A rejected PR teaches a negative regardless of who touched
+        # it, so spending an API call to find out would be waste.
+        #
+        # This is the convergence point on purpose: `_pr_had_human_edits` stays a
+        # pure predicate and no caller can forget to supply the authors, which is
+        # how the previous version ended up reading a payload key that only tests
+        # ever wrote.
+        commit_authors = _fetch_pr_commit_authors(
+            repo, pr.get("number"),
+            _get_token(payload.get("installation", {}).get("id")))
+        if commit_authors is None:
+            _log_activity("commit_authors_unavailable", {
+                "pr": pr.get("number"), "repo": repo,
+                "effect": "treated as human-edited, so no counters are credited",
+            })
+        if _pr_had_human_edits(pr, row, commit_authors):
+            outcome = "merged_with_edits"
+        else:
+            outcome = "merged_clean"
 
     pr_ledger.record_outcome(pr_url, outcome, {
         "repo": repo, "pattern_id": row.get("pattern_id", ""),

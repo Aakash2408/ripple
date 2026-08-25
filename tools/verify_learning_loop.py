@@ -119,6 +119,25 @@ def _open_pr(webhook, url: str, explanation: str) -> None:
     )
 
 
+def _with_app_authors(webhook, count: int = 1):
+    """Substitute the commit-author fetch with what the API would return.
+
+    The author check is LIVE: _record_pr_terminal calls
+    _fetch_pr_commit_authors, which hits /repos/{repo}/pulls/{n}/commits. This
+    verifier has no installation and no token, so the real call returns None --
+    and None correctly means "assume a human touched it", which would make every
+    merge here read as merged_with_edits and test nothing about the ladder.
+
+    Substituting is only safe because a separate regression test pins that
+    production actually performs this fetch at the convergence point
+    (test_the_commit_authors_are_actually_fetched_not_read_from_the_payload).
+    Without that pairing this seam would be the same trap the old `commit_list`
+    payload key was: filled by tests, never by production.
+    """
+    webhook._fetch_pr_commit_authors = (
+        lambda *_a, **_k: [APP_LOGIN] * max(1, count))
+
+
 def phase_write() -> int:
     from app import pr_ledger, webhook
     from app.rag_store import rag_store
@@ -140,6 +159,7 @@ def phase_write() -> int:
           _find(rag_store, pattern_id=pid), None)
 
     # --- 2. clean merge DERIVES the pattern ------------------------------
+    _with_app_authors(webhook, 1)
     pr = _pr(PR_CLEAN, merged=True, commits=1, files=1)
     r1 = webhook._record_pr_terminal(pr, _payload(pr, [APP_LOGIN]), merged=True)
     print(f"     clean merge      -> {r1}")
@@ -153,6 +173,7 @@ def phase_write() -> int:
 
     # --- 3. human-edited merge: no credit, but it OWNS the strategy ------
     _open_pr(webhook, PR_EDITED, f"[RAG/{pid}] applied a learned pattern")
+    webhook._fetch_pr_commit_authors = lambda *_a, **_k: [APP_LOGIN, "a-human"]
     pr = _pr(PR_EDITED, merged=True, commits=2, files=1, closer="a-human")
     r2 = webhook._record_pr_terminal(
         pr, _payload(pr, [APP_LOGIN, "a-human"]), merged=True)
@@ -180,6 +201,7 @@ def phase_write() -> int:
 
     # --- 5. a PR we never opened teaches nothing -------------------------
     before = len(rag_store.patterns)
+    _with_app_authors(webhook, 1)
     pr = _pr(PR_FOREIGN, merged=True, commits=1, files=1, closer="someone-else")
     r4 = webhook._record_pr_terminal(
         pr, _payload(pr, ["someone-else"]), merged=True)
@@ -191,6 +213,7 @@ def phase_write() -> int:
     # --- 6a. a MANY-commit edit is contaminated: no provenance raise ------
     url6a = f"https://github.com/{REPO}/pull/9006"
     _open_pr(webhook, url6a, f"[RAG/{pid}] applied a learned pattern")
+    webhook._fetch_pr_commit_authors = lambda *_a, **_k: [APP_LOGIN] * 3 + ["a-human"]
     pr = _pr(url6a, merged=True, commits=4, files=1, closer="a-human")
     r6a = webhook._record_pr_terminal(
         pr, _payload(pr, [APP_LOGIN, "a-human", "a-human", "a-human"]), merged=True)
@@ -202,6 +225,7 @@ def phase_write() -> int:
     # --- 6b. a contaminated merge is recorded but teaches nothing ---------
     url = f"https://github.com/{REPO}/pull/9005"
     _open_pr(webhook, url, f"[RAG/{pid}] applied a learned pattern")
+    _with_app_authors(webhook, 1)
     pr = _pr(url, merged=True, commits=1, files=7)
     r5 = webhook._record_pr_terminal(pr, _payload(pr, [APP_LOGIN]), merged=True)
     print(f"     contaminated     -> {r5}")

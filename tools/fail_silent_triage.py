@@ -340,6 +340,26 @@ TRIAGE: dict[tuple, tuple] = {
         "The restore exists so consumers do not accumulate each other's patches, not "
         "as a correctness guarantee about the tree."),
 
+    ("webhook.py", "_fetch_pr_commit_authors", "swallowed_except", "Exception", 0): (
+        LEGITIMATE,
+        "Returning None on ANY failure is the correctness-preserving direction "
+        "here, not a shortcut. None means 'a human may have touched this PR', so "
+        "the caller records the outcome and credits NO counters -- the failure "
+        "degrades to learning nothing, never to learning wrongly. Raising would "
+        "instead lose the whole terminal-state record for a PR whose outcome we "
+        "did observe. The miss is NOT silent to an operator: "
+        "_record_pr_terminal logs commit_authors_unavailable with the effect "
+        "spelled out whenever this returns None. SAME_AS(webhook.py, "
+        "_pr_had_human_edits) for why unknown must read as edited."),
+    ("webhook.py", "_fetch_pr_commit_authors", "silent_empty_return", "", 0): (
+        LEGITIMATE,
+        "A non-list response from the commits endpoint is an API shape we cannot "
+        "read, which is indistinguishable from not knowing the authors -- so it "
+        "returns None for the same reason the except does, and the caller treats "
+        "it as human-edited. Returning [] instead would assert 'no authors', "
+        "which a caller would read as 'nobody but Ripple touched it' and credit a "
+        "clean merge off an unverified PR."),
+
     ("webhook.py", "_retry_delay", "swallowed_except",
      "(AttributeError, TypeError, ValueError)", 0): (
         LEGITIMATE,
