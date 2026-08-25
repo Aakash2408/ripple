@@ -1,0 +1,40 @@
+openapi: 3.0.3
+info:
+  title: User API
+  version: 1.0.0
+paths:
+  /users/{id}:
+    get:
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: the user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+components:
+  schemas:
+    User:
+      type: object
+      required: [id, email, fullName, phoneNumber]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        fullName:
+          type: string
+        phoneNumber:
+          type: integer
+          format: int32
+          description: >-
+            Digits only. RETYPED to string in v1.1 -- this is the breaking
+            change. int32 was always wrong: it cannot hold a leading zero or a
+            leading +, so any non-NANP number was already being corrupted.

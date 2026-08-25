@@ -139,14 +139,14 @@ def main(argv: list) -> int:
                 # no longer does. Same mistake as the negative corpus building its
                 # own layer stack: if the tool does not go through the door the
                 # customer's request goes through, it is measuring a sibling.
-                from app.fix_templates import apply_fix_template, _LAST_TS_RESULT
+                from app.fix_templates import apply_fix_template, _LAST_CODEMOD_RESULT
 
                 fixed, _explanation = apply_fix_template(
                     code=content, language="typescript",
                     change_type="removed_field", field_name=field)
-                edits = _LAST_TS_RESULT.get("edits") or []
-                refusals = _LAST_TS_RESULT.get("refusals") or []
-                diff_violations = _LAST_TS_RESULT.get("diff_violations") or []
+                edits = _LAST_CODEMOD_RESULT.get("edits") or []
+                refusals = _LAST_CODEMOD_RESULT.get("refusals") or []
+                diff_violations = _LAST_CODEMOD_RESULT.get("diff_violations") or []
                 complete = (fixed != content) and not refusals
 
                 print(f"\n  {rel}")

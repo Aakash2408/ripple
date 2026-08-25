@@ -386,11 +386,354 @@ def validate_typescript(workspace: str, backend: str = "",
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+#: Pinned for the same reason as DOCKER_IMAGE. Alpine because mypy needs no wheels
+#: with C extensions at the versions we pin.
+PYTHON_DOCKER_IMAGE = "python:3.11-alpine"
+
+#: The Python equivalent of node_modules: a venv INSIDE the mounted volume, so the
+#: install survives into the second container. pip installs into the container's own
+#: site-packages by default, which the read-only check container does not have --
+#: the first draft did exactly that and mypy was simply "not found" in phase two.
+VENV_DIR = ".ripple-venv"
+
+#: mypy's default line format:
+#:   src/checkout.py:4: error: "int" has no attribute "strip"  [attr-defined]
+_MYPY_LINE = re.compile(
+    r'^(?P<file>[^:]+):(?P<line>\d+):\s*error:\s*(?P<message>.*?)'
+    r'(?:\s+\[(?P<code>[a-z][a-z0-9-]*)\])?$')
+
+#: mypy reports a MISSING ANNOTATION under this code. It is not a type error and
+#: must never be reported as one -- but it does mean mypy could not see the types it
+#: would have needed, which is a third thing again. See validate_python.
+_NO_ANNOTATION_CODE = "no-untyped-def"
+
+
+def _parse_mypy(out: str) -> list:
+    rows = []
+    for raw in out.splitlines():
+        m = _MYPY_LINE.match(raw.strip())
+        if m:
+            d = m.groupdict()
+            d["code"] = d.get("code") or "unknown"
+            rows.append(d)
+    return rows
+
+
+def validate_python(workspace: str, backend: str = "",
+                    project_subdir: str = "") -> Verdict:
+    """Typecheck a Python workspace with mypy. The workspace is COPIED, never mutated.
+
+    WHY MYPY AND NOT compileall, WHICH IS WHAT THE REGISTRY DECLARED
+    ---------------------------------------------------------------
+    capability_claims declared this validator as "compileall + optional pytest" and
+    its own note already recorded the problem: compile() catches syntax only. That
+    was measured before writing this, not assumed -- a consumer reading a field the
+    contract had deleted passed `python -m compileall` with exit 0. A validator that
+    cannot fail on a genuinely broken consumer is not a validator, and wiring it
+    would have granted AUTO on evidence of nothing.
+
+    THE PROPERTY PYTHON HAS AND TYPESCRIPT DOES NOT
+    -----------------------------------------------
+    `tsc` reads a project's own compiler config and typechecks everything. mypy's
+    power depends on the CONSUMER's annotation coverage: the same broken file, with
+    the parameter annotation removed, passes mypy with exit 0. Measured:
+
+        annotated consumer, real break     "User has no attribute phone_number"  exit 1
+        UNannotated consumer, same break   exit 0
+
+    So an exit 0 from mypy is ambiguous in a way an exit 0 from tsc is not. It means
+    either "the code is fine" or "I could not see the types". Collapsing those into
+    VALID is precisely the absence-of-evidence-as-evidence defect this module exists
+    to prevent, so this runner separates them with `--disallow-untyped-defs` and
+    splits the result THREE ways by error code:
+
+        any error that is not no-untyped-def  -> INVALID            (a real type error)
+        only no-untyped-def errors            -> UNABLE_TO_VALIDATE (cannot see enough)
+        no errors at all                      -> VALID
+
+    A partially annotated consumer therefore cannot reach AUTO, which is the correct
+    and deliberately conservative answer rather than a limitation to work around.
+
+    DOCKER ONLY
+    -----------
+    choose_backend()'s host fallback probes for a NODE binary; a node install says
+    nothing about python or mypy being present, so accepting "host" here would run
+    an unknown toolchain. Refusing is honest and keeps the degraded path
+    TypeScript-only.
+    """
+    backend, note = (backend, "explicit") if backend else choose_backend()
+    ev = {"backend": backend or "none", "backend_note": note,
+          "image": PYTHON_DOCKER_IMAGE if backend == "docker" else None,
+          "language": "python"}
+
+    if not backend:
+        return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                       "no validation backend: docker is unreachable", evidence=ev)
+    if backend != "docker":
+        return Verdict(
+            ValidationState.UNABLE_TO_VALIDATE,
+            f"python validation requires docker; backend {backend!r} was selected "
+            f"by probing for a node toolchain, which is no evidence that python or "
+            f"mypy exist here. Refusing rather than running an unknown toolchain",
+            evidence=ev)
+
+    project_dir = os.path.join(workspace, project_subdir) if project_subdir \
+        else workspace
+    ev["project_subdir"] = project_subdir or "."
+
+    # requirements-dev.txt pins mypy at the workspace root (where the install runs);
+    # the mypy config lives with the project, mirroring package.json vs tsconfig.json.
+    # The PROJECT pins its own toolchain version, as the TypeScript fixture does --
+    # a version chosen by this runner would make the verdict depend on Ripple's
+    # release rather than on the consumer's declared toolchain.
+    for required, where in (("requirements-dev.txt", workspace),
+                            ("mypy.ini", project_dir)):
+        if not os.path.exists(os.path.join(where, required)):
+            rel = os.path.relpath(where, workspace)
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"{required} is missing from "
+                           f"{'the workspace root' if rel == '.' else rel}, so mypy "
+                           f"has no pinned version or configuration -- an unpinned "
+                           f"typecheck is not reproducible evidence",
+                           evidence=ev)
+
+    tmp = tempfile.mkdtemp(prefix="ripple-validate-py-")
+    work = os.path.join(tmp, "w")
+    try:
+        shutil.copytree(workspace, work,
+                        ignore=shutil.ignore_patterns(VENV_DIR, "__pycache__",
+                                                      ".mypy_cache", ".git"))
+
+        ev["install"] = f"python -m venv {VENV_DIR} && pip install -r requirements-dev.txt"
+        install = ["docker", "run", "--rm",
+                   "-v", f"{work}:/w", "-w", "/w",
+                   "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
+                   "--security-opt", "no-new-privileges",
+                   PYTHON_DOCKER_IMAGE, "sh", "-c",
+                   f"python -m venv {VENV_DIR} && "
+                   f"{VENV_DIR}/bin/pip install -q --no-cache-dir "
+                   f"-r requirements-dev.txt"]
+        code, out, err = _run(install, work, INSTALL_TIMEOUT, None)
+        ev["install_exit"] = code
+        if code != 0:
+            # NOT invalid. We never found out whether the code is correct.
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"toolchain install failed ({err or 'exit ' + str(code)}), "
+                           f"so mypy never ran: {out.strip()[-300:]}",
+                           evidence=ev)
+
+        target = project_subdir or "."
+        # --cache-dir into /tmp: the source mount is read-only, and mypy writing its
+        # incremental cache into the tree would both fail and dirty the diff.
+        #
+        # --exclude the venv: it lives INSIDE the volume (it has to, to survive into
+        # this container), so `mypy .` walks into it and typechecks mypy's own
+        # dependencies -- thousands of errors from third-party code, reported as the
+        # consumer's. The venv is this runner's artifact, so excluding it is this
+        # runner's job and not something a fixture should have to know about.
+        check = ["docker", "run", "--rm", "--network", "none",
+                 "-v", f"{work}:/w:ro", "-w", "/w",
+                 "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
+                 "--security-opt", "no-new-privileges",
+                 PYTHON_DOCKER_IMAGE,
+                 f"{VENV_DIR}/bin/mypy", "--disallow-untyped-defs",
+                 "--no-error-summary", "--cache-dir=/tmp/.mypy_cache",
+                 "--exclude", f"(^|/){re.escape(VENV_DIR)}/", target]
+        ev["typecheck"] = (f"mypy --disallow-untyped-defs --exclude {VENV_DIR} "
+                           f"{target}")
+
+        code, out, err = _run(check, work, TYPECHECK_TIMEOUT, None)
+        ev["typecheck_exit"] = code
+        if code is None:
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"typecheck could not run: {err}", evidence=ev)
+
+        rows = _parse_mypy(out)
+        gaps = [r for r in rows if r["code"] == _NO_ANNOTATION_CODE]
+        real = [r for r in rows if r["code"] != _NO_ANNOTATION_CODE]
+        ev["mypy_errors"] = len(real)
+        ev["mypy_annotation_gaps"] = len(gaps)
+
+        fmt = [f"{r['file']}({r['line']}): {r['code']} {r['message']}" for r in real]
+
+        if real:
+            return Verdict(ValidationState.INVALID,
+                           f"mypy rejected the generated code with {len(real)} "
+                           f"error(s)",
+                           errors=fmt or [out.strip()[-300:]], evidence=ev)
+        if gaps:
+            # Exit code was non-zero but ONLY because of missing annotations. mypy
+            # therefore never had the type information a real check needs, and a
+            # clean result here would be evidence of nothing.
+            where = ", ".join(f"{r['file']}({r['line']})" for r in gaps[:5])
+            return Verdict(
+                ValidationState.UNABLE_TO_VALIDATE,
+                f"mypy found no type errors, but {len(gaps)} function(s) lack "
+                f"annotations ({where}) -- so it could not see the types this "
+                f"check depends on. A pass here would not be evidence",
+                evidence=ev)
+        if code != 0:
+            # Non-zero with nothing parseable: a crash, a bad config, an internal
+            # error. Not INVALID -- we did not learn that the code is wrong.
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"mypy exited {code} without reporting a parseable "
+                           f"error: {out.strip()[-300:]}", evidence=ev)
+        return Verdict(ValidationState.VALID,
+                       "mypy --disallow-untyped-defs accepted the generated code",
+                       evidence=ev)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+#: Pinned, same reasoning as the other images.
+GO_DOCKER_IMAGE = "golang:1.21-alpine"
+
+#: Go's module cache, like the Python venv, must live INSIDE the mounted volume or
+#: the second container cannot see what the first downloaded. GOCACHE (the BUILD
+#: cache) goes to /tmp instead, because the check container mounts the source
+#: read-only and go writes there unconditionally.
+GOMODCACHE_DIR = ".ripple-gomodcache"
+
+#: `./contact.go:10:41: u.PhoneNumber undefined (type models.User has no field ...)`
+_GO_LINE = re.compile(
+    r"^(?P<file>[^\s:]+\.go):(?P<line>\d+):(?P<col>\d+):\s*(?P<message>.+)$")
+
+
+def _parse_go(out: str) -> list:
+    rows = []
+    for raw in out.splitlines():
+        m = _GO_LINE.match(raw.strip())
+        if m:
+            rows.append(m.groupdict())
+    return rows
+
+
+def validate_go(workspace: str, backend: str = "",
+                project_subdir: str = "") -> Verdict:
+    """Build a Go module. The workspace is COPIED, never mutated.
+
+    WHY GO IS THE STRICTEST OF THE THREE
+    The registry's note is right and it matters here: unused imports and unused
+    variables are compile ERRORS in Go, not warnings. Removing a field's last use
+    therefore breaks the build unless the fix also removes the import that only that
+    use needed. That makes `go build` catch a class of incomplete fix that `tsc`
+    accepts and mypy never sees -- so a Go cell is harder to reach AUTO with, and
+    that difficulty is the validator doing its job rather than a defect.
+
+    TWO STATES PLUS ONE, NOT THREE
+    Python needed a third outcome because mypy's reach depends on the consumer's
+    annotations. Go has no equivalent hole: `go build` either compiles the package or
+    does not, and there is no "I could not see enough" middle. So this returns
+    VALID / INVALID / UNABLE_TO_VALIDATE, where the last means the toolchain never
+    ran -- never "it ran and I am unsure".
+
+    DOCKER ONLY, for the same reason as Python: choose_backend()'s host fallback
+    probes for a node binary, which is no evidence that a Go toolchain exists.
+
+    A NOTE ON THE NETWORK
+    `go mod download` needs the module proxy. On a corporate network that intercepts
+    TLS -- measured on this dev desktop, where proxy.golang.org resolves to a DNS
+    sinkhole -- the download fails and this returns UNABLE_TO_VALIDATE rather than
+    INVALID, because a missing dependency tells us nothing about the code. A
+    stdlib-only consumer needs no network at all and validates fine.
+    """
+    backend, note = (backend, "explicit") if backend else choose_backend()
+    ev = {"backend": backend or "none", "backend_note": note,
+          "image": GO_DOCKER_IMAGE if backend == "docker" else None,
+          "language": "go"}
+
+    if not backend:
+        return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                       "no validation backend: docker is unreachable", evidence=ev)
+    if backend != "docker":
+        return Verdict(
+            ValidationState.UNABLE_TO_VALIDATE,
+            f"go validation requires docker; backend {backend!r} was selected by "
+            f"probing for a node toolchain, which is no evidence that a Go "
+            f"toolchain exists here. Refusing rather than guessing",
+            evidence=ev)
+
+    project_dir = os.path.join(workspace, project_subdir) if project_subdir \
+        else workspace
+    ev["project_subdir"] = project_subdir or "."
+
+    # go.mod defines the module and its requirements. Without it `go build ./...`
+    # resolves nothing and the verdict would describe a different program.
+    if not os.path.exists(os.path.join(project_dir, "go.mod")):
+        rel = os.path.relpath(project_dir, workspace)
+        return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                       f"go.mod is missing from "
+                       f"{'the workspace root' if rel == '.' else rel}, so the "
+                       f"module and its requirements are undefined -- building "
+                       f"without it proves nothing",
+                       evidence=ev)
+
+    tmp = tempfile.mkdtemp(prefix="ripple-validate-go-")
+    work = os.path.join(tmp, "w")
+    try:
+        shutil.copytree(workspace, work,
+                        ignore=shutil.ignore_patterns(GOMODCACHE_DIR, ".git"))
+
+        env = ["-e", f"GOMODCACHE=/w/{GOMODCACHE_DIR}",
+               "-e", "GOCACHE=/tmp/gocache",
+               "-e", "GOFLAGS=-mod=mod"]
+        ev["install"] = "go mod download all"
+        install = ["docker", "run", "--rm",
+                   "-v", f"{work}:/w", "-w", "/w"] + env + [
+                   "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
+                   "--security-opt", "no-new-privileges",
+                   GO_DOCKER_IMAGE, "go", "mod", "download", "all"]
+        code, out, err = _run(install, work, INSTALL_TIMEOUT, None)
+        ev["install_exit"] = code
+        if code != 0:
+            # NOT invalid. We never found out whether the code is correct. This is
+            # the path a TLS-intercepting corporate proxy takes.
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"module download failed ({err or 'exit ' + str(code)}), "
+                           f"so the compiler never ran: {out.strip()[-300:]}",
+                           evidence=ev)
+
+        target = f"./{project_subdir}/..." if project_subdir else "./..."
+        check = ["docker", "run", "--rm", "--network", "none",
+                 "-v", f"{work}:/w:ro", "-w", "/w"] + env + [
+                 "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
+                 "--security-opt", "no-new-privileges",
+                 GO_DOCKER_IMAGE, "go", "build", target]
+        ev["typecheck"] = f"go build {target}"
+
+        code, out, err = _run(check, work, TYPECHECK_TIMEOUT, None)
+        ev["typecheck_exit"] = code
+        if code is None:
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"build could not run: {err}", evidence=ev)
+
+        rows = _parse_go(out)
+        ev["go_errors"] = len(rows)
+        if code == 0:
+            return Verdict(ValidationState.VALID,
+                           "go build accepted the generated code", evidence=ev)
+        if not rows:
+            # Non-zero with nothing parseable: a toolchain or module error rather
+            # than a compile error. We did not learn that the code is wrong.
+            return Verdict(ValidationState.UNABLE_TO_VALIDATE,
+                           f"go build exited {code} without a parseable compile "
+                           f"error: {out.strip()[-300:]}", evidence=ev)
+        return Verdict(
+            ValidationState.INVALID,
+            f"go build rejected the generated code with {len(rows)} error(s)",
+            errors=[f"{r['file']}({r['line']}): {r['message']}" for r in rows],
+            evidence=ev)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 #: language -> runner. A language absent here is UNABLE_TO_VALIDATE, which is the
 #: honest state and makes no claim -- the same reason capability_claims lists a
 #: validator for only three languages instead of inventing eleven more.
 RUNNERS = {
     "typescript": validate_typescript,
+    "python": validate_python,
+    "go": validate_go,
 }
 
 

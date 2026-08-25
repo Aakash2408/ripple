@@ -46,6 +46,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+from app.ast_compat import source_of
 
 # The functions that actually open a pull request / merge request / review.
 PR_CREATORS = {
@@ -327,7 +330,7 @@ def _terminal_state_wrapping(path: str) -> list:
         return [f"{PIPELINE_FN} is gone -- this check no longer checks anything"]
 
     loops = [n for n in ast.walk(fn)
-             if isinstance(n, ast.For) and ast.unparse(n.iter) == "breaking_changes"]
+             if isinstance(n, ast.For) and source_of(n.iter) == "breaking_changes"]
     if not loops:
         return ["no `for change in breaking_changes` loop found -- if it was "
                 "renamed, update this check rather than deleting it"]
@@ -335,7 +338,7 @@ def _terminal_state_wrapping(path: str) -> list:
     for loop in loops:
         first = loop.body[0]
         wrapped = (isinstance(first, ast.With)
-                   and any("ChangeRun" in ast.unparse(i.context_expr)
+                   and any("ChangeRun" in source_of(i.context_expr)
                            for i in first.items))
         if not wrapped:
             problems.append(

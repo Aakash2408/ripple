@@ -126,24 +126,9 @@ def _inside_jsx_tag(code: str, pos: int, limit: int = 4000) -> bool:
     return False
 
 
-@dataclass
-class CodemodResult:
-    code: str
-    changed: bool
-    edits: list = _field(default_factory=list)
-    refusals: list = _field(default_factory=list)
-    notes: list = _field(default_factory=list)
-
-    @property
-    def complete(self) -> bool:
-        """Every reference that MATTERS was handled.
-
-        Notes are excluded deliberately: a comment or string mentioning the field
-        is not a compile error, so letting it veto the fix would block almost every
-        real consumer. A partial removal, by contrast, still leaves a type error, so
-        "some edits" is not success -- it is a different failure.
-        """
-        return self.changed and not self.refusals
+#: Moved to app/codemod_result.py when the Python codemod needed the same contract.
+#: Re-exported here because this module's public surface already included it.
+from .codemod_result import CodemodResult  # noqa: E402  (kept next to its users)
 
 
 def _regions(code: str) -> list:
@@ -350,5 +335,243 @@ def remove_field(code: str, field: str) -> CodemodResult:
                 f"can remove safely. Removing a function parameter breaks every "
                 f"caller; removing a destructured binding or an aliased value "
                 f"changes behaviour. A human must decide.")
+
+    return CodemodResult(out, out != code, edits, refusals, notes)
+
+
+# ---------------------------------------------------------------------------
+# TYPE REMOVED
+# ---------------------------------------------------------------------------
+
+def _type_refusal_reason(line: str, type_name: str) -> str:
+    """Why this particular reference cannot be repaired mechanically.
+
+    One specific reason per shape, so the PR body tells a reviewer what decision
+    is being asked of them rather than "a human must decide".
+    """
+    esc = re.escape(type_name)
+    s = line.strip()
+    if re.search(rf"\b(?:extends|implements)\s+[\w.,<>\s]*\b{esc}\b", s):
+        return ("a base class or implemented interface -- the subtype's entire "
+                "contract depends on it, so removing the inheritance is a redesign")
+    if re.search(rf"\bnew\s+{esc}\b", s):
+        return ("a construction -- there is no value to substitute for the object "
+                "it was building")
+    if re.search(rf"\binstanceof\s+{esc}\b", s):
+        return ("a runtime type test -- deleting it silently changes which branch "
+                "runs, which is a behavioural decision")
+    if re.search(rf"^\s*(?:export\s+)?(?:async\s+)?function\b.*\b{esc}\b", s) \
+            or re.search(rf"\)\s*:\s*[\w<>\[\]|\s]*\b{esc}\b", s):
+        return ("part of a function signature -- deleting the function, changing "
+                "the parameter, or inlining the fields are three different "
+                "decisions")
+    if re.search(rf":\s*[\w<>\[\]|\s]*\b{esc}\b", s):
+        return ("a type annotation on live code -- removing the annotation would "
+                "hide the break rather than fix it")
+    if re.search(rf"\bas\s+{esc}\b", s):
+        return ("a type assertion -- dropping it changes what the compiler is "
+                "allowed to infer about live code")
+    if re.search(rf"\b{esc}\s+as\s+\w+", s):
+        return ("an aliased import whose local name is used elsewhere; dropping it "
+                "would orphan every use of the alias")
+    return ("referenced in a way this codemod cannot repair mechanically. A "
+            "deleted type has no substitute value, so refusing is the only safe "
+            "answer")
+
+
+def _rewrite_binding_list(raw: str, esc: str) -> tuple:
+    """Split a `{ A, B as C }` binding list and drop the exact name.
+
+    Returns (kept, dropped). An aliased binding (`User as U`) is NOT dropped: the
+    local name is `U` and something else uses it, so removing the import would
+    orphan those uses. It stays, and the classification pass refuses it.
+    """
+    kept, dropped = [], []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        # `type User` inside a mixed `import { type User, Address }` list.
+        if re.fullmatch(rf"(?:type\s+)?{esc}", p):
+            dropped.append(p)
+        else:
+            kept.append(p)
+    return kept, dropped
+
+
+def remove_type(code: str, type_name: str) -> CodemodResult:
+    """Remove references to a deleted TYPE from TypeScript or JavaScript, or refuse.
+
+    WHY THIS REPLACES THE REGEX
+    Two separate defects, in two languages, from one shared table.
+
+    TypeScript went through `_TYPE_REF_PATTERNS['typescript']`, whose first entry is
+
+        r'^\\s*import\\s+.*\\b{name}\\b.*$'
+
+    which deletes the ENTIRE import statement when the removed name appears anywhere
+    on it -- the identical bug already fixed in py_codemod. Measured:
+
+        import { User, Address } from './models';   ->  (line deleted)
+        export function label(a: Address) { ... }   ->  UNCHANGED
+
+    so `Address` became undefined while it reported "Removed references to deleted
+    type 'User' (1 lines affected)". `tsc` would eventually catch the fallout, but
+    the fix path still returns a broken file and calls it a success.
+
+    JavaScript was worse: it has NO entry in that table at all, so it fell through
+    to `_generic_remove`, which deletes every line matching any CASE VARIANT of the
+    name. `name_variants("User")` yields snake `user` and camel `user` -- the
+    conventional variable name for a User -- so it deleted essentially every line of
+    a real consumer. Measured, a two-function module was reduced to `}`:
+
+        export function fmt(user) { return user.email; }   ->   }
+        claim: "Removed references to deleted type 'User' (2 lines affected)."
+
+    And JavaScript has no wired validator, so nothing downstream caught it.
+
+    WHAT IS ACTUALLY MECHANICAL WHEN A TYPE IS DELETED
+    Almost nothing, and that is the honest answer rather than a limitation -- the
+    same conclusion py_codemod.remove_type reached. A consumer with
+    `function label(u: User): string` cannot be repaired by any transformation:
+    deleting the function, changing the signature, and inlining the fields are three
+    different decisions with different consequences.
+
+    The ONE safe edit is removing the name from an import (or `require`) binding list
+    while leaving its neighbours alone, and deleting the statement only when nothing
+    is left to import. That is a complete fix exactly when the type was imported but
+    never used -- a stale import -- and the only case where nothing else must change.
+
+    Everything else REFUSES, so `complete` is False and the fix path returns the
+    original code.
+
+    ONE SHARED IMPLEMENTATION FOR BOTH LANGUAGES
+    TS and JS already share `remove_field` here, because the shapes that matter are
+    the shapes they have in common. Type-only syntax (`import type`, `: User`) simply
+    never appears in a `.js` file, so the TS-specific handling is inert there rather
+    than wrong. The one JS-only shape is CommonJS `require`, handled below.
+    """
+    if not type_name:
+        return CodemodResult(code, False, refusals=["no type name given"])
+
+    anywhere = re.compile(rf"\b{re.escape(type_name)}\b")
+    if not anywhere.search(code):
+        return CodemodResult(code, False)
+
+    edits, refusals, notes = [], [], []
+    out = code
+    esc = re.escape(type_name)
+    DELETE = "\x00DELETE\x00"
+
+    # 1. Single-line ES import with a braced binding list, optionally preceded by a
+    #    default binding:
+    #        import { User, Address } from './m';
+    #        import type { User } from './m';
+    #        import Default, { User } from './m';
+    named = re.compile(
+        rf"^(?P<indent>[ \t]*)import[ \t]+(?P<type>type[ \t]+)?"
+        rf"(?P<default>[A-Za-z_$][\w$]*[ \t]*,[ \t]*)?"
+        rf"\{{(?P<names>[^{{}}\n]*)\}}[ \t]*from[ \t]*(?P<src>['\"][^'\"\n]+['\"])"
+        rf"(?P<semi>;?)[ \t]*$",
+        re.MULTILINE)
+
+    def _rewrite_named(m):
+        kept, dropped = _rewrite_binding_list(m.group("names"), esc)
+        if not dropped:
+            return m.group(0)
+        default = (m.group("default") or "").strip().rstrip(",").strip()
+        if not kept and not default:
+            edits.append({"shape": "import statement (last binding removed)",
+                          "removed": m.group(0).strip()})
+            return DELETE
+        edits.append({"shape": "name in import list",
+                      "removed": f"{type_name} from `{m.group(0).strip()}`"})
+        ty = m.group("type") or ""
+        head = f"{default}, " if default else ""
+        if not kept:
+            # Only the default binding survives: `import D from './m';`
+            return (f"{m.group('indent')}import {ty}{default} from "
+                    f"{m.group('src')}{m.group('semi')}")
+        return (f"{m.group('indent')}import {ty}{head}{{ {', '.join(kept)} }} from "
+                f"{m.group('src')}{m.group('semi')}")
+
+    out = named.sub(_rewrite_named, out)
+
+    # 2. Single-line CommonJS destructured require:
+    #        const { User, Address } = require('./m');
+    cjs = re.compile(
+        rf"^(?P<indent>[ \t]*)(?P<kw>const|let|var)[ \t]+"
+        rf"\{{(?P<names>[^{{}}\n]*)\}}[ \t]*=[ \t]*(?P<call>require\([^)\n]*\))"
+        rf"(?P<semi>;?)[ \t]*$",
+        re.MULTILINE)
+
+    def _rewrite_cjs(m):
+        kept, dropped = _rewrite_binding_list(m.group("names"), esc)
+        if not dropped:
+            return m.group(0)
+        if not kept:
+            edits.append({"shape": "require statement (last binding removed)",
+                          "removed": m.group(0).strip()})
+            return DELETE
+        edits.append({"shape": "name in require binding list",
+                      "removed": f"{type_name} from `{m.group(0).strip()}`"})
+        return (f"{m.group('indent')}{m.group('kw')} {{ {', '.join(kept)} }} = "
+                f"{m.group('call')}{m.group('semi')}")
+
+    out = cjs.sub(_rewrite_cjs, out)
+
+    # 3. A sole default import or require of exactly this name:
+    #        import User from './m';        const User = require('./m');
+    #    Safe only because there is no binding list to preserve.
+    sole = re.compile(
+        rf"^[ \t]*(?:import[ \t]+(?:type[ \t]+)?{esc}[ \t]+from[ \t]*['\"][^'\"\n]+['\"];?"
+        rf"|(?:const|let|var)[ \t]+{esc}[ \t]*=[ \t]*require\([^)\n]*\);?)[ \t]*$",
+        re.MULTILINE)
+    for m in list(sole.finditer(out)):
+        edits.append({"shape": "sole import of the deleted type",
+                      "removed": m.group(0).strip()})
+    out = sole.sub(DELETE, out)
+
+    # 4. Multi-line braced import/require with one binding per line -- remove just
+    #    that line. Only attempted when the name genuinely sits alone on its line,
+    #    so a nested or exotic form falls through to the refusal pass instead of
+    #    being guessed at.
+    per_line = re.compile(rf"^[ \t]*(?:type[ \t]+)?{esc}[ \t]*,?[ \t]*$\n?", re.MULTILINE)
+    if re.search(r"(?:import|require\()\s*\{[^}]*\n", out) or re.search(r"\{\s*\n", out):
+        for m in list(per_line.finditer(out)):
+            edits.append({"shape": "name on its own line in a multi-line import",
+                          "removed": m.group(0).strip()})
+        out = per_line.sub("", out)
+
+    # Drop the marked whole-statement deletions, taking their newline with them.
+    out = re.sub(rf"{re.escape(DELETE)}\n?", "", out)
+
+    # 5. Classify what is left. Every remaining reference in CODE refuses: a type is
+    #    not a value, so there is no equivalent of dropping an interpolation or an
+    #    object-literal property the way remove_field can. A mention in a comment or
+    #    a string is a NOTE -- it cannot break a build, and blocking the fix over it
+    #    would block nearly every real consumer.
+    regions = _regions(out)
+    lines = out.split("\n")
+    seen = set()
+    for m in anywhere.finditer(out):
+        line_no = out[:m.start()].count("\n") + 1
+        line = lines[line_no - 1] if line_no - 1 < len(lines) else ""
+        kind = _kind_at(m.start(), regions)
+        key = (line_no, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        if kind == "comment":
+            notes.append(f"line {line_no}: mentioned in a comment -- left as is, "
+                         f"but it is now stale: `{line.strip()[:70]}`")
+        elif kind == "string":
+            notes.append(f"line {line_no}: appears in a string literal -- left as "
+                         f"is, since editing it could change behaviour: "
+                         f"`{line.strip()[:70]}`")
+        else:
+            refusals.append(
+                f"line {line_no}: `{line.strip()[:80]}` -- "
+                f"{_type_refusal_reason(line, type_name)}")
 
     return CodemodResult(out, out != code, edits, refusals, notes)

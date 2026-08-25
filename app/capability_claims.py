@@ -103,14 +103,25 @@ VALIDATORS: dict[str, ValidatorSpec] = {
              "int32` is syntactically fine and semantically impossible, so brace "
              "matching cannot catch it."),
     "python": ValidatorSpec(
-        "python", "compileall + optional pytest",
-        note="compile() catches syntax only. It passed a half-fix that accepts a "
-             "parameter and never sends it, which is the most common defect."),
+        "python", "mypy --disallow-untyped-defs",
+        implemented_by="app.validation:validate_python",
+        note="Declared as `compileall + optional pytest` until it was wired, and "
+             "that was measured to be useless: a consumer reading a field the "
+             "contract had DELETED passes `python -m compileall` with exit 0. mypy "
+             "catches it. But mypy's reach depends on the CONSUMER's annotations -- "
+             "the same broken file passes at exit 0 once the parameter annotation is "
+             "removed -- so the runner splits three ways and a partially annotated "
+             "consumer is UNABLE_TO_VALIDATE rather than VALID."),
     "go": ValidatorSpec(
         "go", "go build ./...",
-        note="Unused imports and unused variables are compile ERRORS in Go, so "
-             "removing a field's last use breaks the build -- exactly the case a "
-             "removal fix creates."),
+        implemented_by="app.validation:validate_go",
+        note="The strictest of the three. Unused imports and unused variables are "
+             "compile ERRORS in Go, so removing a field's last use breaks the build "
+             "unless the fix also drops the import that only that use needed -- a "
+             "class of incomplete fix tsc accepts and mypy never sees. Two states "
+             "plus UNABLE, not three: go build has no annotation-coverage hole, so "
+             "there is no 'ran but could not see enough'. NOTE: no Go cell has an "
+             "e2e fixture yet, so validate_ok rises while e2e_tested does not."),
 }
 
 # Claims that a fixture proved the complete path, keyed by cell, valued by the
@@ -127,9 +138,35 @@ VALIDATORS: dict[str, ValidatorSpec] = {
 # `tsc --noEmit` in a container, and byte-compares every other file to prove the
 # diff is minimal. It SKIPS when no backend exists rather than passing, because a
 # test that passes without a compiler is evidence of nothing.
+#
+# The second entry needed no new validator, no new codemod and no new detection --
+# only the fixture. The THIRD needed a validator: python was a declaration with an
+# empty implemented_by until it was wired, and wiring it doubled validate_ok from 63
+# cells to 126. Its op is deliberately the same as the second cell's, so that the
+# new fixture tests the new VALIDATOR rather than an unexercised codemod.
+#
+# The FOURTH needed a CODEMOD. python/openapi/remove_field was blocked on nothing
+# but a fixture according to the registry, and a fixture would have failed: the
+# Python remove_field handler was five context-free regexes that returned the file
+# untouched while reporting "2 lines affected". That is the registry working as
+# intended -- "blocked on a fixture" means the fixture is the next thing to try, not
+# that it will pass. Writing app/py_codemod.py is what actually unblocked it.
 E2E_FIXTURES: dict[tuple, str] = {
     ("typescript", "openapi", "remove_field"):
         "test_e2e_typescript_openapi_remove_field",
+    ("typescript", "openapi", "change_field_type"):
+        "test_e2e_typescript_openapi_change_field_type",
+    ("python", "openapi", "change_field_type"):
+        "test_e2e_python_openapi_change_field_type",
+    ("python", "openapi", "remove_field"):
+        "test_e2e_python_openapi_remove_field",
+    # The FIFTH closes the last wired-but-unproven validator. Go's only other
+    # detectable mechanical op for openapi is remove_field, whose codemod edits the
+    # struct declaration and does nothing to a usage file -- the one file it can
+    # touch is the one that does not need touching -- so change_field_type is the
+    # only viable Go cell today.
+    ("go", "openapi", "change_field_type"):
+        "test_e2e_go_openapi_change_field_type",
 }
 
 

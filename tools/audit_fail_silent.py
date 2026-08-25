@@ -37,6 +37,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+from app.ast_compat import literal_value, source_of
 
 # Functions whose failures are genuinely safe to swallow, with the reason.
 ALLOW_SILENT = {
@@ -71,7 +74,13 @@ def _is_empty_return(node: ast.AST) -> bool:
     v = node.value
     if v is None:
         return True
-    if isinstance(v, ast.Constant) and v.value in ("", None, 0, False):
+    # literal_value rather than isinstance(v, ast.Constant): on Python 3.7 an
+    # empty string is ast.Str and None is ast.NameConstant, so the Constant-only
+    # test made `return ""` and `return None` invisible -- this audit was
+    # under-reporting fail-silent paths on the dev desktop while catching them
+    # in CI.
+    is_literal, lit = literal_value(v)
+    if is_literal and (lit is None or lit == "" or lit == 0 or lit is False):
         return True
     if isinstance(v, (ast.List, ast.Dict, ast.Tuple, ast.Set)) and not getattr(v, "elts", getattr(v, "keys", [])):
         return True
@@ -110,7 +119,7 @@ def audit_file(path: str) -> list:
                 exc = "Exception"
                 if node.type is not None:
                     try:
-                        exc = ast.unparse(node.type)
+                        exc = source_of(node.type)
                     except Exception:
                         exc = "?"
                 findings.append({

@@ -2553,9 +2553,17 @@ def test_production_readiness_cannot_be_declared():
                if "generate_fix" in cc.required_facts(r["operation"])]
     ready = [(r["language"], r["contract"], r["operation"])
              for r in fixable if r["production"]]
-    # EXACTLY one. Not zero (the mechanism must be able to say yes) and not many
-    # (breadth without proof is the thing being refused).
-    assert ready == [("typescript", "openapi", "remove_field")], ready
+    # Every ready FIXABLE cell must be one that earned it, and at least one must
+    # exist. Not zero (the mechanism must be able to say yes) and not any cell
+    # without a fixture (breadth without proof is the thing being refused).
+    #
+    # This was `== [("typescript", "openapi", "remove_field")]` while one cell was
+    # ready. A literal is the wrong assertion here for the same reason production
+    # must be computed rather than declared: it asserts an inventory, not a rule.
+    # The rule is "ready iff proven", and it is checked in both directions below.
+    proven = sorted(cell for cell in cc.E2E_FIXTURES)
+    assert ready, "no FIXABLE cell is production-ready -- the mechanism cannot say yes"
+    assert sorted(ready) == proven, (sorted(ready), proven)
     wire = [r for r in cc.claim_matrix()
             if cc.required_facts(r["operation"]) == ("detect",)]
     assert wire and all(r["production"] for r in wire), (
@@ -2574,14 +2582,45 @@ def test_production_readiness_cannot_be_declared():
     assert reasons == [], reasons
 
     # A sibling cell differing in ONE dimension must still be blocked, otherwise
-    # readiness leaked across the matrix.
-    assert cc.blocking_reasons("typescript", "proto", "remove_field")
-    assert cc.blocking_reasons("python", "openapi", "remove_field")
-    assert cc.blocking_reasons("typescript", "openapi", "rename_field")
+    # readiness leaked across the matrix. DERIVED, not named: this listed
+    # python/openapi/remove_field until that cell shipped, which made adding a cell a
+    # test failure for the third time. The invariant is "readiness does not leak",
+    # and it is checked by walking every one-dimension neighbour of a ready cell and
+    # requiring that the unproven ones are blocked.
+    ready = sorted(cell for cell in cc.E2E_FIXTURES if cc.production_ready(*cell))
+    assert ready, "no cell is ready -- this check would be vacuous"
+    from app.capabilities import detectable_pairs as _pairs
+    from app import languages as _langs
+    neighbours_checked = 0
+    for lang, contract, op in ready:
+        candidates = (
+            [(l, contract, op) for l in sorted(_langs.languages()) if l != lang]
+            + [(lang, c, o) for c, o in _pairs() if (c, o) != (contract, op)]
+        )
+        for cell in candidates:
+            if cell in cc.E2E_FIXTURES:
+                continue          # proven in its own right, not a leak
+            if "e2e_tested" not in cc.required_facts(cell[2]):
+                # wire_only and non_breaking ops require ONLY detect -- generating a
+                # fix for them would be wrong, so they are ready without a fixture by
+                # design. Including them made this check fail on
+                # python/proto/wire_incompatible, which is correct behaviour.
+                continue
+            assert cc.blocking_reasons(*cell), \
+                f"{'/'.join(cell)} is ready without a fixture -- readiness leaked"
+            neighbours_checked += 1
+    assert neighbours_checked > 50, neighbours_checked
 
-    # And a language WITHOUT a runner still reports both.
-    unwired = cc.blocking_reasons("go", "openapi", "remove_field")
-    assert any("UNABLE_TO_VALIDATE" in r for r in unwired), unwired
+    # And a language with NO ValidatorSpec at all still reports both. This used to
+    # ask about `go`, which was a declaration with an empty implemented_by; go is now
+    # wired, so its only remaining blocker is the missing fixture. `java` has no spec
+    # whatsoever, which is the state this assertion is actually about -- and unlike
+    # go it cannot be quietly wired out from under the test.
+    unvalidated = cc.blocking_reasons("java", "openapi", "remove_field")
+    assert any("UNABLE_TO_VALIDATE" in r for r in unvalidated), unvalidated
+    assert any("fixture" in r for r in unvalidated), unvalidated
+    assert "java" not in cc.VALIDATORS, \
+        "java gained a validator -- point this assertion at another unvalidated language"
 
 
 def test_every_e2e_claim_names_the_test_that_proves_it():
@@ -2603,15 +2642,22 @@ def test_every_e2e_claim_names_the_test_that_proves_it():
             f"{cell} names {test_name!r}, which does not exist in the suite")
         assert callable(getattr(self_mod, test_name))
 
-    # And an unclaimed cell must not read as tested.
-    # Stage 6: this cell IS now claimed, and the invariant above proves the named
-    # test exists and is callable. What must still hold is that a cell WITHOUT a
-    # fixture is not silently credited.
-    assert e2e_tested("typescript", "openapi", "remove_field")
-    assert E2E_FIXTURES[("typescript", "openapi", "remove_field")] == \
-        "test_e2e_typescript_openapi_remove_field"
-    assert not e2e_tested("python", "openapi", "remove_field")
-    assert not e2e_tested("typescript", "proto", "remove_field")
+    # And an unclaimed cell must not read as tested. DERIVED: this named
+    # python/openapi/remove_field until that cell shipped. The rule is
+    # "e2e_tested iff registered", checked in both directions across the whole
+    # matrix, which cannot be invalidated by adding a fixture.
+    from app.capabilities import detectable_pairs as _pairs
+    from app import languages as _langs
+    unclaimed = 0
+    for lang in sorted(_langs.languages()):
+        for contract, op in _pairs():
+            claimed = (lang, contract, op) in E2E_FIXTURES
+            assert e2e_tested(lang, contract, op) == claimed, \
+                f"{lang}/{contract}/{op}: e2e_tested disagrees with E2E_FIXTURES"
+            unclaimed += 0 if claimed else 1
+    assert unclaimed > 100, unclaimed
+    for cell, test_name in E2E_FIXTURES.items():
+        assert e2e_tested(*cell), cell
 
 
 def test_cli_and_production_discover_the_same_consumers():
@@ -3414,12 +3460,20 @@ def test_golden_fixture_is_broken_satisfiable_and_claims_nothing_yet():
     assert unchanged == judgment
     assert "Could NOT remove" in why, why
 
-    # 3. nothing is claimed yet
+    # 3. the claim is earned, and every registered claim names a real test
     from app.capability_claims import E2E_FIXTURES, e2e_tested
     assert e2e_tested("typescript", "openapi", "remove_field"), \
         "Stage 6 earned this claim; losing it means the evidence was dropped"
-    assert len(E2E_FIXTURES) == 1, \
-        f"one cell has end-to-end evidence, not {len(E2E_FIXTURES)}"
+    # Deliberately NOT `len(E2E_FIXTURES) == 1`. Pinning the count made adding the
+    # second fixture a test failure, which punishes the exact progress the registry
+    # exists to enable. What must hold is that no entry is fiction: every claimed
+    # cell names a test that exists in this module.
+    import sys as _sys
+    this_module = _sys.modules[__name__]
+    for cell, test_name in sorted(E2E_FIXTURES.items()):
+        assert hasattr(this_module, test_name), \
+            f"{'/'.join(cell)} claims evidence from {test_name}, which does not exist"
+        assert e2e_tested(*cell), f"{'/'.join(cell)} is registered but not e2e_tested"
 
 
 def test_validation_never_turns_unknown_into_valid():
@@ -3438,14 +3492,18 @@ def test_validation_never_turns_unknown_into_valid():
     import tempfile
     from app.capability_claims import ValidationState
     from app.validation import (Verdict, validate, validate_typescript,
-                                choose_backend, RUNNERS)
+                                validate_python, choose_backend, RUNNERS)
 
-    # 1. A language with no runner makes no claim.
-    for lang in ("python", "go", "rust", "cobol"):
+    # 1. A language with no runner makes no claim. `python` used to be in this list
+    #    and was moved out when its runner was wired -- the cases in 4 below replace
+    #    the coverage it provided, so wiring a language STRENGTHENS this test rather
+    #    than shrinking it.
+    for lang in ("rust", "cobol", "cobol2"):
         v = validate(lang, "/nonexistent")
         assert v.state is ValidationState.UNABLE_TO_VALIDATE, lang
         assert not v.is_valid
         assert "no validation runner" in v.reason
+    assert set(RUNNERS) == {"typescript", "python", "go"}, sorted(RUNNERS)
 
     # 2. An unrecognised backend REFUSES rather than silently taking the weakest
     #    path. The first version branched `if docker ... else host`, so any unknown
@@ -3461,6 +3519,21 @@ def test_validation_never_turns_unknown_into_valid():
         v = validate_typescript(empty, backend="host")
         assert v.state is ValidationState.UNABLE_TO_VALIDATE
         assert "package.json" in v.reason
+
+        # 4. The python runner's own refusals, both reached before any container is
+        #    started so this stays hermetic.
+        #
+        # 4a. python is docker-only. choose_backend()'s host path probes for a NODE
+        #     binary, which is no evidence that python or mypy exist -- accepting it
+        #     would run an unknown toolchain and call the result validation.
+        v = validate_python(empty, backend="host")
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE, v.state
+        assert "requires docker" in v.reason, v.reason
+
+        # 4b. No pinned toolchain, no reproducible verdict.
+        v = validate_python(empty, backend="docker")
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE, v.state
+        assert "requirements-dev.txt" in v.reason, v.reason
     finally:
         import shutil as _sh
         _sh.rmtree(empty, ignore_errors=True)
@@ -3487,10 +3560,19 @@ def test_validation_never_turns_unknown_into_valid():
     assert ts.is_wired and validates("typescript")
     assert validation_state("typescript") is ValidationState.VALID
 
-    for unwired in ("python", "go"):
-        assert not VALIDATORS[unwired].is_wired, unwired
-        assert not validates(unwired)
-        assert validation_state(unwired) is ValidationState.UNABLE_TO_VALIDATE
+    for wired in ("typescript", "python", "go"):
+        assert VALIDATORS[wired].is_wired, wired
+        assert validates(wired)
+        assert validation_state(wired) is ValidationState.VALID
+    assert (VALIDATORS["python"].implemented_by
+            == "app.validation:validate_python")
+    assert VALIDATORS["go"].implemented_by == "app.validation:validate_go"
+
+    # All three declared validators are now wired, so there is no real unwired entry
+    # left to assert against. The distinction is still tested -- by the synthetic
+    # specs below, whose implemented_by paths deliberately do not resolve. That is
+    # stronger than relying on one language staying unimplemented, which was only
+    # ever true by accident of scheduling.
 
     # A path that does not resolve must NOT count as wired.
     from app.capability_claims import ValidatorSpec
@@ -3501,13 +3583,70 @@ def test_validation_never_turns_unknown_into_valid():
     # 7. The superseded stub is gone, not merely frozen.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     assert not os.path.exists(os.path.join(root, "app", "validated_fix.py"))
-    assert "typescript" in RUNNERS and len(RUNNERS) == 1, \
-        "only TypeScript has a real runner; adding a key here is a capability claim"
+    # 8. Adding a RUNNERS key is a capability claim, so it must be EARNED rather
+    #    than merely typed. This was `len(RUNNERS) == 1` while TypeScript was the
+    #    only runner; a count pin makes wiring a second language a test failure,
+    #    which punishes the work instead of policing it. The invariant that actually
+    #    matters is the two-way agreement: every runner has a wired ValidatorSpec
+    #    pointing back at it, and every wired spec has a runner. That makes a key
+    #    added without an implementation fail, and a spec claiming an implementation
+    #    that is not dispatched fail too.
+    from app.capability_claims import VALIDATORS as _V
+    for lang, fn in RUNNERS.items():
+        spec = _V.get(lang)
+        assert spec is not None, \
+            f"{lang} has a runner but no ValidatorSpec -- an undeclared capability"
+        assert spec.is_wired, f"{lang} has a runner but its spec is not wired"
+        assert spec.implemented_by.endswith(fn.__name__), (
+            f"{lang}: spec points at {spec.implemented_by!r} but RUNNERS dispatches "
+            f"to {fn.__name__} -- the declaration and the dispatch disagree")
+    for lang, spec in _V.items():
+        assert spec.is_wired == (lang in RUNNERS), (
+            f"{lang}: is_wired={spec.is_wired} but RUNNERS membership="
+            f"{lang in RUNNERS} -- a wired spec with no runner would be a claim "
+            f"nothing can honour")
 
     # 8. choose_backend never invents one.
     backend, note = choose_backend()
     assert backend in ("", "docker", "host"), backend
     assert note
+
+
+def _record_e2e_evidence(cell, verdict):
+    """Merge one cell's compile proof into tests/.e2e_evidence.json.
+
+    MERGE, not overwrite. Each e2e test owns exactly one key; a plain write would
+    mean whichever test ran last was the only one with evidence, and
+    audit_capabilities would then report fewer proven cells than actually
+    compiled -- evidence lost silently, which is the failure mode this whole
+    evidence file exists to prevent.
+
+    Stale keys are NOT pruned here. A key for a cell no longer in E2E_FIXTURES is
+    harmless (the audit intersects with E2E_FIXTURES), and pruning from inside a
+    test would let a single failing test erase another's proof.
+    """
+    import json as _json
+    import time as _time
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".e2e_evidence.json")
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as fh:
+                data = _json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+    if not isinstance(data.get("cells"), dict):
+        data = {"cells": {}}
+    data["cells"]["/".join(cell)] = {
+        "ran_at": _time.time(),
+        "backend": verdict.evidence["backend"],
+        "typecheck_exit": verdict.evidence["typecheck_exit"],
+        "validated": True,
+    }
+    with open(path, "w") as fh:
+        _json.dump(data, fh, indent=2, sort_keys=True)
 
 
 def test_e2e_typescript_openapi_remove_field():
@@ -3594,23 +3733,1217 @@ def test_e2e_typescript_openapi_remove_field():
         # 6. Only now, having actually compiled, write the proof. audit_capabilities
         #    requires this for every E2E_FIXTURES claim, so a skipped run cannot
         #    stand in for a real one.
-        with open(evidence_path, "w") as fh:
-            json.dump({"ran_at": __import__("time").time(),
-                       "cell": ["typescript", "openapi", "remove_field"],
-                       "backend": after.evidence["backend"],
-                       "typecheck_exit": after.evidence["typecheck_exit"],
-                       "validated": True}, fh, indent=2)
+        _record_e2e_evidence(("typescript", "openapi", "remove_field"), after)
     finally:
         _sh.rmtree(work_root, ignore_errors=True)
 
 
-def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
-    """AUTO exists now. It must remain impossible to obtain without earning it.
+def test_e2e_typescript_openapi_change_field_type():
+    """The SECOND golden path, end to end, against the real toolchain.
+
+    detect -> canonical op -> fix -> APPLY -> tsc --noEmit -> minimal diff
+
+    Same five assertions as the remove_field cell, but the change is inverted and
+    that is the point. A removal leaves the type declaration correct and the
+    USAGES stale, so the fix edits usages. A type change leaves the usages correct
+    and the DECLARATION stale, so the fix edits the declaration -- src/types.ts
+    here, not the file that fails to compile. A fixture that edited the erroring
+    file would be testing the wrong direction.
+
+    Two hazards this fixture is shaped around, both real:
+
+    1. `change_field_type` ANNOTATES instead of editing when the contract type has
+       no native mapping (fix_templates.py, the `native_old and native_new` guard).
+       integer->string is mapped for TypeScript (number->string), so the codemod
+       genuinely edits. An unmapped pair would leave a comment, the file would
+       still not compile, and step 4 would fail -- correctly, because that cell is
+       not production-ready.
+
+    2. `_change_type_typescript` rewrites EVERY `: number` in the file and ignores
+       field_name. src/types.ts therefore declares exactly one number-typed field.
+       A second one would be silently retyped and step 5 would fail.
+
+    SKIPS rather than passes with no validation backend, for the same reason as
+    the first cell: a pass without a compiler is evidence of nothing.
+    """
+    import filecmp
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.change_types import canonical_op, category, MECHANICAL
+    from app.fix_templates import apply_fix_template
+    from app.validation import validate, choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "typescript-openapi", "change-field-type")
+    consumer = os.path.join(base, "consumer")
+
+    backend, note = choose_backend()
+    if not backend:
+        print(f"      SKIP: no validation backend ({note}) -- no e2e evidence written")
+        return
+
+    # 1. the operation is mechanical, so a transformation is legitimate at all
+    assert canonical_op("field_type_changed") == "change_field_type"
+    assert category("field_type_changed") == MECHANICAL
+
+    work_root = tempfile.mkdtemp(prefix="ripple-e2e-cft-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns("node_modules", ".git"))
+        target = os.path.join(work, "src", "types.ts")
+
+        # 2. the consumer genuinely does not compile first. Two errors, both in
+        #    contact.ts: .trim() and .startsWith() on a number.
+        before = validate("typescript", work)
+        assert before.state is ValidationState.INVALID, before.reason
+        assert len(before.errors) == 2, before.errors
+
+        # 3. generate and APPLY the fix (read before write)
+        with open(target) as fh:
+            original = fh.read()
+        fixed, explanation = apply_fix_template(
+            code=original, language="typescript", change_type="field_type_changed",
+            field_name="phoneNumber", old_type="integer", new_type="string")
+        assert fixed != original, "the transformation did nothing"
+        assert "phoneNumber: string;" in fixed, fixed
+        # the sibling string fields must survive verbatim -- proof the field-blind
+        # regex was pointed at `: number` and not at `: string`
+        assert fixed.count(": string;") == 4, fixed
+        assert ": number" not in fixed, fixed
+        with open(target, "w") as fh:
+            fh.write(fixed)
+        assert open(target).read() == fixed
+
+        # 4. the real compiler accepts it
+        after = validate("typescript", work)
+        assert after.state is ValidationState.VALID, \
+            f"{after.reason} :: {after.errors[:3]}"
+        assert after.evidence["typecheck_exit"] == 0
+
+        # 5. the diff is MINIMAL -- everything else byte-identical. contact.ts is
+        #    listed because it is the file that ERRORED: the fix must repair it
+        #    without editing it, which is the whole claim of this cell.
+        for untouched in ("src/contact.ts", "src/orders.ts", "tsconfig.json",
+                          "package.json"):
+            assert filecmp.cmp(os.path.join(consumer, untouched),
+                               os.path.join(work, untouched), shallow=False), \
+                f"{untouched} was modified -- the PR would not be reviewable"
+
+        # 6. proof written only after a real compile
+        _record_e2e_evidence(("typescript", "openapi", "change_field_type"), after)
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_python_type_removed_no_longer_destroys_a_live_import():
+    """The exact input the old regex corrupted while reporting success.
+
+    `_TYPE_REF_PATTERNS['python']` opened with
+
+        r'^\\s*from\\s+\\S+\\s+import\\s+.*\\b{name}\\b.*$'
+
+    which deletes the ENTIRE import statement when the removed name appears anywhere
+    on it. Measured: `from src.models import User, Address` vanished, so `Address` --
+    used two functions below -- became undefined, while every `User` reference
+    survived. It reported "Removed references to deleted type 'User' (1 lines
+    affected): imports, declarations, type annotations and constructions".
+
+    This was worse than the remove_field no-op: that one merely failed to fix, this
+    one actively broke a file that had only one thing wrong with it.
+    """
+    from app.fix_templates import apply_fix_template
+
+    src = ('from src.models import User, Address\n'
+           '\n'
+           '\n'
+           'def f(u: User) -> str:\n'
+           '    return u.email\n'
+           '\n'
+           '\n'
+           'def g(a: Address) -> str:\n'
+           '    return a.city\n')
+
+    fixed, explanation = apply_fix_template(
+        code=src, language="python", change_type="type_removed",
+        field_name="User")
+
+    # A live reference cannot be repaired mechanically, so the whole patch is refused
+    # and the file comes back untouched. That is the correct answer.
+    assert fixed == src, fixed
+    assert "Address" in fixed, "the still-used neighbour was dropped from the import"
+    assert "Could NOT remove" in explanation, explanation
+    assert "NEEDS A HUMAN" in explanation, explanation
+    # and the fabricated category list is gone
+    assert "type annotations and constructions" not in explanation, explanation
+
+
+def test_python_type_removed_completes_only_for_a_stale_import():
+    """The one shape that IS a complete fix, and its two variants.
+
+    Removing a name from an import list is the only mechanical edit available when a
+    type is deleted: there is no substitute value for an object, so a signature, a
+    construction or a base class all need a human. A stale import is the case where
+    nothing else has to change -- and it is real, not contrived.
+    """
+    from app.py_codemod import remove_type
+
+    # a) name removed from the list, neighbours preserved verbatim
+    src = ('from src.models import User, Address\n'
+           '\n'
+           '\n'
+           'def g(a: Address) -> str:\n'
+           '    return a.city\n')
+    r = remove_type(src, "User")
+    assert r.complete, (r.refusals, r.edits)
+    assert r.code.splitlines()[0] == "from src.models import Address"
+    assert [e["shape"] for e in r.edits] == ["name in import list"]
+
+    # b) sole name -- the whole statement goes, not just the name
+    r2 = remove_type("from src.models import User\n\n\nX = 1\n", "User")
+    assert r2.complete, (r2.refusals, r2.edits)
+    assert "import" not in r2.code, r2.code
+    assert "X = 1" in r2.code
+
+    # c) every other shape refuses, with a reason specific enough to act on
+    for src_, expect in (
+        ("def f(u: User) -> str:\n    return u.email\n", "function signature"),
+        ("class Admin(User):\n    pass\n", "base class"),
+        ("x = User(id='1')\n", "construction"),
+    ):
+        rr = remove_type(src_, "User")
+        assert rr.refusals, src_
+        assert not rr.complete, src_
+        assert any(expect in r for r in rr.refusals), (expect, rr.refusals)
+
+
+def test_symbol_fallback_refuses_instead_of_destroying_the_file():
+    """The six languages with no codemod and no pattern table.
+
+    `_remove_type_reference` fell through to `_generic_remove`, which deletes every
+    line matching any CASE VARIANT of the name. `name_variants("User")` yields snake
+    `user` and camel `user` -- the conventional VARIABLE name -- so it deleted the
+    code and kept the reference. Measured through apply_fix_template:
+
+        dart    import 'models.dart'; String label(User u){return u.email;}
+                ->  import 'models.dart';\\n\\n}     the STALE IMPORT survived
+        scala   3 lines -> one blank line          entire file destroyed
+        shell   echo "looking up user $user_id"    deleted; shell has no types
+        yaml    the $ref AND its parent `user:` key gone
+
+    None of these languages has a wired validator, so nothing downstream would have
+    caught any of it.
+    """
+    from app.fix_templates import apply_fix_template
+
+    LIVE = {
+        "dart": "import 'models.dart';\n\nString label(User user) {\n"
+                "  return user.email;\n}\n",
+        "php": "<?php\nuse App\\Models\\User;\n\nfunction label(User $user) {\n"
+               "    return $user->email;\n}\n",
+        "scala": "import models.User\n\ndef label(user: User): String = user.email\n",
+        "swift": "import Models\n\nfunc label(user: User) -> String {\n"
+                 "    return user.email\n}\n",
+        "shell": '#!/bin/sh\nuser_id="$1"\necho "looking up user $user_id"\n',
+        "yaml": "properties:\n  user:\n    $ref: '#/components/schemas/User'\n",
+    }
+    for lang, src in LIVE.items():
+        fixed, explanation = apply_fix_template(src, lang, "type_removed", "User")
+        assert fixed == src, (
+            f"{lang}: a live reference remains, so the only safe answer is to change "
+            f"nothing. Got:\n{fixed}")
+        assert "Could NOT remove" in explanation, (lang, explanation)
+        assert "lines affected" not in explanation, (
+            f"{lang}: claimed an edit count for a file it did not touch: "
+            f"{explanation}")
+
+    # `to_upper_snake("User")` is `USER`, which collides with a bare upper-case list
+    # entry. Removing a TYPE must not touch a list of required environment variables:
+    # after the symbol is removed the line is structural-only, nothing else in the
+    # file references it, so the removal would look COMPLETE and ship.
+    #
+    # NOTE ON THIS ASSERTION: it originally used `echo "$USER"`, which does NOT
+    # manifest -- the word `echo` survives, so the structural-only rule refuses that
+    # line anyway. Mutation-testing caught the weak assertion: enabling upper-snake
+    # for types left the test green. This is the case that actually fires.
+    env_list = "required:\n  - USER\n  - HOME\n"
+    fixed, _ = apply_fix_template(env_list, "yaml", "type_removed", "User")
+    assert fixed == env_list, (
+        f"a list of required environment variables is not a reference to a type "
+        f"called User:\n{fixed}")
+
+    # And upper-snake must still work where it is meant to: an ENUM VALUE.
+    enum_yaml = "status:\n  enum:\n    - ACTIVE\n    - PENDING\n"
+    fixed, _ = apply_fix_template(enum_yaml, "yaml", "removed_enum_value", "pending")
+    assert "- PENDING" not in fixed, fixed
+    assert "- ACTIVE" in fixed, fixed
+
+
+def test_symbol_fallback_completes_only_for_a_stale_import():
+    """The one case that IS mechanical, and it must keep its neighbours.
+
+    Same conclusion py_codemod and ts_codemod reached: for a deleted symbol the only
+    safe edit is dropping an import that nothing uses. A PARTIAL removal is not a
+    smaller success -- the first draft of this function dropped scala's
+    `import models.User` while leaving `User` in a live signature, producing a file
+    where the type was both undefined AND unimported, which is strictly worse than
+    not touching it. Hence the all-or-nothing check.
+    """
+    from app.fix_templates import apply_fix_template
+
+    src = ("import models.User\n"
+           "import models.Order\n"
+           "\n"
+           "def n(o: Order): Int = 1\n")
+    fixed, explanation = apply_fix_template(src, "scala", "type_removed", "User")
+
+    assert "import models.User" not in fixed, fixed
+    assert "import models.Order" in fixed, (
+        f"the neighbouring import was taken with it:\n{fixed}")
+    assert "def n(o: Order): Int = 1" in fixed, fixed
+    assert "Could NOT" not in explanation, explanation
+
+    # A comma-separated import list is refused in BOTH directions: a neighbour before
+    # the symbol would be lost, and text after it means the symbol is not the import.
+    for listed in ("import models.{Address, User}\n\ndef n(a: Address): Int = 1\n",
+                   "import models.{User, Address}\n\ndef n(a: Address): Int = 1\n"):
+        out, _ = apply_fix_template(listed, "scala", "type_removed", "User")
+        assert out == listed, (
+            f"a braced import list is not a shape this fallback can edit:\n{out}")
+
+
+def test_enum_value_explanation_stops_fabricating_a_shape_list():
+    """Third occurrence of the fabricated-shape-list defect, after remove_field and
+    remove_type.
+
+    The explanation asserted "Removed references to deleted enum value 'X'
+    (N lines affected): switch/case arms, match arms and constant declarations for
+    {lang}" on EVERY outcome. Measured with a target that appears nowhere:
+
+        apply_fix_template("const x = 1;\\n", "typescript",
+                           "removed_enum_value", "NOPE")
+        -> unchanged, and it still named three shapes it had not cleaned.
+    """
+    from app.fix_templates import apply_fix_template
+
+    untouched = "const x = 1;\n"
+    fixed, explanation = apply_fix_template(
+        untouched, "typescript", "removed_enum_value", "NOPE")
+    assert fixed == untouched
+    assert "Could NOT remove" in explanation, explanation
+    assert "switch/case arms" not in explanation, (
+        f"named shapes it did not clean: {explanation}")
+    assert "0 lines affected" not in explanation, explanation
+
+    # And the truthful branch still fires when something really was removed.
+    real = ("enum Status {\n  ACTIVE = 1,\n  PENDING = 2,\n}\n")
+    fixed, explanation = apply_fix_template(
+        real, "dart", "removed_enum_value", "PENDING")
+    assert "PENDING" not in fixed, fixed
+    assert "ACTIVE = 1," in fixed, fixed
+    assert "lines affected" in explanation, explanation
+
+    # A lowercase spec literal must still match -- `literal` exists in name_variants
+    # precisely because pascal/upper-snake would miss an OpenAPI enum like `pending`.
+    yml = "status:\n  enum:\n    - active\n    - pending\n"
+    fixed, _ = apply_fix_template(yml, "yaml", "removed_enum_value", "pending")
+    assert "- pending" not in fixed, fixed
+    assert "- active" in fixed, fixed
+
+
+def test_capability_tables_match_the_dispatch():
+    """`_OP_TABLE` must describe the code it claims to describe.
+
+    app/capabilities.py cited this test by name as the guard against drift, and the
+    test did not exist -- a comment asserting a guarantee nothing enforced, the same
+    shape as a gate whose PASS message names a property it never exercises.
+
+    It catches the drift that motivated it: `remove_type` used to read
+    `_TYPE_REF_PATTERNS`, then typescript/javascript were wired to a syntax-aware
+    codemod instead. javascript has NO pattern entry, so the registry reported
+    `generate_fix("javascript", "remove_type") == False` while a real codemod was
+    wired -- an UNDER-claim, safe in direction but still a lie about the code.
+
+    Two checks:
+
+    1. every attribute `_OP_TABLE` names exists in fix_templates and is a dict, so
+       `_table_languages` -- which silently returns the empty set for a non-dict --
+       cannot make an operation look unsupported in every language;
+    2. every language named in an explicit `lang ==` / `lang in (...)` branch of the
+       dispatch appears in at least one of the tables, so adding a delegation
+       without registering it fails here.
+    """
+    import ast
+    import pathlib
+
+    from app import capabilities as cap
+    from app import fix_templates as ft
+
+    # 1. Each named attribute must resolve to a dict keyed by language.
+    for op, attr in cap._OP_TABLE.items():
+        table = getattr(ft, attr, None)
+        assert table is not None, (
+            f"_OP_TABLE maps {op!r} to fix_templates.{attr}, which does not exist")
+        assert isinstance(table, dict), (
+            f"_OP_TABLE maps {op!r} to fix_templates.{attr}, which is a "
+            f"{type(table).__name__}. _table_languages returns the EMPTY SET for a "
+            f"non-dict, so every language would silently report unsupported")
+        assert table, f"fix_templates.{attr} is empty, so {op!r} claims no languages"
+
+    known = set()
+    for attr in set(cap._OP_TABLE.values()):
+        known |= set(getattr(ft, attr, {}))
+
+    # 2. Any language the dispatch branches on explicitly must be registered.
+    src = pathlib.Path(ft.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    all_langs = set(cap.languages())
+    branched = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        left = node.left
+        if not (isinstance(left, ast.Name) and left.id in ("lang", "language")):
+            continue
+        for comparator in node.comparators:
+            for lit in ast.walk(comparator):
+                value = _ast_str(lit)
+                if value in all_langs:
+                    branched.add(value)
+
+    assert branched, (
+        "found no `lang == '...'` branch in fix_templates, so this check would pass "
+        "vacuously. Refusing a pass over an empty set")
+
+    missing = sorted(branched - known)
+    assert not missing, (
+        f"the dispatch branches on {missing} but no _OP_TABLE table lists "
+        f"{'them' if len(missing) > 1 else 'it'}, so generate_fix() reports False "
+        f"for a language that HAS a handler. Register the delegation in the table "
+        f"_OP_TABLE names for that operation")
+
+    # The specific claim that was wrong, asserted directly so the reason survives.
+    assert cap.generate_fix("javascript", "remove_type"), (
+        "javascript delegates remove_type to ts_codemod, so the registry must say so")
+    assert cap.generate_fix("typescript", "remove_type")
+    assert cap.generate_fix("python", "remove_type")
+
+
+def _ast_str(node):
+    """The string value of a literal node, or None. 3.7 uses ast.Str."""
+    from app.ast_compat import str_literal
+    return str_literal(node)
+
+
+def test_typescript_remove_type_no_longer_destroys_a_live_import():
+    """The exact input the shared regex corrupted while reporting success.
+
+    `_TYPE_REF_PATTERNS['typescript']` opens with
+
+        r'^\\s*import\\s+.*\\b{name}\\b.*$'
+
+    which deletes the ENTIRE import statement when the removed name appears anywhere
+    on it -- the identical defect already fixed in py_codemod, in a language that
+    carries TWO production cells. Measured:
+
+        import { User, Address } from './models';   ->  (line deleted)
+        export function label(a: Address) { ... }   ->  UNCHANGED
+
+    so `Address` became undefined while it claimed "Removed references to deleted
+    type 'User' (1 lines affected)". `tsc` would catch the fallout eventually, which
+    is the only thing that made this less severe than the javascript case -- the fix
+    path still returned a broken file and called it success.
+    """
+    from app.fix_templates import apply_fix_template
+
+    src = ("import { User, Address } from './models';\n"
+           "\n"
+           "export function label(a: Address): string {\n"
+           "  return a.city;\n"
+           "}\n")
+
+    fixed, explanation = apply_fix_template(src, "typescript", "type_removed", "User")
+
+    assert "Address" in fixed, (
+        f"the still-used neighbour was destroyed with the import:\n{fixed}")
+    assert "import { Address } from './models';" in fixed, fixed
+    assert "User" not in fixed, fixed
+    assert "return a.city;" in fixed
+    assert "name in import list" in explanation, explanation
+
+
+def test_javascript_remove_type_no_longer_deletes_every_line_naming_a_variable():
+    """The most severe corruption found in the audit: a module reduced to `}`.
+
+    javascript had NO `_TYPE_REF_PATTERNS` entry, so `_remove_type_reference` fell
+    through to `_generic_remove`, which deletes every line matching any CASE VARIANT
+    of the name. For a type called `User`:
+
+        name_variants("User") -> snake 'user', camel 'user'
+
+    which is the conventional variable name for a User, i.e. essentially every line
+    of any real consumer. Measured:
+
+        export function formatContact(user) {      ->   }
+          return `${user.email}`;
+        }
+
+    reported as "Removed references to deleted type 'User' (2 lines affected)". And
+    javascript has NO wired validator, so nothing downstream would have caught it.
+
+    The correct answer for this input is to change NOTHING: the file never mentions
+    `User` at all. `user` is a parameter.
+    """
+    from app.fix_templates import apply_fix_template
+
+    src = ("export function formatContact(user) {\n"
+           "  return `${user.email} ${user.phoneNumber}`;\n"
+           "}\n"
+           "\n"
+           "export function toPayload(user) {\n"
+           "  return {\n"
+           "    id: user.id,\n"
+           "    phone: user.phoneNumber,\n"
+           "  };\n"
+           "}\n")
+
+    fixed, explanation = apply_fix_template(src, "javascript", "type_removed", "User")
+
+    assert fixed == src, (
+        f"nothing in this file references the type `User` -- only a variable named "
+        f"`user` -- so the correct edit is none:\n{fixed}")
+    assert "Could NOT remove" in explanation, explanation
+    assert "lines affected" not in explanation, (
+        f"claimed an edit count for a file it did not touch: {explanation}")
+
+    # And the shape javascript CAN fix: a CommonJS binding list, neighbour kept.
+    cjs = ("const { User, Address } = require('./models');\n"
+           "\n"
+           "module.exports = { Address };\n")
+    out, expl = apply_fix_template(cjs, "javascript", "type_removed", "User")
+    assert "const { Address } = require('./models');" in out, out
+    assert "User" not in out, out
+    assert "require binding list" in expl, expl
+
+
+def test_ts_remove_type_refuses_every_shape_that_needs_a_decision():
+    """A deleted type has no substitute value, so only a binding list is mechanical.
+
+    Each refusal must carry a reason SPECIFIC to the shape -- a reviewer reading the
+    PR body needs to know which decision is being asked of them, not "a human must
+    decide". An alias is included because its local name is used elsewhere: dropping
+    the import would orphan every use of `U`.
+    """
+    from app.ts_codemod import remove_type
+
+    for src, expect in (
+        ("export function label(u: User): string {\n  return u.city;\n}\n",
+         "function signature"),
+        ("let current: User | null = null;\n", "type annotation"),
+        ("const u = new User({ id: '1' });\n", "construction"),
+        ("class Admin extends User {\n  role = 'a';\n}\n", "base class"),
+        ("class Admin implements User {\n  id = '';\n}\n", "implemented interface"),
+        ("if (x instanceof User) { go(); }\n", "runtime type test"),
+        ("const u = payload as User;\n", "type assertion"),
+        ("import { User as U } from './m';\n\nexport function f(u: U) { return u; }\n",
+         "aliased import"),
+    ):
+        r = remove_type(src, "User")
+        assert r.refusals, f"should refuse: {src!r}"
+        assert not r.complete, f"refused but reported complete: {src!r}"
+        assert not r.changed, (
+            f"a refusal must not edit the file, or the caller returns corrupted "
+            f"output: {src!r} -> {r.code!r}")
+        assert any(expect in x for x in r.refusals), (expect, r.refusals)
+
+    # A comment or a string mention is a NOTE, never a refusal -- it cannot break a
+    # build, and blocking on it would block nearly every real consumer.
+    for src in ("// User was removed from the spec\nexport const X = 1;\n",
+                "console.log('User');\nexport const X = 1;\n"):
+        r = remove_type(src, "User")
+        assert r.notes, src
+        assert not r.refusals, (src, r.refusals)
+
+
+def test_ruby_remove_field_no_longer_welds_the_next_line_on():
+    """The exact input the old regex corrupted while reporting success.
+
+    `_remove_field_ruby` removed a list element with
+
+        re.sub(rf':{snake}\\s*,?\\s*', '', code)
+
+    whose trailing `\\s*` matches NEWLINES. Removing the LAST element of
+    `attr_accessor :id, :email, :phone_number` therefore consumed the line break
+    -- and the blank line after it -- welding the following line on:
+
+        attr_accessor :id, :email, def initialize(id: nil, email: nil)
+
+    Two things make this the worst case in the codebase:
+
+    1. It is SYNTACTICALLY VALID. `def` is an expression in Ruby, so `ruby -c`
+       reports "Syntax OK" on the corrupted file. Measured with real ruby 2.0.
+       A syntax check cannot catch this class; the damage only appears when the
+       class is loaded, as `attr_accessor(:id, :email, nil)` ->
+       "TypeError: nil is not a symbol".
+    2. Ruby has NO wired validator, so nothing downstream would have caught it
+       either. The fix path returned a file that raises on import and reported
+       "Removed references to field 'phone_number' (1 lines affected)".
+
+    The one-character fix (`\\s*` -> `[^\\S\\n]*`) is NOT sufficient: it leaves
+    `attr_accessor :id, :email,` whose trailing comma is a line continuation in
+    Ruby, so `end` still gets swallowed. The separator has to go with the
+    element -- see `_drop_list_element`.
+    """
+    from app.fix_templates import apply_fix_template
+
+    src = ('class User\n'
+           '  attr_accessor :id, :email, :phone_number\n'
+           '\n'
+           '  def initialize(id: nil, email: nil, phone_number: nil)\n'
+           '    @id = id\n'
+           '    @email = email\n'
+           '    @phone_number = phone_number\n'
+           '  end\n'
+           'end\n')
+
+    fixed, explanation = apply_fix_template(
+        src, "ruby", "removed_field", "phone_number")
+
+    lines = fixed.split("\n")
+
+    # The attribute list keeps its neighbours and stays a list of symbols only.
+    attr_line = next(l for l in lines if "attr_accessor" in l)
+    assert attr_line.strip() == "attr_accessor :id, :email", repr(attr_line)
+    assert "def " not in attr_line, (
+        f"the next line was welded onto the attribute list: {attr_line!r}")
+
+    # `def initialize` is still a definition on its own line.
+    assert any(l.strip().startswith("def initialize(") for l in lines), fixed
+
+    # The field is genuinely gone from every shape, and the neighbours survive.
+    assert "phone_number" not in fixed, fixed
+    assert ":id" in fixed and ":email" in fixed
+    assert "@id = id" in fixed and "@email = email" in fixed
+
+    # No line count may collapse: the old bug merged two logical lines.
+    assert len([l for l in lines if l.strip()]) == 7, (
+        f"expected 7 non-blank lines, got "
+        f"{len([l for l in lines if l.strip()])}: {fixed!r}")
+
+    assert "1 lines affected" not in explanation or "phone_number" not in fixed
+
+    # If a real ruby is on this machine, make it the judge rather than the
+    # assertions above. `-c` is only a syntax check and is blind to the weld, so
+    # LOAD the class: the old output raised TypeError here, the new one runs.
+    import shutil
+    import subprocess
+    import tempfile
+
+    ruby = shutil.which("ruby")
+    if ruby:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "user.rb")
+            with open(path, "w") as fh:
+                fh.write(fixed + "\nu = User.new(id: 'a', email: 'b')\n"
+                                 "raise 'lost id' unless u.id == 'a'\n"
+                                 "raise 'lost email' unless u.email == 'b'\n"
+                                 "raise 'field survived' if u.respond_to?(:phone_number)\n")
+            proc = subprocess.run([ruby, path], capture_output=True, text=True,
+                                  timeout=60)
+            assert proc.returncode == 0, (
+                f"real ruby refused the fixed output:\n{proc.stderr}\n{fixed}")
+
+
+def test_python_remove_field_no_longer_lies_about_success():
+    """The exact input the old regex claimed to fix, and did not touch.
+
+    Measured before app/py_codemod.py existed: every reference survived, one blank
+    line was collapsed, and the explanation read "Removed references to field
+    'phone_number' (2 lines affected). Cleaned: struct/class declarations, accessor
+    methods, function params, object literals, and direct field access patterns for
+    python." Two false claims in one string -- nothing was removed, and the five
+    named categories were a fixed list appended to every success.
+
+    `changed` being True on a whitespace-only edit is the dangerous part: the
+    pipeline believes a fix exists and only the validator stands between that and a
+    PR.
+    """
+    from app.fix_templates import apply_fix_template
+
+    src = ('from src.models import User\n'
+           '\n'
+           '\n'
+           'def format_contact(user: User) -> str:\n'
+           '    return f"{user.full_name} <{user.email}> {user.phone_number}"\n'
+           '\n'
+           '\n'
+           'def to_crm_payload(user: User) -> dict:\n'
+           '    return {\n'
+           '        "id": user.id,\n'
+           '        "phone": user.phone_number,\n'
+           '    }\n')
+
+    fixed, explanation = apply_fix_template(
+        code=src, language="python", change_type="removed_field",
+        field_name="phone_number")
+
+    # 1. the references are actually GONE, which was the whole failure
+    assert "phone_number" not in fixed, fixed
+    assert fixed != src
+
+    # 2. the surviving code is still valid Python. A removal that leaves
+    #    `f"{user.full_name} <{user.email}> "` is fine; one that leaves `f"{}"` or a
+    #    dangling comma is not, and only parsing catches it.
+    import ast as _ast
+    _ast.parse(fixed)
+
+    # 3. the fields that should NOT be touched survive
+    assert "user.full_name" in fixed and "user.email" in fixed
+    assert '"id": user.id,' in fixed
+
+    # 4. PEP 8's two blank lines between top-level defs survive. The normaliser used
+    #    to collapse every gap in the file, turning a one-field removal into a diff
+    #    across every function boundary.
+    assert fixed.count("\n\n\n") == src.count("\n\n\n"), \
+        "blank-line runs changed -- the diff is no longer minimal"
+
+    # 5. the explanation names the shapes ACTUALLY removed, not a canned list
+    assert "f-string interpolation" in explanation, explanation
+    assert "dict-literal entry" in explanation, explanation
+    assert "accessor methods" not in explanation, \
+        "the fabricated category list is back"
+
+
+def test_python_remove_field_refuses_what_it_cannot_do_safely():
+    """Four shapes that must abstain, each with exactly one reason.
+
+    Two of these were actively CORRUPTED by the old regexes rather than refused:
+    `\\b{f}\\s*:\\s*[^,=)]+...` stripped a function parameter, and
+    `^\\s*.*\\[["\\']?{f}...` deleted the entire line containing a subscript.
+    """
+    from app.fix_templates import apply_fix_template
+
+    cases = {
+        "parameter": 'def send(phone_number: str) -> None:\n    print(phone_number)\n',
+        "aliased": 'def f(u: object) -> object:\n    phone = u.phone_number\n    return phone\n',
+        "subscript": 'def f(d: dict) -> str:\n    return d["phone_number"]\n',
+        "side_effect_default": ('from dataclasses import dataclass\n\n\n'
+                                '@dataclass\nclass U:\n'
+                                '    phone_number: str = fetch()\n'),
+    }
+    for name, src in cases.items():
+        fixed, explanation = apply_fix_template(
+            code=src, language="python", change_type="removed_field",
+            field_name="phone_number")
+        assert fixed == src, f"{name}: the codemod edited a shape it cannot handle"
+        assert "Could NOT remove" in explanation, f"{name}: {explanation}"
+        assert "NEEDS A HUMAN" in explanation, f"{name}: {explanation}"
+
+    # ONE reason per reference. The side-effecting default was refused twice -- once
+    # specifically by the declaration pass and once generically by the final
+    # classification pass -- so the PR body restated it worse and the count doubled.
+    _, explanation = apply_fix_template(
+        code=cases["side_effect_default"], language="python",
+        change_type="removed_field", field_name="phone_number")
+    refusals = [l for l in explanation.split("\n") if l.startswith("NEEDS A HUMAN")]
+    assert len(refusals) == 1, refusals
+    assert "the default contains" in refusals[0], refusals[0]
+
+
+def test_python_remove_field_notes_mentions_without_refusing_them():
+    """A comment or string naming the field is reported, never edited.
+
+    ts_codemod learned this the expensive way: refusing benign mentions set
+    complete=False, and nearly every real consumer has a log line or comment naming
+    the field it uses, so the one real repository came back BLOCKED. A safety rule
+    that blocks the safe cases is not conservative, it is broken.
+
+    The subscript case is the deliberate exception -- see the codemod's docstring.
+    """
+    from app.fix_templates import apply_fix_template
+    from app.py_codemod import remove_field
+
+    src = '# phone_number was removed upstream\nX = "phone_number"\n'
+    result = remove_field(src, "phone_number")
+    assert result.code == src, "a comment or string was edited"
+    assert not result.refusals, result.refusals
+    assert len(result.notes) == 2, result.notes
+    assert any("comment" in n for n in result.notes), result.notes
+    assert any("string" in n for n in result.notes), result.notes
+
+    _, explanation = apply_fix_template(
+        code=src, language="python", change_type="removed_field",
+        field_name="phone_number")
+    assert "NOTE:" in explanation and "NEEDS A HUMAN" not in explanation, explanation
+
+
+def test_blank_line_normaliser_does_what_its_docstring_says():
+    """`\\n{3,}` -> `\\n\\n` collapsed to ONE blank line while claiming to leave two.
+
+    The docstring and the regex disagreed and the regex won. Python felt it worst:
+    PEP 8 requires two blank lines between top-level definitions, so every Python fix
+    reformatted every gap in the file.
+    """
+    from app.fix_templates import _clean_blank_lines
+
+    # two blank lines are PRESERVED
+    assert _clean_blank_lines("a\n\n\nb\n") == "a\n\n\nb\n"
+    # one blank line is preserved
+    assert _clean_blank_lines("a\n\nb\n") == "a\n\nb\n"
+    # three or more collapse to exactly two, as documented
+    assert _clean_blank_lines("a\n\n\n\nb\n") == "a\n\n\nb\n"
+    assert _clean_blank_lines("a\n\n\n\n\n\nb\n") == "a\n\n\nb\n"
+
+
+def test_codemod_result_has_exactly_one_definition():
+    """`complete` is a rule, and a rule with two copies drifts.
+
+    CodemodResult lived in ts_codemod.py until Python needed the same contract.
+    Duplicating it would have put two definitions of `complete` in the tree, which is
+    the defect already removed twice -- from the capability registry and from the
+    production predicate.
+    """
+    from app import codemod_result, ts_codemod, py_codemod
+
+    assert ts_codemod.CodemodResult is codemod_result.CodemodResult
+    assert py_codemod.CodemodResult is codemod_result.CodemodResult
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    defining = []
+    for name in sorted(os.listdir(os.path.join(root, "app"))):
+        if not name.endswith(".py"):
+            continue
+        body = open(os.path.join(root, "app", name)).read()
+        if "class CodemodResult" in body:
+            defining.append(name)
+    assert defining == ["codemod_result.py"], defining
+
+
+def test_e2e_go_openapi_change_field_type():
+    """The FIFTH golden path, and the first for the Go validator.
+
+    detect -> canonical op -> fix -> APPLY -> go build -> minimal diff
+
+    Go was the last wired validator with nothing proven, which is a specific kind of
+    gap: validate_ok counted 63 more cells than before, and not one of them had been
+    shown to work. A wired validator with no cell is a claim about a toolchain, not
+    about the product.
+
+    WHY change_field_type AND NOT remove_field
+    Measured before this fixture was written. The Go remove_field codemod edits the
+    STRUCT DECLARATION and does nothing at all to a usage file:
+
+        _remove_field_go(usage_file,  "PhoneNumber")  ->  unchanged
+        _remove_field_go(struct_file, "PhoneNumber")  ->  field removed
+
+    For a removal the declaration is regenerated correct and the USAGES are stale, so
+    the one file it can edit is the one file that does not need editing. go/openapi/
+    remove_field is therefore not production-ready, and a fixture for it would fail
+    at step 4. Only change_field_type and remove_field are even detectable for
+    go/openapi, so change_field_type is the only viable Go cell today.
+
+    THE TYPE-NAME HAZARD IS SHARPER IN GO
+    `native_type("go", "integer")` is `int32`, not `int`. A struct declaring `int`
+    does not match, and the codemod correctly ANNOTATES instead of editing --
+    "Ripple did NOT transform the code: it lacks the information to do so correctly".
+    The fixture declares the sized type, which is also what OpenAPI codegen produces
+    for an integer with a 32-bit format, so the spec and the struct agree.
+
+    GO IS THE STRICTEST VALIDATOR
+    Unused imports are compile errors here. This cell does not trip that -- the
+    retype keeps `strings` in use -- but a remove_field cell would have to drop the
+    now-unused import or fail the build, which is the validator earning its keep.
+    """
+    import filecmp
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.change_types import canonical_op, category, MECHANICAL
+    from app.fix_templates import apply_fix_template
+    from app.validation import validate, choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "go-openapi", "change-field-type")
+    consumer = os.path.join(base, "consumer")
+
+    backend, note = choose_backend()
+    if backend != "docker":
+        print(f"      SKIP: go validation needs docker, got {backend or 'none'} "
+              f"({note}) -- no e2e evidence written")
+        return
+
+    # 1. the operation is mechanical, so a transformation is legitimate at all
+    assert canonical_op("field_type_changed") == "change_field_type"
+    assert category("field_type_changed") == MECHANICAL
+
+    work_root = tempfile.mkdtemp(prefix="ripple-e2e-go-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns(".ripple-gomodcache", ".git"))
+        target = os.path.join(work, "models", "user.go")
+
+        # 2. the consumer genuinely does not build first. Two errors, both in
+        #    contact.go, both the sized integer being passed where a string is wanted.
+        before = validate("go", work)
+        assert before.state is ValidationState.INVALID, \
+            f"{before.state.value}: {before.reason}"
+        assert len(before.errors) == 2, before.errors
+        assert all("contact.go" in e for e in before.errors), before.errors
+
+        # 3. generate and APPLY the fix (read before write)
+        with open(target) as fh:
+            original = fh.read()
+        fixed, explanation = apply_fix_template(
+            code=original, language="go", change_type="field_type_changed",
+            field_name="PhoneNumber", old_type="integer", new_type="string")
+        assert fixed != original, "the transformation did nothing"
+        # It must EDIT, not annotate. The annotate path is correct behaviour for an
+        # unmapped type but means this cell is not ready, so it has to be excluded
+        # explicitly rather than passing by accident.
+        assert "RIPPLE-ACTION-REQUIRED" not in fixed, \
+            "the codemod annotated instead of editing -- the declared type did not " \
+            "match native_type('go', 'integer')"
+        assert "PhoneNumber string" in fixed, fixed
+        assert "int32" not in fixed, fixed
+        # exactly ONE line differs. The first draft of this fixture quoted the type
+        # name in its doc comment and got four extra edits inside the comment.
+        assert (len(fixed.splitlines()) == len(original.splitlines())
+                and sum(1 for a, b in zip(original.splitlines(), fixed.splitlines())
+                        if a != b) == 1), "more than one line changed"
+
+        with open(target, "w") as fh:
+            fh.write(fixed)
+        assert open(target).read() == fixed
+
+        # 4. the real compiler accepts it
+        after = validate("go", work)
+        assert after.state is ValidationState.VALID, \
+            f"{after.reason} :: {after.errors[:3]}"
+        assert after.evidence["typecheck_exit"] == 0
+
+        # 5. the diff is MINIMAL. contact.go is listed because it is the file that
+        #    ERRORED: the fix must repair it without editing it.
+        for untouched in ("contact.go", "orders.go", "go.mod"):
+            assert filecmp.cmp(os.path.join(consumer, untouched),
+                               os.path.join(work, untouched), shallow=False), \
+                f"{untouched} was modified -- the PR would not be reviewable"
+
+        # 6. proof written only after a real build
+        _record_e2e_evidence(("go", "openapi", "change_field_type"), after)
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_e2e_python_openapi_remove_field():
+    """The FOURTH golden path -- and the one that was impossible this morning.
+
+    detect -> canonical op -> fix -> APPLY -> mypy -> minimal diff
+
+    This cell could not exist until app/py_codemod.py replaced five context-free
+    regexes. Measured on this fixture's own consumer, the old handler returned every
+    reference intact while reporting "Removed references to field 'phone_number'
+    (2 lines affected)", so step 4 would have failed and the cell would correctly
+    have refused to become production-ready. Two of those regexes were worse than
+    useless -- one stripped a function parameter, one deleted whole lines around a
+    subscript -- and no test noticed, because there was no Python fixture.
+
+    THE INVERSION, AGAIN, IN THE OTHER DIRECTION
+    The change-field-type cells edit the DECLARATION because a retype leaves the
+    usages correct. A removal is the opposite: models.py is regenerated from the new
+    spec and is already right, so the USAGES are stale and checkout.py is the fix
+    target. models.py must come out byte-identical, which this asserts -- the same
+    relationship as the TypeScript remove-field cell.
+
+    Both edited shapes are ones the codemod can remove with no behavioural change:
+    an f-string interpolation and a dict-literal entry. A parameter or an aliased
+    local in this file would be refused, correctly, and the cell would not qualify.
+    """
+    import filecmp
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.change_types import canonical_op, category, MECHANICAL
+    from app.fix_templates import apply_fix_template
+    from app.validation import validate, choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "python-openapi", "remove-field")
+    consumer = os.path.join(base, "consumer")
+
+    backend, note = choose_backend()
+    if backend != "docker":
+        print(f"      SKIP: python validation needs docker, got {backend or 'none'} "
+              f"({note}) -- no e2e evidence written")
+        return
+
+    # 1. the operation is mechanical, so a transformation is legitimate at all
+    assert canonical_op("removed_field") == "remove_field"
+    assert category("removed_field") == MECHANICAL
+
+    work_root = tempfile.mkdtemp(prefix="ripple-e2e-pyrm-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns("__pycache__", ".mypy_cache",
+                                                ".ripple-venv", ".git"))
+        target = os.path.join(work, "src", "checkout.py")
+
+        # 2. the consumer genuinely does not typecheck first. Two attribute errors,
+        #    one per stale reference, and NO annotation gaps -- a gap would make the
+        #    verdict UNABLE_TO_VALIDATE and a later pass would prove nothing.
+        before = validate("python", work)
+        assert before.state is ValidationState.INVALID, \
+            f"{before.state.value}: {before.reason}"
+        assert len(before.errors) == 2, before.errors
+        assert before.evidence["mypy_annotation_gaps"] == 0, before.evidence
+
+        # 3. generate and APPLY the fix (read before write)
+        with open(target) as fh:
+            original = fh.read()
+        fixed, explanation = apply_fix_template(
+            code=original, language="python", change_type="removed_field",
+            field_name="phone_number")
+        assert fixed != original, "the transformation did nothing"
+
+        # The failure this cell exists to prevent: a no-op that reports success.
+        assert "user.phone_number" not in fixed, fixed
+        # ...and the explanation must name the shapes it really removed, not the
+        # fabricated five-category list the old success path appended to everything.
+        assert "f-string interpolation" in explanation, explanation
+        assert "dict-literal entry" in explanation, explanation
+        assert "accessor methods" not in explanation, explanation
+        # The neighbours survive: only the removed field's references go.
+        assert "user.full_name" in fixed and "user.email" in fixed, fixed
+        assert '"id": user.id,' in fixed, fixed
+        # PEP 8's two blank lines between top-level defs survive
+        assert fixed.count("\n\n\n") == original.count("\n\n\n"), \
+            "blank-line runs changed -- the diff is no longer minimal"
+        # and it is still parseable Python, which a dangling comma or `f"{}"` is not
+        import ast as _ast
+        _ast.parse(fixed)
+
+        with open(target, "w") as fh:
+            fh.write(fixed)
+        assert open(target).read() == fixed
+
+        # 4. the real typechecker accepts it
+        after = validate("python", work)
+        assert after.state is ValidationState.VALID, \
+            f"{after.reason} :: {after.errors[:3]}"
+        assert after.evidence["typecheck_exit"] == 0
+
+        # 5. the diff is MINIMAL. models.py is listed first because it is the file
+        #    the SIBLING cell edits -- here it is already correct and touching it
+        #    would mean the codemod went after the declaration instead of the usages.
+        for untouched in ("src/models.py", "src/orders.py", "src/__init__.py",
+                          "mypy.ini", "requirements-dev.txt"):
+            assert filecmp.cmp(os.path.join(consumer, untouched),
+                               os.path.join(work, untouched), shallow=False), \
+                f"{untouched} was modified -- the PR would not be reviewable"
+
+        # 6. proof written only after a real typecheck
+        _record_e2e_evidence(("python", "openapi", "remove_field"), after)
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_e2e_python_openapi_change_field_type():
+    """The THIRD golden path -- and the first in a language other than TypeScript.
+
+    detect -> canonical op -> fix -> APPLY -> mypy -> minimal diff
+
+    This cell proves the NEW thing, which is the Python validator, rather than a
+    third fixture for an already-proven toolchain. The operation is the same as the
+    TypeScript cell deliberately: holding the codemod constant means a failure here
+    is attributable to validation, not to a transformation nobody had exercised.
+
+    Why the op is change_field_type and not remove_field, which would have mirrored
+    the first cell: the Python remove_field codemod DOES NOT WORK. Measured before
+    this fixture was written -- given a consumer reading `user.phone_number`, it
+    returns the file with every reference still present while reporting "Removed
+    references to field 'phone_number' (2 lines affected)". A fixture for that cell
+    would fail at step 4, correctly, and the cell is not production-ready. It is
+    recorded in expected.json rather than quietly avoided.
+
+    Three hazards, all measured:
+
+    1. mypy's reach depends on the CONSUMER's annotations, not on the project config
+       the way tsc's does. The same broken file passes mypy at exit 0 once the
+       parameter annotation is removed. Every def in this fixture is annotated, and
+       the runner passes --disallow-untyped-defs so a gap yields
+       UNABLE_TO_VALIDATE rather than a pass it could not have earned.
+    2. _change_type_python is field-blind -- it rewrites every occurrence of the old
+       annotation and never reads field_name. models.py has exactly one.
+    3. The codemod does not respect comments. The first draft of this fixture said
+       the pattern out literally in its docstring and got "3 type annotations
+       updated" for a one-field change, two of them inside the comment. The prose
+       now avoids the pattern.
+
+    SKIPS rather than passes with no docker, for the same reason as the other cells.
+    """
+    import filecmp
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.change_types import canonical_op, category, MECHANICAL
+    from app.fix_templates import apply_fix_template
+    from app.validation import validate, choose_backend
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.join(root, "fixtures", "python-openapi", "change-field-type")
+    consumer = os.path.join(base, "consumer")
+
+    backend, note = choose_backend()
+    if backend != "docker":
+        # Python validation is docker-only by design: choose_backend()'s host path
+        # probes for NODE, which is no evidence that python or mypy exist.
+        print(f"      SKIP: python validation needs docker, got {backend or 'none'} "
+              f"({note}) -- no e2e evidence written")
+        return
+
+    # 1. the operation is mechanical, so a transformation is legitimate at all
+    assert canonical_op("field_type_changed") == "change_field_type"
+    assert category("field_type_changed") == MECHANICAL
+
+    work_root = tempfile.mkdtemp(prefix="ripple-e2e-py-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns("__pycache__", ".mypy_cache",
+                                                ".ripple-venv", ".git"))
+        target = os.path.join(work, "src", "models.py")
+
+        # 2. the consumer genuinely does not typecheck first. Two errors, both in
+        #    contact.py: .strip() and .startswith() on an int.
+        before = validate("python", work)
+        assert before.state is ValidationState.INVALID, \
+            f"{before.state.value}: {before.reason}"
+        assert len(before.errors) == 2, before.errors
+        assert before.evidence["mypy_annotation_gaps"] == 0, \
+            "the fixture must be fully annotated, or a pass would prove nothing"
+
+        # 3. generate and APPLY the fix (read before write)
+        with open(target) as fh:
+            original = fh.read()
+        fixed, explanation = apply_fix_template(
+            code=original, language="python", change_type="field_type_changed",
+            field_name="phone_number", old_type="integer", new_type="string")
+        assert fixed != original, "the transformation did nothing"
+        assert "phone_number: str" in fixed, fixed
+        # sibling str fields survive verbatim -- proof the field-blind regex was
+        # pointed at the int annotation and not at the str ones
+        assert fixed.count(": str") == 4, fixed
+        # Word boundary, not substring: the docstring contains "(type: integer)",
+        # which a plain `": int" not in fixed` test matches. The codemod uses
+        # `:\s*int\b`, which correctly does NOT match inside "integer" -- so the
+        # assertion has to use the same semantics or it fails on prose the codemod
+        # never touched. (It did, on the first run.)
+        assert re.search(r":\s*int\b", fixed) is None, fixed
+        # and exactly ONE line changed: if the comment gets rewritten too, this
+        # fixture is measuring a three-line diff and calling it one
+        assert (len(fixed.splitlines()) == len(original.splitlines())
+                and sum(1 for a, b in zip(original.splitlines(), fixed.splitlines())
+                        if a != b) == 1), "more than one line changed"
+        with open(target, "w") as fh:
+            fh.write(fixed)
+        assert open(target).read() == fixed
+
+        # 4. the real typechecker accepts it
+        after = validate("python", work)
+        assert after.state is ValidationState.VALID, \
+            f"{after.reason} :: {after.errors[:3]}"
+        assert after.evidence["typecheck_exit"] == 0
+
+        # 5. the diff is MINIMAL. contact.py is listed because it is the file that
+        #    ERRORED: the fix must repair it without editing it.
+        for untouched in ("src/contact.py", "src/orders.py", "src/__init__.py",
+                          "mypy.ini", "requirements-dev.txt"):
+            assert filecmp.cmp(os.path.join(consumer, untouched),
+                               os.path.join(work, untouched), shallow=False), \
+                f"{untouched} was modified -- the PR would not be reviewable"
+
+        # 6. proof written only after a real typecheck
+        _record_e2e_evidence(("python", "openapi", "change_field_type"), after)
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_python_validator_refuses_to_pass_an_unannotated_consumer():
+    """A mypy pass on unannotated code must be UNABLE_TO_VALIDATE, never VALID.
+
+    This is the load-bearing property of the Python validator and the reason it is
+    not simply `mypy`. Measured: the change-field-type fixture, broken, passes mypy
+    at exit 0 once the parameter annotation is removed -- so an exit-0-means-valid
+    runner would have granted AUTO to a consumer it could not read.
+
+    Runs on the SAME broken fixture with one annotation stripped, so it cannot drift
+    from the cell it protects.
+    """
+    import shutil as _sh
+    import tempfile
+    from app.capability_claims import ValidationState
+    from app.validation import validate, choose_backend
+
+    backend, note = choose_backend()
+    if backend != "docker":
+        print(f"      SKIP: python validation needs docker ({note})")
+        return
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    consumer = os.path.join(root, "fixtures", "python-openapi",
+                            "change-field-type", "consumer")
+    work_root = tempfile.mkdtemp(prefix="ripple-py-unann-")
+    work = os.path.join(work_root, "consumer")
+    try:
+        _sh.copytree(consumer, work,
+                     ignore=_sh.ignore_patterns("__pycache__", ".mypy_cache",
+                                                ".ripple-venv", ".git"))
+        path = os.path.join(work, "src", "contact.py")
+        body = open(path).read()
+        # Strip the annotations from BOTH defs. The first version of this test
+        # stripped only one and got INVALID -- correctly, because the OTHER def was
+        # still annotated and still reported attr-defined, and a real type error
+        # outranks an annotation gap. To isolate the property under test, no real
+        # error may remain: mypy must then have nothing to say except that it cannot
+        # see the types.
+        stripped = body.replace("def normalise_phone(user: User) -> str:",
+                                "def normalise_phone(user):")
+        stripped = stripped.replace("def is_international(user: User) -> bool:",
+                                    "def is_international(user):")
+        assert stripped.count("(user):") == 2, \
+            "the fixture signatures changed -- update this test"
+        open(path, "w").write(stripped)
+
+        v = validate("python", work)
+        assert v.state is ValidationState.UNABLE_TO_VALIDATE, (
+            f"an unannotated consumer produced {v.state.value}, not "
+            f"UNABLE_TO_VALIDATE -- mypy cannot see the types here, so this would "
+            f"be a pass earned by absence of evidence")
+        assert v.evidence["mypy_annotation_gaps"] >= 2, v.evidence
+        assert v.evidence["mypy_errors"] == 0, \
+            f"a real type error survived, so this is not testing the gap path: {v.errors}"
+        assert "could not see the types" in v.reason, v.reason
+    finally:
+        _sh.rmtree(work_root, ignore_errors=True)
+
+
+def test_auto_is_real_only_for_proven_cells_and_unreachable_otherwise():
+    """AUTO exists. It must remain impossible to obtain without earning it.
 
     Before Stage 6 this was easy to guarantee, because AUTO was unreachable for all
-    1800 cells -- nothing validated. Now exactly one cell reaches it, which is the
+    1800 cells -- nothing validated. Now a small set of cells reach it, which is the
     first time the mechanism has had to distinguish rather than simply refuse. That
     makes this the load-bearing test of the whole plan.
+
+    The expected AUTO set is DERIVED from E2E_FIXTURES, not written as a literal.
+    It was a literal while there was one cell, and adding the second broke this
+    test -- which is the right outcome for a hardcoded expectation but the wrong
+    place to spend the correction. Deriving it means the invariant under test is
+    "AUTO iff proven", which is the actual rule, and a third fixture needs no edit
+    here. A literal would also have let someone add a fixture and silently keep
+    this assertion true by editing the list to match.
     """
     from app import capability_claims as cc
     from app.capabilities import CONTRACT_ENGINES
@@ -3631,31 +4964,39 @@ def test_auto_is_real_for_exactly_one_cell_and_unreachable_otherwise():
                 if d.level is Level.AUTO:
                     autos.append((lang, contract, op))
 
-    # 1. exactly the golden cell, and nothing else
-    assert autos == [("typescript", "openapi", "remove_field")], autos
-    assert counts["AUTO"] == 1 and counts["REVIEW"] == 1799, counts
+    # 1. exactly the proven cells, and nothing else
+    expected = sorted(cell for cell in cc.E2E_FIXTURES
+                      if cc.production_ready(*cell))
+    assert expected, "no cell is production-ready -- this test would be vacuous"
+    assert sorted(autos) == expected, (sorted(autos), expected)
+    total = sum(counts.values())
+    assert counts["AUTO"] == len(expected), counts
+    assert counts["REVIEW"] == total - len(expected), counts
 
     # 1b. AUTO REQUIRES A LIVE VALIDATION OF THIS PATCH. Registry evidence proves the
     #     CELL works -- that this combination has an end-to-end fixture which
     #     compiles. It says nothing about whether THIS patch, on THIS repository,
-    #     compiles, and conflating the two is what AUTO used to rest on.
-    golden = ("typescript", "openapi", "remove_field")
-    for validated, expected in ((True, Level.AUTO),
+    #     compiles, and conflating the two is what AUTO used to rest on. Checked for
+    #     EVERY proven cell: a per-cell rule verified on one cell is a rule verified
+    #     nowhere in particular.
+    for cell in expected:
+        for validated, want in ((True, Level.AUTO),
                                 (False, Level.REVIEW),
                                 (None, Level.REVIEW)):
-        d = pr_level(*golden, confidence=0.99, min_confidence=0.5,
-                     validated=validated)
-        assert d.level is expected, (
-            f"validated={validated!r} produced {d.level.value}, wanted "
-            f"{expected.value} -- 'we could not check' must never read as 'it is fine'")
-    assert any("not validated" in r
-               for r in pr_level(*golden, confidence=0.99, min_confidence=0.5,
-                                 validated=None).reasons), \
-        "an unvalidated fix is downgraded without saying why"
-    assert any("did not typecheck" in r
-               for r in pr_level(*golden, confidence=0.99, min_confidence=0.5,
-                                 validated=False).reasons), \
-        "a fix that failed the compiler is downgraded without saying why"
+            d = pr_level(*cell, confidence=0.99, min_confidence=0.5,
+                         validated=validated)
+            assert d.level is want, (
+                f"{'/'.join(cell)} validated={validated!r} produced {d.level.value}, "
+                f"wanted {want.value} -- 'we could not check' must never read as "
+                f"'it is fine'")
+        assert any("not validated" in r
+                   for r in pr_level(*cell, confidence=0.99, min_confidence=0.5,
+                                     validated=None).reasons), \
+            f"{'/'.join(cell)}: an unvalidated fix is downgraded without saying why"
+        assert any("did not typecheck" in r
+                   for r in pr_level(*cell, confidence=0.99, min_confidence=0.5,
+                                     validated=False).reasons), \
+            f"{'/'.join(cell)}: a failed compile is downgraded without saying why"
 
     # 2. every AUTO must satisfy the registry AND be mechanical
     for lang, contract, op in autos:
@@ -4197,7 +5538,7 @@ def test_a_partial_removal_returns_the_original_not_broken_code():
 
     This is the real billing-api shape, which is why it is this shape.
     """
-    from app.fix_templates import apply_fix_template, _LAST_TS_RESULT
+    from app.fix_templates import apply_fix_template, _LAST_CODEMOD_RESULT
 
     partial = (
         "interface CreateUserRequest {\n"
@@ -4216,9 +5557,9 @@ def test_a_partial_removal_returns_the_original_not_broken_code():
     assert out == partial, \
         "a partial removal returned CHANGED code -- it would open a PR that cannot " \
         "compile, which is what wiring the diff contract was meant to stop"
-    assert not (_LAST_TS_RESULT.get("edits") or []), \
+    assert not (_LAST_CODEMOD_RESULT.get("edits") or []), \
         "edits were reported for a patch that was refused"
-    assert any("diff contract" in str(r) for r in _LAST_TS_RESULT.get("refusals") or []), \
+    assert any("diff contract" in str(r) for r in _LAST_CODEMOD_RESULT.get("refusals") or []), \
         "the refusal does not say the diff contract rejected it, so the PR body " \
         "could not explain why nothing happened"
 
@@ -6124,17 +7465,15 @@ def test_a_contaminated_outcome_is_recorded_but_teaches_nothing():
     row = {"pattern_id": "abc", "source": "pattern", "consumer_file": "src/x.ts",
            "field_name": "phoneNumber"}
 
-    clean = {"number": 1, "commits": 1,
-             "commit_list": [{"author": {"login": "ripple-api[bot]"}}],
-             "changed_files": 1}
+    # No proposed_files on this row on purpose: it doubles as coverage that a
+    # LEGACY row written before Stage 1 still falls back to a bound of 1.
+    clean = {"number": 1, "commits": 1, "changed_files": 1}
     contaminated, reason = w._outcome_is_contaminated(clean, row)
     assert not contaminated, f"a clean single-commit merge was called contaminated: {reason}"
 
     for label, pr in (
-        ("extra files touched", {"number": 2, "commits": 1, "changed_files": 7,
-                                 "commit_list": [{"author": {"login": "ripple-api[bot]"}}]}),
-        ("squash of many commits", {"number": 3, "commits": 6, "changed_files": 1,
-                                    "commit_list": []}),
+        ("extra files touched", {"number": 2, "commits": 1, "changed_files": 7}),
+        ("squash of many commits", {"number": 3, "commits": 6, "changed_files": 1}),
     ):
         contaminated, reason = w._outcome_is_contaminated(pr, row)
         assert contaminated, f"{label} was NOT flagged as contaminated"
@@ -6180,10 +7519,23 @@ def test_a_clean_template_merge_derives_a_pattern():
         language="typescript", field_name=field,
         consumer_file="src/only.ts", repo="acme/api", validated=True, level="AUTO")
 
-    result = w._handle_pr_merged(
-        {"repository": {"full_name": "acme/api"}},
-        {"number": 4242, "html_url": url, "commits": 1, "changed_files": 1,
-         "commit_list": [{"author": {"login": "ripple-api[bot]"}}]})
+    # The author check is now LIVE: _record_pr_terminal fetches the commit
+    # authors from the API. Substituting the fetch supplies what the network would,
+    # and keeps this test about pattern DERIVATION rather than about HTTP.
+    #
+    # Substituting is safe here only because a separate test --
+    # test_the_commit_authors_are_actually_fetched_not_read_from_the_payload --
+    # pins that production really performs this fetch at the convergence point.
+    # Without that pairing this would be the trap the old commit_list key was:
+    # a seam only tests ever fill, making a dead check look alive.
+    _real_fetch = w._fetch_pr_commit_authors
+    w._fetch_pr_commit_authors = lambda *_a, **_k: ["ripple-api[bot]"]
+    try:
+        result = w._handle_pr_merged(
+            {"repository": {"full_name": "acme/api"}},
+            {"number": 4242, "html_url": url, "commits": 1, "changed_files": 1})
+    finally:
+        w._fetch_pr_commit_authors = _real_fetch
 
     assert result["outcome"] == "merged_clean", result
     after = len(rag_store.patterns)
@@ -6826,6 +8178,383 @@ def test_the_store_constants_still_match_their_recorded_derivation():
         f"finding was that cost does not bind below ~25k rows, so the cap exists "
         f"to bound growth and is deliberately ONE number across both persisted "
         f"stores. If they should now differ, say why in both docstrings.")
+
+
+def test_one_pr_carrying_two_consumers_keeps_both():
+    """Ripple opens ONE PR per repo covering ALL of that repo's consumers.
+
+    `_create_fix_pr` is called once per consumer file, but the branch name is
+    derived from the FIELD, not the consumer -- so the second consumer hits the
+    existing branch, appends a commit, and returns the SAME pr_url. Live proof:
+    billing-api PR #5 is 2 commits / 2 files / 1 PR.
+
+    record_open() keyed `_rows[pr_url] = {...}`, so N consumers on one PR wrote N
+    rows to one key and only the LAST survived. Every other consumer was silently
+    dropped, which then made contamination read the merge as "N files changed but
+    Ripple proposed 1".
+
+    Merging rather than overwriting is the fix, and it keeps the three per-consumer
+    call sites untouched -- restructuring the loops to accumulate first would put
+    the same requirement in three places, which is how the diff contract ended up
+    wired in one caller and bypassed by another.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    scratch = tempfile.mkdtemp(prefix="ripple_ledger_multi_")
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = scratch
+    try:
+        import importlib
+
+        import app.pr_ledger as led
+        importlib.reload(led)
+
+        url = "https://github.com/acme/billing-api/pull/9101"
+        common = dict(pattern_id="", source="template",
+                      change_type="removed_field", language="typescript",
+                      field_name="phoneNumber", repo="acme/billing-api",
+                      validated=True, level="AUTO")
+
+        led.record_open(url, consumer_file="packages/reporting/src/summary.ts",
+                        **common)
+        led.record_open(url, consumer_file="packages/checkout/src/client.ts",
+                        **common)
+
+        row = led.lookup(url)
+        assert row is not None, "row vanished entirely"
+
+        proposed = row.get("proposed_files")
+        assert proposed is not None, (
+            "the row records no proposed_files, so a multi-consumer PR still "
+            "collapses to whichever consumer happened to be written last")
+        assert set(proposed) == {
+            "packages/reporting/src/summary.ts",
+            "packages/checkout/src/client.ts",
+        }, f"both consumers must survive, got {proposed}"
+
+        # One row per PR, not one per consumer -- the key is the PR.
+        assert len(led._rows) == 1, (
+            f"expected exactly 1 ledger row for 1 PR, got {len(led._rows)}")
+
+        # Identity fields must not drift between merges of the same PR.
+        assert row["field_name"] == "phoneNumber"
+        assert row["repo"] == "acme/billing-api"
+        assert row["source"] == "template"
+
+        # Back-compat: consumer_file still present for readers that expect one.
+        assert row.get("consumer_file") in proposed, (
+            "consumer_file must remain a real member of proposed_files")
+
+        # And it survives a reload, since attribution happens days later.
+        importlib.reload(led)
+        reloaded = led.lookup(url)
+        assert reloaded and set(reloaded.get("proposed_files") or []) == set(proposed), (
+            "proposed_files did not survive a reload, so a PR merged tomorrow "
+            "cannot be attributed")
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+        import importlib
+
+        import app.pr_ledger as led2
+        importlib.reload(led2)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_a_real_pattern_id_is_not_lost_to_a_later_template_write():
+    """Merging must not let a later write erase a real pattern_id with "".
+
+    Consumers of the same field can be generated by different paths -- one from a
+    stored pattern, another falling back to the template. `_pattern_id_from_
+    explanation` returns "" for template, and a plain dict update would let that
+    empty string overwrite the real id, silently making the merge unattributable
+    to the pattern that actually produced part of it.
+
+    Same shape as the provenance ladder: absence must never outrank presence.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    scratch = tempfile.mkdtemp(prefix="ripple_ledger_pid_")
+    old = os.environ.get("RIPPLE_DATA_DIR")
+    os.environ["RIPPLE_DATA_DIR"] = scratch
+    try:
+        import importlib
+
+        import app.pr_ledger as led
+        importlib.reload(led)
+
+        url = "https://github.com/acme/billing-api/pull/9102"
+        common = dict(source="template", change_type="removed_field",
+                      language="typescript", field_name="phoneNumber",
+                      repo="acme/billing-api", validated=True, level="AUTO")
+
+        led.record_open(url, pattern_id="abc123def4567890",
+                        consumer_file="a.ts", **common)
+        led.record_open(url, pattern_id="", consumer_file="b.ts", **common)
+
+        row = led.lookup(url)
+        assert row["pattern_id"] == "abc123def4567890", (
+            f"a later empty pattern_id erased the real one, got "
+            f"{row['pattern_id']!r} -- the merge is now unattributable")
+    finally:
+        if old is None:
+            os.environ.pop("RIPPLE_DATA_DIR", None)
+        else:
+            os.environ["RIPPLE_DATA_DIR"] = old
+        import importlib
+
+        import app.pr_ledger as led2
+        importlib.reload(led2)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _s2_row(files, **over):
+    """A provenance row shaped like pr_ledger writes one, for Stage 2 tests."""
+    row = {
+        "pattern_id": "", "source": "template", "change_type": "removed_field",
+        "language": "typescript", "field_name": "phoneNumber",
+        "consumer_file": files[0] if files else "",
+        "proposed_files": list(files),
+        "repo": "acme/billing-api", "validated": True, "level": "AUTO",
+        "opened_at": 0.0,
+    }
+    row.update(over)
+    return row
+
+
+def _s2_pr(commits, changed, number=9200):
+    return {
+        "html_url": f"https://github.com/acme/billing-api/pull/{number}",
+        "number": number, "merged": True, "state": "closed",
+        "commits": commits, "changed_files": changed,
+        "user": {"login": "ripple-api[bot]"},
+        "base": {"repo": {"full_name": "acme/billing-api"}},
+    }
+
+
+def test_a_multi_consumer_clean_merge_is_not_contaminated():
+    """The common case must be learnable.
+
+    Ripple opens ONE PR per repo covering ALL its consumers, one commit per
+    consumer file -- billing-api PR #5 is 2 commits / 2 files / 1 PR. The
+    predicate hardcoded `changed_files > 1` and `commits > 2` against an
+    assumption of one file per PR, and said so in its own message: "N files
+    changed but Ripple proposed 1".
+
+    So every real multi-consumer merge was classified contaminated and derived
+    no pattern. The store could never gain a row, which is why it still holds
+    zero after the whole learning loop was built and deployed.
+
+    The bound is now the SET Ripple actually proposed.
+    """
+    from app.webhook import _outcome_is_contaminated
+
+    two = ["packages/reporting/src/summary.ts", "packages/checkout/src/client.ts"]
+
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=2, changed=2),
+                                        _s2_row(two))
+    assert not bad, (
+        f"a 2-commit / 2-file merge of a PR that proposed 2 files was called "
+        f"contaminated: {why}")
+
+    # Three consumers, three commits, three files -- still clean.
+    three = two + ["packages/notify/src/sms.ts"]
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=3, changed=3),
+                                        _s2_row(three))
+    assert not bad, f"a 3-consumer clean merge was called contaminated: {why}"
+
+    # Fewer files than proposed is fine -- one fix may have been a no-op.
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=2, changed=1),
+                                        _s2_row(two))
+    assert not bad, f"changed < proposed must not be contamination: {why}"
+
+
+def test_edits_beyond_the_proposed_set_are_still_contaminated():
+    """Loosening the bound must not remove the property it was protecting."""
+    from app.webhook import _outcome_is_contaminated
+
+    two = ["packages/reporting/src/summary.ts", "packages/checkout/src/client.ts"]
+
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=2, changed=7),
+                                        _s2_row(two))
+    assert bad and "file" in why.lower(), (
+        f"7 files changed against 2 proposed must be contaminated, got {why!r}")
+
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=9, changed=2),
+                                        _s2_row(two))
+    assert bad and "commit" in why.lower(), (
+        f"9 commits against 2 proposed must be contaminated, got {why!r}")
+
+    # THE TWO PREDICATES HAVE DIFFERENT COMMIT TOLERANCES, on purpose.
+    #
+    # `_pr_had_human_edits` fires at > expected: Ripple pushes one commit per
+    # consumer file, so anything beyond that is someone else. Contamination
+    # tolerates ONE more, because a single reviewer follow-up touching only the
+    # proposed files is still attributable -- that file's merged state IS the
+    # corrected fix, which is what makes a human_edit outcome worth recording at
+    # all. Collapsing the two tolerances would mean every human correction became
+    # unlearnable, which is the opposite of the ladder's intent.
+    one = ["packages/reporting/src/summary.ts"]
+    bad, _ = _outcome_is_contaminated(_s2_pr(commits=2, changed=1),
+                                      _s2_row(one))
+    assert not bad, (
+        "1 Ripple commit + 1 reviewer follow-up on the one proposed file must "
+        "stay attributable, or provenance can never rise to human_edit")
+
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=3, changed=1),
+                                        _s2_row(one))
+    assert bad, (
+        f"two follow-up commits on one proposed file is a pile-up we cannot "
+        f"split into fix and not-fix, got {why!r}")
+
+    # Absent data stays conservative -- "could not check" is not "it is fine".
+    for pr, label in ((_s2_pr(commits=None, changed=2), "commits absent"),
+                      (_s2_pr(commits=2, changed=None), "changed_files absent")):
+        bad, why = _outcome_is_contaminated(pr, _s2_row(two))
+        assert bad, f"{label} must read as contaminated, got {why!r}"
+
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=1, changed=1), None)
+    assert bad, "a PR with no provenance row must be contaminated"
+
+    # The bound itself, asserted directly. Both callers early-return when the row
+    # is absent, so `_proposed_count(None)` is defensive-only -- and a mutation
+    # making it return 999 passed every other test precisely because nothing
+    # reached it. An unreachable branch with no contract is a trap for the next
+    # caller, who will reach it.
+    from app.webhook import _proposed_count
+
+    assert _proposed_count(None) == 1, (
+        "an absent row must yield the STRICTEST bound, not an unbounded one")
+    assert _proposed_count({}) == 1, "an empty row must yield the strictest bound"
+    assert _proposed_count({"proposed_files": []}) == 1, (
+        "an empty proposed_files list must not mean 'unbounded'")
+    assert _proposed_count({"proposed_files": ["a.ts", "b.ts"]}) == 2
+    assert _proposed_count({"consumer_file": "a.ts"}) == 1, (
+        "a legacy row predating proposed_files must fall back to 1")
+
+    # A row predating proposed_files must behave like the old single-file bound,
+    # not like an unbounded one.
+    legacy = _s2_row(["a.ts"])
+    legacy.pop("proposed_files")
+    bad, why = _outcome_is_contaminated(_s2_pr(commits=1, changed=2), legacy)
+    assert bad and "file" in why.lower(), (
+        f"a legacy row with no proposed_files must fall back to a FILE bound of "
+        f"1, not to unlimited, got {why!r}")
+
+
+def test_human_edit_detection_is_bounded_by_the_proposed_set():
+    """One commit per consumer file is Ripple's own shape, not a human's."""
+    from app.webhook import _pr_had_human_edits
+
+    two = ["a.ts", "b.ts"]
+    app_only = ["ripple-api[bot]", "ripple-api[bot]"]
+
+    assert not _pr_had_human_edits(_s2_pr(commits=2, changed=2),
+                                   _s2_row(two), app_only), (
+        "2 App commits on a PR that proposed 2 files is Ripple's normal shape")
+
+    assert _pr_had_human_edits(_s2_pr(commits=5, changed=2),
+                               _s2_row(two), app_only), (
+        "5 commits against 2 proposed files means someone added commits")
+
+    assert _pr_had_human_edits(_s2_pr(commits=2, changed=2), _s2_row(two),
+                               ["ripple-api[bot]", "a-human"]), (
+        "a non-App commit author must read as a human edit even when the "
+        "commit COUNT looks like Ripple's own shape -- a rebase or amend keeps "
+        "the count and changes the author")
+
+    assert _pr_had_human_edits(_s2_pr(commits=2, changed=2),
+                               _s2_row(two), None), (
+        "unknown authors must default to 'a human touched it' -- same "
+        "direction as validated=None -> REVIEW")
+
+
+def test_the_commit_authors_are_actually_fetched_not_read_from_the_payload():
+    """The author check must be LIVE, which it was not.
+
+    `_pr_had_human_edits` read `pr["commit_list"]`, and grepping the repo showed
+    that key is written ONLY by tests -- nothing in production populates it and
+    the handler never called /pulls/{n}/commits. So the author half of the check
+    was dead code, and `commits != 1` was the only guard actually running.
+
+    That matters precisely because Stage 2 loosens the count to
+    `commits > len(proposed_files)`: without a live author check, a human who
+    amends or rebases Ripple's commits keeps the count intact and would be
+    credited as a clean merge. Loosening the count while the author check was
+    dead would have made the system LESS safe, not more.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from app import webhook
+
+    assert hasattr(webhook, "_fetch_pr_commit_authors"), (
+        "no _fetch_pr_commit_authors -- the author check has no source of "
+        "authors in production")
+
+    src = inspect.getsource(webhook._fetch_pr_commit_authors)
+    assert "/commits" in src, (
+        "_fetch_pr_commit_authors does not call the commits endpoint")
+
+    # The fetch must happen at the single convergence point, so no caller has to
+    # remember it -- the shape that kept the diff contract from being bypassed.
+    terminal = inspect.getsource(webhook._record_pr_terminal)
+    assert "_fetch_pr_commit_authors" in terminal, (
+        "_record_pr_terminal does not fetch commit authors, so the author check "
+        "still has nothing to check")
+
+    # And commit_list must no longer be READ: a payload-supplied author list is a
+    # key a test can set and production never will. Checked against the AST rather
+    # than the text, because naming it in a docstring that explains why it was
+    # removed is documentation, not a live read -- a substring check here would
+    # punish the comment that records the bug.
+    whole = pathlib.Path(webhook.__file__).read_text()
+    tree = ast.parse(whole)
+    reads = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "commit_list"):
+            reads.append(node.lineno)
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "commit_list"):
+            reads.append(node.lineno)
+    assert not reads, (
+        f"commit_list is still read as code at line(s) {reads} -- that key is "
+        f"test-only, and reading it makes the author check look alive while "
+        f"nothing in production populates it")
+
+    # _pr_had_human_edits must take authors as an argument rather than digging
+    # them out of the payload itself.
+    params = list(inspect.signature(webhook._pr_had_human_edits).parameters)
+    assert len(params) >= 3, (
+        f"_pr_had_human_edits{tuple(params)} should receive (pr, row, authors) "
+        f"so the fetch stays at one place and the predicate stays pure")
+
+    # Every call site must pass all three -- a two-arg call would silently lose
+    # the bound or the authors. This is the signature-bind lesson from Stage 2 of
+    # the learning loop, where a real call raised TypeError on every invocation.
+    tree = ast.parse(whole)
+    sig = inspect.signature(webhook._pr_had_human_edits)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_pr_had_human_edits"):
+            try:
+                sig.bind(*[None] * len(node.args),
+                         **{k.arg: None for k in node.keywords if k.arg})
+            except TypeError as exc:
+                raise AssertionError(
+                    f"call to _pr_had_human_edits at line {node.lineno} does not "
+                    f"match its signature: {exc}") from exc
 
 
 if __name__ == "__main__":

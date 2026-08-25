@@ -102,6 +102,30 @@ jobs:
         # which is the one outcome that must never happen.
         run: python tools/audit_codemod_coverage.py
 
+      - name: Codemod honesty (blocking)
+        # 101 probes across all 15 languages x {remove_field usages, remove_field
+        # decl, remove_type usages, remove_type IMPORTS, remove_enum, rename_field,
+        # change_type}, measuring four things a coverage number cannot:
+        #
+        #   NO-OP LIE       claims success, the target token is still there
+        #   PHANTOM LIE     changed=True but nothing real moved
+        #   COLLATERAL      deleted a line that never mentioned the target
+        #   NEIGHBOUR LOSS  an identifier that was NOT the target lost its binding
+        #
+        # NEIGHBOUR LOSS is the one that earns its keep. `import { User, Address }`
+        # mentions the target, so deleting it wholesale to remove `User` is invisible
+        # to a collateral check -- and that exact defect shipped in python,
+        # typescript, javascript and rust. Rust had no validator behind it.
+        #
+        # Runs on all 15 languages, not just the ones without a validator: the
+        # typescript instance proves a wired compiler does not help when the cell is
+        # not a validated one, because the bad patch still opens a PR reporting
+        # success. Fixtures are skipped, visibly, where a shape does not exist in a
+        # language (Go imports packages, shell has no types) -- and the audit FAILS if
+        # any language contributes zero probes, so losing a fixture cannot quietly
+        # shrink it.
+        run: python tools/audit_codemod_honesty.py
+
       - name: Negative fix corpus (blocking)
         # Six fixes that the deleted app/validated_fix.py once called VALID. Each is
         # replayed against a frozen reproduction of that old logic to prove it really

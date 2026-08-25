@@ -1,0 +1,91 @@
+{
+  "id": "go-openapi-change-field-type",
+  "cell": {
+    "language": "go",
+    "contract": "openapi",
+    "operation": "change_field_type"
+  },
+  "why_this_cell": "The FIFTH production-ready cell, and the first for the Go validator. Go was the last wired validator with nothing proven -- validate_ok counted 63 more cells and not one had been shown to work. A wired validator with no cell is a claim about a toolchain, not about the product.",
+  "why_not_remove_field": {
+    "measured": "_remove_field_go edits the STRUCT DECLARATION and does nothing at all to a usage file. For a removal the declaration is regenerated correct and the USAGES are stale, so the one file it can edit is the one file that does not need editing.",
+    "consequence": "go/openapi/remove_field is NOT production-ready. A fixture for it would fail at the build step, correctly.",
+    "scope": "change_field_type and remove_field are the only mechanical ops detectable for go/openapi, so change_field_type is the only viable Go cell today."
+  },
+  "change": {
+    "spec_before": "spec/user.before.yaml",
+    "spec_after": "spec/user.after.yaml",
+    "field": "phoneNumber",
+    "old_type": "integer (format int32)",
+    "new_type": "string",
+    "native_old": "int32",
+    "native_new": "string",
+    "category": "mechanical"
+  },
+  "consumer": {
+    "root": "consumer",
+    "module": "example.com/consumer",
+    "install": ["go", "mod", "download", "all"],
+    "install_note": "GOMODCACHE is set INSIDE the mounted volume so the second container can see it -- the same cross-container problem as pip. This fixture is stdlib-only, so the download is a no-op and no network is required, which also means it validates on a corporate network that intercepts proxy.golang.org TLS.",
+    "typecheck": ["go", "build", "./..."],
+    "typecheck_note": "GOCACHE goes to /tmp because the check container mounts the source read-only."
+  },
+  "expect": {
+    "fix_target": "models/user.go",
+    "fix_target_note": "The DECLARATION is stale, not the usages -- the same inversion as the TypeScript and Python change-field-type cells. The file that ERRORS (contact.go) must be repaired without being edited.",
+    "consumers_found": ["models/user.go"],
+    "untouched": ["contact.go", "orders.go", "go.mod"],
+    "transformation": [
+      {
+        "site": "models.User.PhoneNumber",
+        "shape": "struct field type",
+        "action": "rewrite the PhoneNumber field's sized-integer type to string",
+        "mechanical": true,
+        "why": "the contract now says string; the declaration is simply wrong and there is exactly one correct value for it"
+      }
+    ],
+    "typecheck_before_fix": "INVALID",
+    "typecheck_before_fix_errors": 2,
+    "typecheck_before_fix_error_sites": [
+      "./contact.go(18): cannot use u.PhoneNumber (variable of type int32) as string value in argument to strings.TrimSpace",
+      "./contact.go(22): cannot use u.PhoneNumber (variable of type int32) as string value in argument to strings.HasPrefix"
+    ],
+    "typecheck_after_fix": "VALID",
+    "terminal_state": "RESOLVED",
+    "pr_files": ["models/user.go"]
+  },
+  "hazards": [
+    {
+      "hazard": "native_type('go', 'integer') is int32, NOT int",
+      "measured": "A struct declaring `int` does not match, and the codemod correctly ANNOTATES instead of editing: 'PARTIAL: marked 1 site(s) with RIPPLE-ACTION-REQUIRED ... Ripple did NOT transform the code: it lacks the information to do so correctly, and guessing would be worse than flagging.'",
+      "mitigation": "The struct declares the sized type, which is what OpenAPI codegen produces for an integer with a 32-bit format -- so the spec carries `format: int32` and the two agree. The test asserts RIPPLE-ACTION-REQUIRED is absent, so the annotate path cannot pass by accident."
+    },
+    {
+      "hazard": "_change_type_go is field-blind and does not respect comments",
+      "measured": "The first draft of this fixture quoted the type name four times in the package doc comment and got '5 type annotation(s) updated' for a one-field change. THIRD language with the identical hazard, after TypeScript and Python.",
+      "mitigation": "The prose describes the type instead of naming it. The test asserts exactly ONE line differs."
+    },
+    {
+      "hazard": "Go treats unused imports as compile ERRORS",
+      "note": "This cell does not trip it -- the retype keeps `strings` in use. A remove_field cell would have to drop the now-unused import or fail the build, which is the validator earning its keep rather than a defect."
+    }
+  ],
+  "measured": {
+    "as_of": "2026-08-23",
+    "measured_by": "test_e2e_go_openapi_change_field_type, run against the real toolchain",
+    "fixture_fails_without_a_fix": true,
+    "fixture_is_satisfiable": true,
+    "ripple_changed_the_file": true,
+    "ripple_annotated_instead_of_editing": false,
+    "ripple_build_after": "VALID",
+    "ripple_explanation": "Changed type 'int32' -> 'string' in go code (contract: integer -> string). 1 type annotation(s) updated.",
+    "ripple_edits": ["struct field type: PhoneNumber int32 -> string"],
+    "ripple_diff_minimal": true,
+    "lines_changed": 1,
+    "untouched_verified_by": "byte comparison of contact.go, orders.go, go.mod",
+    "validation_backend": "docker, golang:1.21-alpine, --network none and read-only source for the build",
+    "typecheck_exit": 0,
+    "evidence_test": "test_e2e_go_openapi_change_field_type",
+    "production_ready": true,
+    "cost_note": "Cell 2 needed only a fixture. Cell 3 needed a validator. Cell 4 needed a codemod. Cell 5 needed only a fixture again -- the Go validator was wired in the previous session and change_field_type's Go handler already worked. The expensive part was discovering that remove_field's Go handler does not."
+  }
+}

@@ -68,6 +68,12 @@ CONTRACT_ENGINES = {
 # test_capability_tables_match_the_dispatch, which fails if this drifts from the
 # code it describes.
 #
+# That test was CITED HERE for weeks without existing -- a comment asserting a
+# guarantee nothing enforced, which is the defect shape this registry exists to
+# remove. It exists now, and it caught the first real drift immediately: wiring
+# javascript's remove_type to a codemod made this table understate it, because
+# javascript has no `_TYPE_REF_PATTERNS` entry to be read.
+#
 # Note the inversion this exposes: the JUDGMENT operations annotate, so they need
 # only a comment token and reach all 15 languages, while the MECHANICAL ones need
 # language-specific patterns and reach 8-9. The operations Ripple refuses to
@@ -75,7 +81,7 @@ CONTRACT_ENGINES = {
 _OP_TABLE = {
     "remove_field": "REMOVE_HANDLERS",
     "change_field_type": "TYPE_CHANGE_HANDLERS",
-    "remove_type": "_TYPE_REF_PATTERNS",
+    "remove_type": "TYPE_REMOVAL_HANDLERS",   # NOT _TYPE_REF_PATTERNS -- see there
     "rename_type": "_TYPE_REF_PATTERNS",
     "remove_enum_value": "_ENUM_VALUE_PATTERNS",
     "rename_field": "_LINE_COMMENT",        # case-variant replacement, all langs
@@ -115,6 +121,8 @@ def emitted_change_types(contract: str) -> frozenset:
         return frozenset()
 
     import ast
+
+    from app.ast_compat import str_literal
     try:
         tree = ast.parse(open(path, encoding="utf-8", errors="ignore").read())
     except SyntaxError:
@@ -135,15 +143,17 @@ def emitted_change_types(contract: str) -> frozenset:
             continue
         # change_type="..." on any call
         for kw in node.keywords:
-            if (kw.arg == "change_type" and isinstance(kw.value, ast.Constant)
-                    and isinstance(kw.value.value, str)):
-                found.add(kw.value.value)
+            if kw.arg == "change_type":
+                literal = str_literal(kw.value)
+                if literal is not None:
+                    found.add(literal)
         # _bc("field_removed", ...) / BreakingChange("field_removed", ...)
         name = _callee(node)
         if (name == "BreakingChange" or name.endswith("_bc") or name == "_bc") \
-                and node.args and isinstance(node.args[0], ast.Constant) \
-                and isinstance(node.args[0].value, str):
-            found.add(node.args[0].value)
+                and node.args:
+            literal = str_literal(node.args[0])
+            if literal is not None:
+                found.add(literal)
 
     return frozenset(ct for ct in found if ct in CHANGE_TYPE_MAP)
 

@@ -716,7 +716,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 165 tests
+python tests/test_regression.py            # 191 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
@@ -724,6 +724,7 @@ python tools/audit_fail_silent.py --check  # 42 sites, every one classified
 python tools/audit_pipeline_governance.py  # 3 of 5 entry points governed
 python tools/audit_frozen_surface.py       # 6 frozen modules, 747 statements
 python tools/audit_codemod_coverage.py     # automation 68.0%, implementation 94.4%
+python tools/audit_codemod_honesty.py      # 101 probes, all fix templates, 4 failure modes
 python tools/audit_negative_corpus.py      # 7 bad fixes (6 historical + 1 observed)
 python tools/audit_safety_reachability.py  # 4 of 4 safety layers wired to production
 python tools/verify_archive_safety.py      # hostile archives: 8 cases, containment
@@ -739,10 +740,22 @@ so that evidence always records `tested_tree_dirty: true` — a dirty tree is no
 commit and can never legitimately equal a deployed sha. **Release evidence must come
 from a post-commit run:** commit first, re-run the suite, then release.
 
-All eight gate CI. The fail-silent gate does not demand zero silent paths — 25 are
-correct-but-invisible and making them visible is P0.4/P0.5 work. It demands that
-none is *unexplained*: classified in `tools/fail_silent_triage.py`, no `REAL_BUG`
-left standing, and no function that was fixed allowed to go silent again.
+All of these gate CI — 18 steps in `.github/workflows/checks.yml`, and the same list
+in `.githooks/pre-commit`. ("All eight gate CI" sat here while the number was 13; a
+count in prose has no owner and no test, which is the defect `audit_public_claims.py`
+exists to catch and did not, because it only gates counts that map onto a derived
+fact.)
+
+The fail-silent gate does not demand zero silent paths — 25 are correct-but-invisible
+and making them visible is P0.4/P0.5 work. It demands that none is *unexplained*:
+classified in `tools/fail_silent_triage.py`, no `REAL_BUG` left standing, and no
+function that was fixed allowed to go silent again.
+
+`audit_codemod_honesty.py` blocks on four things, and deliberately not on coverage.
+Its own docstring records two known gaps it does NOT fail on — `remove_field` deleting
+whole reference lines in the six languages with no handler, and a partial rename in
+shell — because inventing a failure for a weakness that is not a lie would only
+pressure someone into loosening the checks.
 
 ## License
 

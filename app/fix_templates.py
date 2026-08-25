@@ -4,6 +4,7 @@ Handles field_removed, field_renamed, type_changed across 8+ languages WITHOUT a
 """
 from __future__ import annotations
 
+import collections
 import re
 from typing import Callable
 
@@ -29,8 +30,14 @@ def to_upper_snake(name: str) -> str:
 
 
 def name_variants(name: str) -> dict[str, str]:
-    """Return all case variants of a field name."""
+    """Return all case variants of a field name.
+
+    `literal` is the name EXACTLY as the contract declares it, which is not
+    reconstructible from the others: an OpenAPI enum value may be written `pending`,
+    and pascal/upper-snake would miss it. `_declared_symbol_names` needs it.
+    """
     return {
+        'literal': name,
         'snake': to_snake(name),
         'camel': to_camel(name),
         'pascal': to_pascal(name),
@@ -46,6 +53,45 @@ def _remove_lines_matching(code: str, pattern: re.Pattern) -> str:
         line for line in code.split('\n')
         if not pattern.search(line)
     )
+
+
+_H = r'[^\S\n]'   # horizontal whitespace ONLY -- see _drop_list_element
+
+
+def _drop_list_element(code: str, element: str) -> str:
+    """Remove one element of a comma-separated list, taking its separator with it.
+
+    `element` is a regex matching the element WITHOUT surrounding separators.
+
+    Two rules, both learned from a real parse failure:
+
+    1. WHICH COMMA IS THE ARTEFACT DEPENDS ON POSITION. Removing the element and
+       leaving both commas alone leaves the list malformed:
+
+           :id, :email, :phone_number      last    -> comma BEFORE is orphaned
+           :id, :phone_number, :email      middle  -> either one works
+           :phone_number, :id, :email      first   -> comma AFTER is orphaned
+
+       So take the preceding comma when there is one, otherwise the following
+       one. `_clean_trailing_commas` cannot rescue this: it only repairs `,,`
+       and a comma against a bracket, and `:email, end` is neither.
+
+    2. HORIZONTAL WHITESPACE ONLY. `\\s*` matches newlines, so a trailing `\\s*`
+       after the last element of a line consumes the line break and welds the
+       next line on. Measured with real ruby 2.0 -- `attr_accessor :id, :email,`
+       swallowed the blank line AND the following `def`, producing
+       `attr_accessor :id, :email, def initialize(id:, email:)` and
+       `syntax error, unexpected ','`. Ruby is the worst case because a trailing
+       comma there is a line continuation rather than a hard error, so the
+       damage lands two lines away from the edit.
+
+       Same reasoning as `_remove_empty_blocks` and `_clean_trailing_commas`,
+       both of which already use `[^\\S\\n]` for exactly this. The lesson was
+       written down one function away and not applied here.
+    """
+    code = re.sub(rf',{_H}*{element}', '', code)          # not first -> take the comma before
+    code = re.sub(rf'{element}{_H}*,{_H}*', '', code)     # first     -> take the comma after
+    return code
 
 
 def _clean_trailing_commas(code: str) -> str:
@@ -87,8 +133,24 @@ def _remove_empty_blocks(code: str) -> str:
 
 
 def _clean_blank_lines(code: str) -> str:
-    """Collapse 3+ consecutive blank lines to 2."""
-    return re.sub(r'\n{3,}', '\n\n', code)
+    """Collapse 3+ consecutive blank lines to 2.
+
+    That is what this always claimed to do. `\\n{3,}` -> `\\n\\n` collapsed to ONE
+    blank line, because `\\n\\n` is a single blank line, not two -- the docstring and
+    the regex disagreed and the regex won.
+
+    It mattered most in Python, where PEP 8 requires TWO blank lines between
+    top-level definitions. Every Python fix silently reformatted every gap in the
+    file from two blank lines to one, so a one-field removal arrived as a diff
+    touching every function boundary -- destroying the minimal-diff property the
+    fixtures assert, in a language that had no fixture to notice until the validator
+    was wired. TypeScript was unaffected only because one blank line between members
+    is conventional there.
+
+    `\\n{4,}` -> `\\n\\n\\n` is the documented behaviour: three or more blank lines
+    become two, and two stay two.
+    """
+    return re.sub(r'\n{4,}', '\n\n\n', code)
 
 
 def _postprocess(code: str) -> str:
@@ -118,6 +180,43 @@ def _remove_field_go(code: str, variants: dict[str, str]) -> str:
     return code
 
 
+def _run_codemod(code: str, field: str, language: str, codemod) -> str:
+    """Run a syntax-aware codemod, enforce the diff contract, record the outcome.
+
+    Extracted when Python got a real codemod. It was inline in
+    `_remove_field_typescript`, and copying it would have put two copies of the
+    diff-contract enforcement in the tree -- including two copies of the decision to
+    return the ORIGINAL code on violation, which is the part that must never drift.
+    """
+    from .diff_contract import check as _diff_check
+    result = codemod(code, field)
+
+    # THE DIFF CONTRACT, IN THE REQUEST PATH.
+    #
+    # On violation the ORIGINAL code is returned, not the partial result. A patch
+    # that changed something it should not have is worse than no patch, and returning
+    # unchanged code is already what apply_fix_template turns into a truthful "could
+    # not remove" and what the outcome derivation turns into BLOCKED.
+    refusals = list(result.refusals)
+    out = result.code
+    diff_violations = []
+    if out != code:
+        verdict = _diff_check(code, out, field, language)
+        if not verdict.ok:
+            diff_violations = verdict.violations
+            refusals = refusals + [
+                f"diff contract: {v}" for v in verdict.violations[:3]]
+            out = code                      # refuse the patch entirely
+
+    _LAST_CODEMOD_RESULT.clear()
+    _LAST_CODEMOD_RESULT.update(
+        language=language,
+        refusals=refusals, notes=result.notes,
+        edits=[] if diff_violations else [e["shape"] for e in result.edits],
+        diff_violations=diff_violations)
+    return out
+
+
 def _remove_field_typescript(code: str, variants: dict[str, str]) -> str:
     """Delegates to app/ts_codemod.py, which is syntax-aware and REFUSES shapes it
     cannot remove safely.
@@ -133,57 +232,35 @@ def _remove_field_typescript(code: str, variants: dict[str, str]) -> str:
     derivation turns into BLOCKED with a reason.
     """
     from .ts_codemod import remove_field as _codemod
-    from .diff_contract import check as _diff_check
-    result = _codemod(code, variants['camel'])
-
-    # THE DIFF CONTRACT, IN THE REQUEST PATH.
-    #
-    # It was written in Stage 3 and gated in CI, and for three stages it was imported
-    # by tests/ and tools/ and by NOTHING in app/ -- built, tested, CI-gated,
-    # unreachable, which is the defect class this project keeps rediscovering. The
-    # cost was exactly one class: `known_bad_fix_003`, a half-fix that keeps a
-    # function parameter, which `tsc` ACCEPTS as VALID and which only this check
-    # rejects. Five of the six negative-corpus cases fail the compiler on their own
-    # merits; that one does not.
-    #
-    # On violation the ORIGINAL code is returned, not the partial result. A patch
-    # that changed something it should not have is worse than no patch, and returning
-    # unchanged code is already what apply_fix_template turns into a truthful "could
-    # not remove" and what the outcome derivation turns into BLOCKED. This also
-    # settles the residue carried since Stage 2: a partial removal used to return
-    # changed code and open as REVIEW carrying a compile error.
-    refusals = list(result.refusals)
-    out = result.code
-    diff_violations = []
-    if out != code:
-        verdict = _diff_check(code, out, variants['camel'])
-        if not verdict.ok:
-            diff_violations = verdict.violations
-            refusals = refusals + [
-                f"diff contract: {v}" for v in verdict.violations[:3]]
-            out = code                      # refuse the patch entirely
-
-    _LAST_TS_RESULT.clear()
-    _LAST_TS_RESULT.update(
-        refusals=refusals, notes=result.notes,
-        edits=[] if diff_violations else [e["shape"] for e in result.edits],
-        diff_violations=diff_violations)
-    return out
+    return _run_codemod(code, variants['camel'], "typescript", _codemod)
 
 
 def _remove_field_python(code: str, variants: dict[str, str]) -> str:
-    snake = variants['snake']
-    # Remove dataclass field: field_name: Type = default
-    code = re.sub(rf'^\s*{snake}\s*:.*$\n?', '', code, flags=re.MULTILINE)
-    # Remove keyword argument: field_name=value,
-    code = re.sub(rf'\b{snake}\s*=[^,)]+,?\s*', '', code)
-    # Remove from function params: field_name: Type,  or  field_name: Type = default,
-    code = re.sub(rf'\b{snake}\s*:\s*[^,=)]+(\s*=[^,)]+)?\s*,?\s*', '', code)
-    # Remove self.field_name access (entire line)
-    code = re.sub(rf'^\s*\S*self\.{snake}\b.*$\n?', '', code, flags=re.MULTILINE)
-    # Remove dict key access: ['field_name'] or ["field_name"] or .get('field_name')
-    code = re.sub(rf'^\s*.*\[\s*["\']?{snake}["\']?\s*\].*$\n?', '', code, flags=re.MULTILINE)
-    return code
+    """Delegates to app/py_codemod.py, which is syntax-aware and REFUSES shapes it
+    cannot remove safely.
+
+    WHAT THIS REPLACED, AND WHY IT WAS WORSE THAN NOTHING
+    Five context-free regexes, measured on a realistic consumer as a complete no-op
+    that reported "2 lines affected" -- every reference survived and one blank line
+    was collapsed, so `changed` was True and the pipeline believed a fix existed.
+
+    Two of the five were also actively unsafe rather than merely useless:
+
+        r'\\b{f}\\s*:\\s*[^,=)]+(\\s*=[^,)]+)?\\s*,?\\s*'   stripped a FUNCTION
+                                                          PARAMETER -- the shape
+                                                          ts_codemod explicitly
+                                                          refuses, because it breaks
+                                                          every caller
+        r'^\\s*.*\\[\\s*["\\']?{f}["\\']?\\s*\\].*$\\n?'      deleted the WHOLE LINE
+                                                          containing a subscript,
+                                                          taking the assignment and
+                                                          any call on it with it
+
+    Neither had a test that would have noticed, because the fixture library had no
+    Python cell until the validator was wired.
+    """
+    from .py_codemod import remove_field as _codemod
+    return _run_codemod(code, variants['snake'], "python", _codemod)
 
 
 def _remove_field_java(code: str, variants: dict[str, str]) -> str:
@@ -219,17 +296,32 @@ def _remove_field_rust(code: str, variants: dict[str, str]) -> str:
 
 
 def _remove_field_ruby(code: str, variants: dict[str, str]) -> str:
-    snake = variants['snake']
-    # Remove attr_accessor/attr_reader/attr_writer :field_name
-    code = re.sub(rf'^\s*attr_(accessor|reader|writer)\s+:{snake}\s*$\n?', '', code, flags=re.MULTILINE)
-    # Remove from multi-attr declarations
-    code = re.sub(rf':{snake}\s*,?\s*', '', code)
-    # Remove @field_name (entire line)
-    code = re.sub(rf'^\s*@{snake}\b.*$\n?', '', code, flags=re.MULTILINE)
-    # Remove hash key: field_name: value,
-    code = re.sub(rf'^\s*{snake}:\s*.*,?\s*$\n?', '', code, flags=re.MULTILINE)
-    # Remove from method params
-    code = re.sub(rf'\b{snake}:\s*[^,)]*,?\s*', '', code)
+    """Remove a field from Ruby source.
+
+    Ruby is the one language here whose field declarations are a comma-separated
+    list ON ONE LINE (`attr_accessor :id, :email, :phone_number`), so it is the
+    only one where the `$`-anchored whole-line patterns cannot fire first and the
+    list-element path is load-bearing. See `_drop_list_element` for why the
+    separator and the newline both matter -- the previous version produced output
+    that real ruby refused to parse.
+    """
+    snake = re.escape(variants['snake'])
+    # Sole attribute on the line: drop the whole declaration.
+    code = re.sub(rf'^{_H}*attr_(accessor|reader|writer){_H}+:{snake}\b{_H}*$\n?',
+                  '', code, flags=re.MULTILINE)
+    # One element of a multi-attribute list. `\b` so a field named `phone` does
+    # not match inside `:phone_number`.
+    code = _drop_list_element(code, rf':{snake}\b')
+    # Remove @field_name (entire line).
+    code = re.sub(rf'^{_H}*@{snake}\b.*$\n?', '', code, flags=re.MULTILINE)
+    # Remove hash key on its own line: field_name: value,
+    code = re.sub(rf'^{_H}*{snake}:{_H}*.*$\n?', '', code, flags=re.MULTILINE)
+    # Keyword argument in a signature or call: `phone_number: value`. Same list
+    # rule; `[^,)\n]*` rather than `[^,)]*` so the value cannot span lines.
+    code = _drop_list_element(code, rf'\b{snake}:{_H}*[^,)\n]*')
+    # Sole keyword argument: `def build(phone_number:)` -> `def build()`. Bounded
+    # by the parens, so this cannot reach past the argument list.
+    code = re.sub(rf'\({_H}*{snake}:{_H}*[^,)\n]*\)', '()', code)
     return code
 
 
@@ -264,7 +356,11 @@ def _remove_field_csharp(code: str, variants: dict[str, str]) -> str:
 #: contract is (code, variants) -> str, so there is no return channel for them --
 #: but losing them is worse: a PR that removes two references and silently declines
 #: a third tells the reviewer nothing about the third.
-_LAST_TS_RESULT: dict = {}
+#: Last codemod outcome, for the explanation. Was _LAST_TS_RESULT until
+#: Python got a real codemod -- a TypeScript-specific name gating a
+#: language-agnostic mechanism is how the Python refusals would have been
+#: silently dropped from the PR body.
+_LAST_CODEMOD_RESULT: dict = {}
 
 
 REMOVE_HANDLERS: dict[str, Callable[[str, dict[str, str]], str]] = {
@@ -516,7 +612,20 @@ _TYPE_REF_PATTERNS = {
         r'^\s*{name}\s+\w+\s*=\s*new\s+{name}\s*\(.*$',
     ],
     'rust': [
-        r'^\s*use\s+.*\b{name}\b.*$',
+        # `[^{}\n]*` and the anchored tail restrict this to a SOLE import:
+        # `use models::User;` matches, `use models::{User, Address};` does not.
+        #
+        # The original was r'^\s*use\s+.*\b{name}\b.*$', which deleted the whole
+        # statement when the name appeared anywhere on it -- the fifth instance of the
+        # destructive-import defect, after python, typescript, javascript and the
+        # generic fallback. Measured: `use models::{User, Address};` vanished, so
+        # `Address` was left used but unimported, and it reported "Removed references
+        # to deleted type 'User' (1 lines affected)". Rust has NO wired validator, so
+        # nothing downstream would have caught it.
+        #
+        # `use models::User as U;` also no longer matches, which is correct: the local
+        # name is `U` and dropping the import would orphan every use of it.
+        r'^\s*use\s+[^{}\n]*\b{name}\b\s*;?\s*$',
         r'^\s*let\s+\w+\s*:\s*{name}\b.*$',
         r'^\s*\w+\s*:\s*{name}\s*,?\s*$',
         r'^\s*let\s+\w+\s*=\s*{name}\s*\{{.*$',
@@ -536,6 +645,30 @@ _TYPE_REF_PATTERNS = {
         r'^\s*var\s+\w+\s*=\s*new\s+{name}\s*\(.*$',
     ],
 }
+
+#: Languages the `remove_type` dispatch actually reaches, and how.
+#:
+#: This exists because `_TYPE_REF_PATTERNS.keys()` STOPPED being the answer. Three
+#: languages now delegate to syntax-aware codemods instead of the pattern table, and
+#: one of them -- javascript -- has no pattern entry at all, so reading the table
+#: understated it: `generate_fix("javascript", "remove_type")` returned False while a
+#: real codemod was wired. The capability registry is only worth having if it tracks
+#: the dispatch, so it reads this instead.
+#:
+#: DERIVED from `_TYPE_REF_PATTERNS` rather than re-listing those languages, so there
+#: is one copy of that set. Only the codemod delegations are named here, and they are
+#: named in exactly one other place -- the `if lang in (...)` in
+#: `_remove_type_reference` -- which `test_capability_tables_match_the_dispatch`
+#: compares against.
+TYPE_REMOVAL_HANDLERS = dict(
+    {lang: "_TYPE_REF_PATTERNS" for lang in _TYPE_REF_PATTERNS},
+    **{
+        "python": "py_codemod.remove_type",
+        "typescript": "ts_codemod.remove_type",
+        "javascript": "ts_codemod.remove_type",
+    },
+)
+
 
 # References to a REMOVED ENUM VALUE: switch/case arms, match arms, and
 # qualified constant references.
@@ -593,10 +726,38 @@ def _symbol_names(variants: dict) -> set:
 
 
 def _remove_type_reference(code: str, variants: dict, lang: str) -> str:
+    if lang == "python":
+        # Python delegates to the syntax-aware codemod. The shared regex path was
+        # DESTRUCTIVE here, not merely useless: its import pattern deleted the whole
+        # `from X import A, B` statement when the removed name appeared anywhere on
+        # it, so a still-used neighbour became undefined while every reference to the
+        # removed type survived -- and it reported success. Measured, see
+        # app/py_codemod.py::remove_type.
+        from .py_codemod import remove_type as _codemod
+        return _run_codemod(code, variants['pascal'], "python", _codemod)
+    if lang in ("typescript", "javascript"):
+        # Same defect, twice more, from the shared table:
+        #
+        #   typescript  `_TYPE_REF_PATTERNS['typescript']` opens with the identical
+        #               whole-import-line deletion, so `import { User, Address }`
+        #               vanished and `Address` became undefined.
+        #   javascript  has NO entry, so it fell through to `_generic_remove`, which
+        #               deletes every line matching a CASE VARIANT of the name --
+        #               and `variants['snake'] == variants['camel'] == 'user'` for a
+        #               type named `User`. A two-function module was reduced to `}`.
+        #
+        # They share one codemod because they already share `remove_field`, and the
+        # editable shape (a binding list) is common to both. See
+        # app/ts_codemod.py::remove_type.
+        from .ts_codemod import remove_type as _codemod
+        return _run_codemod(code, variants['pascal'], lang, _codemod)
     patterns = _TYPE_REF_PATTERNS.get(lang)
     if patterns is None:
-        # Unsupported language: drop whole lines mentioning the type.
-        return _generic_remove(code, variants)
+        # No pattern table and no codemod. Use the CONSERVATIVE fallback, which
+        # abstains rather than guessing: `_generic_remove` deleted every line
+        # matching a case variant of the name, and destroyed all six of these
+        # languages on an idiomatic consumer. See _generic_symbol_remove.
+        return _generic_symbol_remove(code, variants)
     return _apply_patterns(code, patterns, _symbol_names(variants))
 
 
@@ -687,7 +848,16 @@ def _remove_enum_value(code: str, variants: dict, lang: str) -> str:
     code = _remove_inline_enum_member(code, names)
     patterns = _ENUM_VALUE_PATTERNS.get(lang)
     if patterns is None:
-        return _generic_remove(code, variants)
+        # Same conservative fallback as remove_type. An enum value is less
+        # collision-prone than a type -- there is no convention of naming a variable
+        # after the value -- but the rule is the same and one copy is better than
+        # two. The useful shapes (`- pending` in yaml, `PENDING = 3,`) still qualify
+        # as "exists only to name the symbol"; a prose line no longer does.
+        #
+        # include_upper because codegen emits enum values as `PENDING`. It stays OFF
+        # for types, where `to_upper_snake("User")` is `USER` and `$USER` is an
+        # environment variable, not a reference.
+        return _generic_symbol_remove(code, variants, include_upper=True)
     return _apply_patterns(code, patterns, names)
 
 
@@ -906,15 +1076,30 @@ def apply_fix_template(
                 f"The code is unchanged."
             )
         else:
+            # State the shapes ACTUALLY edited. The previous text was a fixed list --
+            # "Cleaned: struct/class declarations, accessor methods, function params,
+            # object literals, and direct field access patterns" -- appended to every
+            # success regardless of what happened. It was a second false claim in the
+            # same string as the first: even when the codemod worked, it named five
+            # categories it had not necessarily touched. A codemod that reports its
+            # own edits cannot drift from them.
+            shapes = _LAST_CODEMOD_RESULT.get("edits") or []
+            if shapes:
+                counted = ", ".join(
+                    f"{n}x {s}" if n > 1 else s
+                    for s, n in sorted(collections.Counter(shapes).items()))
+                detail = f"Removed: {counted}."
+            else:
+                detail = ("No shape detail available -- this language has no "
+                          "syntax-aware codemod, so the edit set is not itemised.")
             explanation = (
-                f"Removed references to field '{field_name}' ({lines_removed} lines affected). "
-                f"Cleaned: struct/class declarations, accessor methods, function params, object literals, "
-                f"and direct field access patterns for {lang}."
+                f"Removed references to field '{field_name}' "
+                f"({lines_removed} lines affected). {detail}"
             )
-        if lang == "typescript" and _LAST_TS_RESULT:
-            for note in _LAST_TS_RESULT.get("notes", []):
+        if _LAST_CODEMOD_RESULT.get("language") == lang:
+            for note in _LAST_CODEMOD_RESULT.get("notes", []):
                 explanation += f"\nNOTE: {note}"
-            for refusal in _LAST_TS_RESULT.get("refusals", []):
+            for refusal in _LAST_CODEMOD_RESULT.get("refusals", []):
                 explanation += f"\nNEEDS A HUMAN: {refusal}"
         return result, explanation
 
@@ -998,24 +1183,69 @@ def apply_fix_template(
         result = _remove_type_reference(code, variants, lang)
         result = _postprocess(result)
         lines_removed = len(code.split('\n')) - len(result.split('\n'))
-        explanation = (
-            f"Removed references to deleted type '{field_name}' "
-            f"({lines_removed} lines affected): imports, declarations, type "
-            f"annotations and constructions for {lang}. Any remaining usage is "
-            f"flagged for review -- a deleted type cannot always be resolved "
-            f"mechanically."
-        )
+        # The old text asserted "Removed references to deleted type 'X' (N lines
+        # affected): imports, declarations, type annotations and constructions" on
+        # EVERY outcome -- including N=0, where nothing was removed at all, and
+        # including the destructive case where an import line had been deleted out
+        # from under a still-used neighbour. Same fabricated-list defect the
+        # remove_field explanation had. Say what happened.
+        if result == code:
+            explanation = (
+                f"Could NOT remove references to deleted type '{field_name}' in "
+                f"{lang}: a deleted type has no substitute value, so nothing here "
+                f"matched a shape this transformation can remove safely. The code is "
+                f"unchanged."
+            )
+        else:
+            shapes = _LAST_CODEMOD_RESULT.get("edits") or []
+            if shapes:
+                counted = ", ".join(
+                    f"{n}x {s}" if n > 1 else s
+                    for s, n in sorted(collections.Counter(shapes).items()))
+                detail = f"Removed: {counted}."
+            else:
+                detail = (f"No shape detail available -- {lang} has no syntax-aware "
+                          f"type-removal codemod, so the edit set is not itemised.")
+            explanation = (
+                f"Removed references to deleted type '{field_name}' "
+                f"({lines_removed} lines affected). {detail}"
+            )
+        if _LAST_CODEMOD_RESULT.get("language") == lang:
+            for note in _LAST_CODEMOD_RESULT.get("notes", []):
+                explanation += f"\nNOTE: {note}"
+            for refusal in _LAST_CODEMOD_RESULT.get("refusals", []):
+                explanation += f"\nNEEDS A HUMAN: {refusal}"
         return result, explanation
 
     elif op == 'remove_enum_value':
         result = _remove_enum_value(code, variants, lang)
         result = _postprocess(result)
         lines_removed = len(code.split('\n')) - len(result.split('\n'))
-        explanation = (
-            f"Removed references to deleted enum value '{field_name}' "
-            f"({lines_removed} lines affected): switch/case arms, match arms "
-            f"and constant declarations for {lang}."
-        )
+        # The old text asserted "Removed references to deleted enum value 'X'
+        # (N lines affected): switch/case arms, match arms and constant declarations
+        # for {lang}" on EVERY outcome -- including N=0 with the file untouched, where
+        # it named three shapes it had not cleaned. Measured:
+        #
+        #   apply_fix_template("const x = 1;\n", "typescript",
+        #                      "removed_enum_value", "NOPE")
+        #   -> unchanged, and "Removed references to deleted enum value 'NOPE'
+        #      (0 lines affected): switch/case arms, match arms and constant
+        #      declarations for typescript."
+        #
+        # Third occurrence of the fabricated-shape-list defect, after remove_field
+        # and remove_type. Say what happened instead.
+        if result == code:
+            explanation = (
+                f"Could NOT remove references to deleted enum value '{field_name}' "
+                f"in {lang}: nothing here matched a shape this transformation can "
+                f"remove safely. The code is unchanged."
+            )
+        else:
+            explanation = (
+                f"Removed references to deleted enum value '{field_name}' "
+                f"({lines_removed} lines affected): switch/case arms, match arms "
+                f"and constant declarations for {lang}."
+            )
         return result, explanation
 
     elif op == 'rename_type':
@@ -1197,3 +1427,148 @@ def _generic_remove(code: str, variants: dict[str, str]) -> str:
         pattern = re.compile(rf'^\s*.*\b{re.escape(name)}\b.*$\n?', re.MULTILINE)
         code = _remove_lines_matching(code, pattern)
     return code
+
+
+#: Keywords that begin an import-like statement in the languages that reach the
+#: generic fallback (dart, php, scala, shell, swift, yaml) plus the ones that do not.
+_IMPORT_KW = r'(?:#include|import|from|use|using|require|include|open|package)'
+
+#: What may remain on a line after the symbol is removed for the line to count as
+#: "existing only to name that symbol". Punctuation, quotes and digits only -- any
+#: surviving LETTER means the line carries other meaning and must not be deleted.
+#: Digits are allowed so an ordinal-assigned enum member (`PENDING = 3,`) qualifies.
+_STRUCTURAL_ONLY = re.compile(r'^[\s\-,:;()\[\]{}|=<>+*&.\'"`$0-9]*$')
+
+
+def _declared_symbol_names(variants: dict, include_upper: bool = False) -> list:
+    """The forms a TYPE or ENUM VALUE is actually WRITTEN in.
+
+    Deliberately excludes the snake and camel variants that `_symbol_names` includes,
+    because for a symbol those are not the symbol -- they are the conventional name
+    of a VARIABLE holding one, or of a property. `name_variants("User")` yields snake
+    `user` and camel `user`, and matching those is precisely what destroyed the six
+    fallthrough languages:
+
+        shell   echo "looking up user $user_id"     deleted -- prose, not a type
+        yaml    user:                               deleted -- a property KEY, and
+                                                    it left the $ref orphaned
+
+    `literal` is included because it is the only form guaranteed to appear: an
+    OpenAPI enum value declared `pending` is written `pending`, and pascal/upper-snake
+    would both miss it.
+
+    UPPER-SNAKE IS OPT-IN, and only for enum values, where codegen conventionally
+    emits `PENDING`. It is NOT used for types, because `to_upper_snake("User")` is
+    `USER` and that collides with a bare upper-case list entry. Measured -- removing
+    a TYPE called `User` from
+
+        required:
+          - USER
+          - HOME
+
+    deletes `- USER` when upper-snake is enabled, because after the symbol is removed
+    the line is structural-only. A list of required environment variables has nothing
+    to do with a type, and nothing else in the file references it, so the removal
+    would look COMPLETE and ship.
+
+    (An earlier version of this comment claimed `echo "$USER"` was the hazard. It is
+    not: the word `echo` survives, so the structural-only rule already refuses that
+    line. The claim was wrong and mutation-testing caught it -- flipping upper-snake
+    on for types left the test green until the assertion was rewritten around the
+    case that actually manifests.)
+    """
+    keys = ['literal', 'pascal'] + (['upper_snake'] if include_upper else [])
+    out = []
+    for key in keys:
+        value = variants.get(key)
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _generic_symbol_remove(code: str, variants: dict,
+                           include_upper: bool = False) -> str:
+    """Conservative fallback for a removed TYPE or ENUM VALUE in a language with no
+    syntax-aware codemod and no pattern table.
+
+    WHY THIS REPLACES _generic_remove FOR SYMBOLS
+    `_generic_remove` deletes every line matching any CASE VARIANT of the name, and
+    for a symbol that is catastrophic rather than merely broad. Measured through
+    apply_fix_template, every one of the six fallthrough languages was destroyed by a
+    single removed type:
+
+        dart    import 'models.dart';  String label(User u){return u.email;}
+                ->  import 'models.dart';  }        the stale import SURVIVED and
+                                                    the live function was deleted
+        scala   3 lines  ->  one blank line         entire file gone
+        shell   echo "looking up user $user_id"  DELETED -- shell has no types at all
+        yaml    the $ref AND its parent key gone, leaving `properties:` childless
+
+    Note the inversion in dart/php/swift: the one line that IS stale -- the import --
+    is the one that survived. It deleted the code and kept the reference.
+
+    THE RULE, IN TWO PARTS
+    1. Delete a line only when it exists SOLELY to name this symbol:
+
+           import-like statement whose last identifier is the symbol
+               import models.User        use App\\Models\\User;
+
+           a bare member or list item
+               - PENDING                 PENDING = 3,               PENDING,
+
+    2. THEN require the removal to be COMPLETE. If any reference survives, put the
+       original code back and refuse the whole thing.
+
+    Part 2 is the part that is easy to miss and was measured as a real regression in
+    the first draft of this function: php and scala correctly dropped the stale
+    `use`/`import` line but left `User` in a live signature, so the output had the
+    type both undefined AND unimported -- strictly worse than not touching the file.
+    That is the same reason `CodemodResult.complete` requires "no refusals" rather
+    than "some edits": a partial removal is not a smaller success, it is a different
+    failure.
+
+    So this completes exactly one real case -- a stale import of a type that is never
+    used -- and refuses everything else. The caller sees `result == code` and reports
+    "Could NOT remove ... The code is unchanged.", which is honest and, for languages
+    with NO wired validator to catch a bad fix, the only safe answer.
+    """
+    names = _declared_symbol_names(variants, include_upper)
+    if not names:
+        return code
+    # Longest first so `UserProfile` is considered before `User`.
+    names.sort(key=len, reverse=True)
+    alternation = "|".join(re.escape(n) for n in names)
+    occurrence = re.compile(rf'\b(?:{alternation})\b')
+
+    kept = []
+    for line in code.split('\n'):
+        if occurrence.search(line) and _line_exists_only_to_name(line, occurrence):
+            continue
+        kept.append(line)
+    out = '\n'.join(kept)
+
+    # Part 2: all or nothing. A surviving reference means the edit was partial.
+    if occurrence.search(out):
+        return code
+    return out
+
+
+def _line_exists_only_to_name(line: str, occurrence: re.Pattern) -> bool:
+    """Is this line's entire purpose to name the symbol?"""
+    # Shape 1: an import-like statement whose LAST identifier is the symbol, and
+    # which does not import a comma-separated list. `import a.{Address, User}` is
+    # refused in both directions: a comma before the symbol means a neighbour would
+    # be lost, and text after it means the symbol was not the thing imported.
+    if re.match(rf'^[ \t]*{_IMPORT_KW}\b', line, re.IGNORECASE):
+        last = None
+        for m in occurrence.finditer(line):
+            last = m
+        if last is not None:
+            before, after = line[:last.start()], line[last.end():]
+            if ',' not in before and re.fullmatch(r"[ \t]*[;'\")\}\]]*[ \t]*", after):
+                return True
+        return False
+
+    # Shape 2: a bare member or list item -- removing the symbol leaves nothing but
+    # structure. Any surviving letter means the line carries other meaning.
+    return bool(_STRUCTURAL_ONLY.fullmatch(occurrence.sub('', line)))

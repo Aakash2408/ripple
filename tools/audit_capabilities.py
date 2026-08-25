@@ -37,6 +37,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
+from app.ast_compat import str_literal
+
 from app import capabilities as cap                      # noqa: E402
 from app import capability_claims as cc                   # noqa: E402
 
@@ -51,7 +53,18 @@ E2E_EVIDENCE = os.path.join(ROOT, "tests", ".e2e_evidence.json")
 
 
 def _e2e_proof() -> tuple:
-    """(proven_cells, error). Missing proof is a FAILURE, never a pass."""
+    """(proven_cells, error). Missing proof is a FAILURE, never a pass.
+
+    The file holds one entry PER CELL, keyed "language/contract/op". It was a
+    single flat object while only one cell was proven; the second cell's test
+    would then have overwritten the first's record, and the audit would have
+    reported one cell proven no matter how many had actually compiled --
+    silently dropping evidence rather than failing. Each e2e test now merges its
+    own key, so N passing tests yield N records.
+
+    A cell only counts with validated=True AND typecheck_exit==0 in ITS OWN
+    entry, so one cell's success cannot vouch for another's.
+    """
     if not os.path.exists(E2E_EVIDENCE):
         return set(), ("no e2e proof at tests/.e2e_evidence.json -- the e2e test "
                        "writes it only after a real compile, so either it has not "
@@ -61,10 +74,36 @@ def _e2e_proof() -> tuple:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
         return set(), f"e2e proof unreadable: {type(exc).__name__}: {exc}"
-    if not data.get("validated") or data.get("typecheck_exit") != 0:
-        return set(), (f"e2e proof exists but does not show a successful compile: "
-                       f"{json.dumps(data)[:160]}")
-    return {tuple(data["cell"])}, ""
+
+    cells = data.get("cells")
+    if not isinstance(cells, dict):
+        # Pre-multi-cell record. Do not silently accept it: its single "cell" key
+        # cannot express what the second fixture proves, and treating it as
+        # authoritative would understate or overstate coverage depending on which
+        # test wrote last.
+        return set(), ("e2e proof is in the retired single-cell format -- re-run "
+                       "the regression suite so every e2e test writes its own "
+                       "entry under \"cells\"")
+
+    proven, bad = set(), []
+    for key, rec in sorted(cells.items()):
+        if not isinstance(rec, dict):
+            bad.append(f"{key}: entry is not an object")
+            continue
+        if not rec.get("validated") or rec.get("typecheck_exit") != 0:
+            bad.append(f"{key}: {json.dumps(rec)[:100]}")
+            continue
+        parts = tuple(key.split("/"))
+        if len(parts) != 3:
+            bad.append(f"{key}: key is not language/contract/op")
+            continue
+        proven.add(parts)
+    if bad:
+        return proven, ("e2e proof present but not a successful compile for: "
+                        + "; ".join(bad))
+    if not proven:
+        return set(), "e2e proof contains no proven cells"
+    return proven, ""
 
 
 # How stale the run record may be. Generous, because CI runs the suite seconds
@@ -304,8 +343,7 @@ def _language_lists_declared_in(path: str, src: str) -> list:
             value = value.args[0] if value.args else None
         if not isinstance(value, (ast.Set, ast.List, ast.Tuple)):
             continue
-        names = {e.value for e in value.elts
-                 if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+        names = {v for v in (str_literal(e) for e in value.elts) if v is not None}
         hits = names & known
         if len(hits) >= 3:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]

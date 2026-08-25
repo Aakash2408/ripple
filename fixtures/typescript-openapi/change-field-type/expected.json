@@ -1,0 +1,99 @@
+{
+  "id": "typescript-openapi-change-field-type",
+  "cell": {
+    "language": "typescript",
+    "contract": "openapi",
+    "operation": "change_field_type"
+  },
+  "change": {
+    "spec_before": "spec/user.before.yaml",
+    "spec_after": "spec/user.after.yaml",
+    "field": "phoneNumber",
+    "old_type": "integer",
+    "new_type": "string",
+    "native_old": "number",
+    "native_new": "string",
+    "category": "mechanical"
+  },
+  "consumer": {
+    "root": "consumer",
+    "install": [
+      "npm",
+      "install",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund"
+    ],
+    "typecheck": [
+      "./node_modules/.bin/tsc",
+      "--noEmit"
+    ],
+    "node": ">=14.17"
+  },
+  "expect": {
+    "fix_target": "src/types.ts",
+    "fix_target_note": "The DECLARATION is stale, not the usages -- inverted from the remove-field fixture, where the declaration was correct and the usages were stale. The file that ERRORS (src/contact.ts) must be repaired without being edited.",
+    "consumers_found": [
+      "src/types.ts"
+    ],
+    "untouched": [
+      "src/contact.ts",
+      "src/orders.ts",
+      "tsconfig.json",
+      "package.json"
+    ],
+    "transformation": [
+      {
+        "site": "User.phoneNumber",
+        "shape": "interface property type annotation",
+        "action": "rewrite `phoneNumber: number` to `phoneNumber: string`",
+        "mechanical": true,
+        "why": "the contract now says string; the annotation is simply wrong and there is exactly one correct value for it"
+      }
+    ],
+    "typecheck_before_fix": "FAIL",
+    "typecheck_before_fix_errors": 2,
+    "typecheck_before_fix_error_sites": [
+      "src/contact.ts normalisePhone -- .trim() on a number",
+      "src/contact.ts isInternational -- .startsWith() on a number"
+    ],
+    "typecheck_after_fix": "PASS",
+    "terminal_state": "RESOLVED",
+    "pr_files": [
+      "src/types.ts"
+    ]
+  },
+  "hazards": [
+    {
+      "hazard": "change_field_type ANNOTATES instead of editing when the contract type has no native mapping",
+      "where": "app/fix_templates.py, the `native_old and native_new` guard",
+      "why_this_fixture_avoids_it": "integer->string is mapped for TypeScript (number->string), verified via native_type() before the fixture was written. An unmapped pair would leave a comment, the file would still not compile, and the cell would correctly fail to become production-ready."
+    },
+    {
+      "hazard": "_change_type_typescript rewrites EVERY `: number` in the file and ignores field_name",
+      "where": "app/fix_templates.py::_change_type_typescript",
+      "why_this_fixture_avoids_it": "src/types.ts declares exactly one number-typed field. A second would be silently retyped and the minimal-diff assertion would fail. This is a latent limitation of the codemod, not of the fixture -- a real consumer with two number fields in one file would get an over-broad edit."
+    }
+  ],
+  "measured": {
+    "as_of": "2026-08-23",
+    "measured_by": "test_e2e_typescript_openapi_change_field_type, run against the real toolchain",
+    "fixture_fails_without_a_fix": true,
+    "fixture_is_satisfiable": true,
+    "ripple_changed_the_file": true,
+    "ripple_output_parses": true,
+    "ripple_typecheck_after": "VALID",
+    "ripple_explanation": "Changed type 'number' -> 'string' in typescript code (contract: integer -> string). 1 type annotation(s) updated.",
+    "ripple_edits": [
+      "interface property annotation: phoneNumber: number -> phoneNumber: string"
+    ],
+    "ripple_diff_minimal": true,
+    "sibling_string_fields_preserved": true,
+    "untouched_verified_by": "byte comparison of src/contact.ts, src/orders.ts, tsconfig.json, package.json",
+    "validation_backend": "docker",
+    "typecheck_exit": 0,
+    "evidence_test": "test_e2e_typescript_openapi_change_field_type",
+    "production_ready": true,
+    "cost_note": "This cell required NO new validator, NO new codemod and NO new detection -- only the fixture and its test. TypeScript's validator was already wired and change_field_type already had a handler."
+  }
+}

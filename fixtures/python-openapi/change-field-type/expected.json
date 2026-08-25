@@ -1,0 +1,119 @@
+{
+  "id": "python-openapi-change-field-type",
+  "cell": {
+    "language": "python",
+    "contract": "openapi",
+    "operation": "change_field_type"
+  },
+  "why_this_cell": "The THIRD production-ready cell and the first outside TypeScript. Its purpose is to prove the newly wired Python validator, so the operation is held constant with the TypeScript cell -- a failure here is then attributable to validation rather than to an unexercised codemod.",
+  "change": {
+    "spec_before": "spec/user.before.yaml",
+    "spec_after": "spec/user.after.yaml",
+    "field": "phone_number",
+    "old_type": "integer",
+    "new_type": "string",
+    "native_old": "int",
+    "native_new": "str",
+    "category": "mechanical"
+  },
+  "consumer": {
+    "root": "consumer",
+    "install": [
+      "python",
+      "-m",
+      "venv",
+      ".ripple-venv"
+    ],
+    "install_note": "The venv MUST live inside the mounted volume. pip installs into the container's own site-packages by default, which the read-only check container does not have -- the first draft did that and mypy was simply not found in phase two. The venv is the Python equivalent of node_modules.",
+    "typecheck": [
+      ".ripple-venv/bin/mypy",
+      "--disallow-untyped-defs",
+      "--no-error-summary",
+      "--exclude",
+      "(^|/)\\.ripple-venv/",
+      "."
+    ],
+    "toolchain_pinned_by": "requirements-dev.txt (mypy==1.8.0)",
+    "config": "mypy.ini"
+  },
+  "expect": {
+    "fix_target": "src/models.py",
+    "fix_target_note": "The DECLARATION is stale, not the usages -- same inversion as the TypeScript change-field-type cell. The file that ERRORS (src/contact.py) must be repaired without being edited.",
+    "consumers_found": [
+      "src/models.py"
+    ],
+    "untouched": [
+      "src/contact.py",
+      "src/orders.py",
+      "src/__init__.py",
+      "mypy.ini",
+      "requirements-dev.txt"
+    ],
+    "transformation": [
+      {
+        "site": "User.phone_number",
+        "shape": "dataclass field type annotation",
+        "action": "rewrite the phone_number annotation from int to str",
+        "mechanical": true,
+        "why": "the contract now says string; the annotation is simply wrong and there is exactly one correct value for it"
+      }
+    ],
+    "typecheck_before_fix": "INVALID",
+    "typecheck_before_fix_errors": 2,
+    "typecheck_before_fix_error_sites": [
+      "src/contact.py normalise_phone -- \"int\" has no attribute \"strip\" [attr-defined]",
+      "src/contact.py is_international -- \"int\" has no attribute \"startswith\" [attr-defined]"
+    ],
+    "typecheck_after_fix": "VALID",
+    "terminal_state": "RESOLVED",
+    "pr_files": [
+      "src/models.py"
+    ]
+  },
+  "hazards": [
+    {
+      "hazard": "mypy's reach depends on the CONSUMER's annotations, unlike tsc which reads the project config",
+      "measured": "The same broken file passes mypy at exit 0 once the parameter annotation is removed. compileall -- the toolchain the registry originally DECLARED for python -- passes the broken consumer at exit 0 too, which is why it was replaced rather than wired.",
+      "mitigation": "The runner passes --disallow-untyped-defs and splits the result three ways by error code: any non-no-untyped-def error is INVALID, only-no-untyped-def is UNABLE_TO_VALIDATE, no errors is VALID. A partially annotated consumer therefore cannot reach AUTO. Guarded by test_python_validator_refuses_to_pass_an_unannotated_consumer.",
+      "fixture_requirement": "Every def in this fixture is annotated. That is load-bearing, not stylistic."
+    },
+    {
+      "hazard": "_change_type_python is field-blind -- it rewrites every occurrence of the old annotation and never reads field_name",
+      "where": "app/fix_templates.py::_change_type_python",
+      "fixture_requirement": "src/models.py declares exactly one int-annotated field. A second would be silently retyped and the minimal-diff assertion would fail. This is a real codemod limitation, not a fixture one."
+    },
+    {
+      "hazard": "The codemod does not respect comments or docstrings",
+      "measured": "The first draft of this fixture wrote the annotation pattern out literally in its module docstring and the codemod reported \"3 type annotation(s) updated\" for a one-field change -- two of them inside the comment. The TypeScript sibling fixture had the identical flaw and was corrected at the same time; there the rewritten comment became self-contradictory, claiming exactly one string-annotated property when there were then four.",
+      "mitigation": "Both fixtures' prose now describes the annotation instead of quoting it. The test asserts exactly ONE line differs, so a comment rewrite fails the cell rather than inflating it."
+    }
+  ],
+  "not_this_cell": {
+    "cell": "python/openapi/remove_field",
+    "why_not": "The Python remove_field codemod DOES NOT WORK. Measured before this fixture was written: given a consumer reading user.phone_number in an f-string and a dict literal, apply_fix_template returns the file with EVERY reference still present, while reporting \"Removed references to field 'phone_number' (2 lines affected)\" -- a false claim in a user-facing string. It also collapses blank lines, so it produces a spurious diff while achieving nothing. Same defect shape as the Stage 4 TypeScript baseline that forced app/ts_codemod.py to be written. python/openapi/remove_field is therefore NOT production-ready and a fixture for it would correctly fail at the typecheck step.",
+    "also_broken": "python type_removed leaves the type name in place while claiming removal. python field_renamed and field_type_changed both genuinely transform."
+  },
+  "measured": {
+    "as_of": "2026-08-23",
+    "measured_by": "test_e2e_python_openapi_change_field_type, run against the real toolchain",
+    "fixture_fails_without_a_fix": true,
+    "fixture_is_satisfiable": true,
+    "ripple_changed_the_file": true,
+    "ripple_output_parses": true,
+    "ripple_typecheck_after": "VALID",
+    "ripple_explanation": "Changed type 'int' -> 'str' in python code (contract: integer -> string). 1 type annotation(s) updated.",
+    "ripple_edits": [
+      "dataclass field annotation: phone_number int -> str"
+    ],
+    "ripple_diff_minimal": true,
+    "lines_changed": 1,
+    "sibling_str_fields_preserved": true,
+    "annotation_gaps_in_fixture": 0,
+    "untouched_verified_by": "byte comparison of src/contact.py, src/orders.py, src/__init__.py, mypy.ini, requirements-dev.txt",
+    "validation_backend": "docker, python:3.11-alpine, --network none and read-only source for the typecheck",
+    "typecheck_exit": 0,
+    "evidence_test": "test_e2e_python_openapi_change_field_type",
+    "production_ready": true,
+    "cost_note": "This cell needed a VALIDATOR, unlike the second cell which needed only a fixture. Wiring python took validate_ok from 63 cells to 126 and left 33 python mechanical cells blocked on nothing but a fixture -- though for remove_field and type_removed the codemod is the real blocker, and a fixture would expose that rather than close it."
+  }
+}

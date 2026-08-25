@@ -1,0 +1,114 @@
+{
+  "id": "python-openapi-remove-field",
+  "cell": {
+    "language": "python",
+    "contract": "openapi",
+    "operation": "remove_field"
+  },
+  "why_this_cell": "The FOURTH production-ready cell, and the one that was impossible until app/py_codemod.py existed. The registry listed it as blocked on nothing but a fixture; a fixture written against the old handler would have failed at the typecheck step, because the handler was a no-op that reported success. That is the registry working as intended -- 'blocked on a fixture' names the next thing to try, not a guarantee it passes.",
+  "change": {
+    "spec_before": "spec/user.before.yaml",
+    "spec_after": "spec/user.after.yaml",
+    "field": "phone_number",
+    "category": "mechanical"
+  },
+  "consumer": {
+    "root": "consumer",
+    "install": ["python", "-m", "venv", ".ripple-venv"],
+    "typecheck": [
+      ".ripple-venv/bin/mypy",
+      "--disallow-untyped-defs",
+      "--no-error-summary",
+      "--exclude",
+      "(^|/)\\.ripple-venv/",
+      "."
+    ],
+    "toolchain_pinned_by": "requirements-dev.txt (mypy==1.8.0)",
+    "config": "mypy.ini"
+  },
+  "expect": {
+    "fix_target": "src/checkout.py",
+    "fix_target_note": "The USAGES are stale, not the declaration -- the opposite of both change-field-type cells. src/models.py is regenerated from the new spec and is already correct, so touching it would mean the codemod went after the declaration instead of the usages. Same relationship as the TypeScript remove-field cell.",
+    "consumers_found": ["src/checkout.py"],
+    "untouched": [
+      "src/models.py",
+      "src/orders.py",
+      "src/__init__.py",
+      "mypy.ini",
+      "requirements-dev.txt"
+    ],
+    "transformation": [
+      {
+        "site": "format_contact",
+        "shape": "f-string interpolation",
+        "action": "delete the whole `{user.phone_number}` replacement field",
+        "mechanical": true,
+        "why": "a display string; the value no longer exists upstream so printing it cannot be correct"
+      },
+      {
+        "site": "to_crm_payload",
+        "shape": "dict-literal entry",
+        "action": "delete the `\"phone\": user.phone_number,` entry",
+        "mechanical": true,
+        "why": "an outbound payload; sending a field the contract deleted is meaningless"
+      }
+    ],
+    "typecheck_before_fix": "INVALID",
+    "typecheck_before_fix_errors": 2,
+    "typecheck_before_fix_error_sites": [
+      "src/checkout.py(19): attr-defined \"User\" has no attribute \"phone_number\"",
+      "src/checkout.py(26): attr-defined \"User\" has no attribute \"phone_number\""
+    ],
+    "typecheck_after_fix": "VALID",
+    "terminal_state": "RESOLVED",
+    "pr_files": ["src/checkout.py"]
+  },
+  "hazards": [
+    {
+      "hazard": "mypy's reach depends on the CONSUMER's annotations",
+      "fixture_requirement": "Every def in this fixture is annotated. An unannotated def would make the verdict UNABLE_TO_VALIDATE rather than VALID -- mypy could not see the type of `user`, so both attribute errors would be invisible and a later pass would prove nothing. The test asserts mypy_annotation_gaps == 0 before the fix for exactly this reason."
+    },
+    {
+      "hazard": "Only some shapes are removable; the rest must abstain",
+      "fixture_requirement": "Both references here are shapes py_codemod EDITS. A function parameter, an aliased local, a tuple unpacking, a keyword argument or a subscript would be REFUSED -- correctly -- and this cell would not qualify. That is the intended behaviour, not a fixture limitation."
+    },
+    {
+      "hazard": "The blank-line normaliser used to reformat every gap in the file",
+      "measured": "_clean_blank_lines claimed to collapse 3+ blank lines to 2 but its regex collapsed them to ONE. PEP 8 requires two between top-level definitions, so every Python fix arrived as a diff touching every function boundary. Fixed to match the docstring; the test asserts blank-line runs are unchanged."
+    }
+  ],
+  "codemod_history": {
+    "what_the_old_handler_did": "Five context-free regexes. Measured on this fixture's own consumer: every reference survived, one blank-line run was collapsed, and it reported \"Removed references to field 'phone_number' (2 lines affected). Cleaned: struct/class declarations, accessor methods, function params, object literals, and direct field access patterns for python.\" Two false claims in one string -- nothing was removed, and the five named categories were a fixed list appended to every success regardless of what happened.",
+    "why_that_was_worse_than_a_no_op": "`changed` was True because whitespace differed, so the pipeline believed a fix existed and only the validator stood between that and a PR.",
+    "two_regexes_were_destructive_not_useless": [
+      "r'\\b{f}\\s*:\\s*[^,=)]+(\\s*=[^,)]+)?\\s*,?\\s*' stripped a FUNCTION PARAMETER -- the shape ts_codemod explicitly refuses, because it breaks every caller",
+      "r'^\\s*.*\\[\\s*[\"\\']?{f}[\"\\']?\\s*\\].*$\\n?' deleted the WHOLE LINE containing a subscript, taking the assignment and any call on it"
+    ],
+    "same_shape_as": "The Stage 4 TypeScript baseline that forced app/ts_codemod.py to be written. Recorded in fixtures/typescript-openapi/remove-field/expected.json under stage_4_baseline."
+  },
+  "measured": {
+    "as_of": "2026-08-23",
+    "measured_by": "test_e2e_python_openapi_remove_field, run against the real toolchain",
+    "fixture_fails_without_a_fix": true,
+    "fixture_is_satisfiable": true,
+    "ripple_changed_the_file": true,
+    "ripple_output_parses": true,
+    "ripple_typecheck_after": "VALID",
+    "ripple_explanation": "Removed references to field 'phone_number' (1 lines affected). Removed: dict-literal entry, f-string interpolation.",
+    "ripple_edits": [
+      "f-string interpolation: {user.phone_number}",
+      "dict-literal entry: \"phone\": user.phone_number,"
+    ],
+    "ripple_refusals": [],
+    "ripple_notes": [],
+    "ripple_diff_minimal": true,
+    "blank_line_runs_preserved": true,
+    "annotation_gaps_in_fixture": 0,
+    "untouched_verified_by": "byte comparison of src/models.py, src/orders.py, src/__init__.py, mypy.ini, requirements-dev.txt",
+    "validation_backend": "docker, python:3.11-alpine, --network none and read-only source for the typecheck",
+    "typecheck_exit": 0,
+    "evidence_test": "test_e2e_python_openapi_remove_field",
+    "production_ready": true,
+    "cost_note": "Cell 2 needed only a fixture. Cell 3 needed a validator. Cell 4 needed a CODEMOD -- app/py_codemod.py, plus the extraction of CodemodResult so `complete` keeps one definition, plus the blank-line normaliser fix. The fixture itself was the cheapest part."
+  }
+}
