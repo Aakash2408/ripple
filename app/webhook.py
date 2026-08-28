@@ -70,6 +70,10 @@ from .github_app_auth import (
 )
 from .consumer_finder import ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
+from . import follow_on as _follow_on
+from . import impact as _impact
+from . import review_comments as _review_comments
+from . import repo_index as _repo_index
 from .pr_engine import CreatedPR
 from .history_learner import HistoryLearner
 from .consumer_graph import ConsumerGraph
@@ -332,33 +336,74 @@ async def recent_logs():
 
 @app.get("/test-llm")
 async def test_llm():
-    """Quick test that the Anthropic API key works. Calls Claude with a minimal prompt."""
-    import os
-    
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return {"status": "error", "message": "ANTHROPIC_API_KEY not set"}
-    
+    """Does the CONFIGURED backend answer? Minimal prompt, honest labelling.
+
+    FOUR BUGS, all in the one endpoint whose entire job is to report whether the LLM
+    configuration works. Found by generalising the credential-scan gate from the
+    literal `ANTHROPIC_API_KEY` to every provider credential in the registry -- the
+    old scan matched `environ.get("ANTHROPIC_API_KEY")` exactly and the two-argument
+    form here slipped past it:
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")   1. wrong variable
+        client  = anthropic.Anthropic()                     2. ignores BASE_URL
+        model   = "claude-sonnet-4-20250514"                3. ignores MODEL
+        return {"model": "claude-sonnet-4-20250514", ...}   4. MISREPORTS the backend
+
+    Consequence, on exactly the setup this work is heading for: point Ripple at
+    OpenRouter (ANTHROPIC_AUTH_TOKEN set, ANTHROPIC_API_KEY unset, BASE_URL and MODEL
+    both set) and this reports "ANTHROPIC_API_KEY not set" while the real fix path
+    works fine. Or, if an Anthropic key happens to also be present, it silently tests
+    api.anthropic.com and reports success for a backend production is not using.
+
+    Bug 4 is the same defect llm_config's own docstring records -- a fix labelled
+    "LLM-generated (semantic)" while the code named claude-sonnet-4 -- reappearing in
+    the diagnostic. A /test-llm that can pass while production is misconfigured is
+    worse than not having one.
+    """
+    from .llm_config import (backend_label, base_url, client_api_key, describe,
+                             is_configured, model)
+
+    if not is_configured():
+        return {"status": "error",
+                "message": "no LLM backend configured -- set ANTHROPIC_AUTH_TOKEN "
+                           "(or ANTHROPIC_API_KEY), or point ANTHROPIC_BASE_URL at a "
+                           "self-hosted endpoint",
+                "config": describe()}
+
     try:
         import anthropic
-        client = anthropic.Anthropic()
+        # base_url and key passed EXPLICITLY. Letting the SDK read the environment is
+        # what allowed this endpoint to test a different backend from the fix path.
+        kwargs = {"base_url": base_url()}
+        key = client_api_key()
+        if key:
+            kwargs["api_key"] = key
+        client = anthropic.Anthropic(**kwargs)
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=model(),
             max_tokens=20,
             messages=[{"role": "user", "content": "Reply with exactly: LLM_OK"}],
         )
         reply = response.content[0].text.strip()
+        usage = getattr(response, "usage", None)
         return {
             "status": "ok",
-            "model": "claude-sonnet-4-20250514",
+            # backend_label() names what ACTUALLY answered, rather than a literal.
+            "backend": backend_label(),
+            "model": model(),
+            "base_url": base_url(),
             "response": reply,
-            "key_prefix": api_key[:12] + "...",
-            "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
+            "tokens_used": ((usage.input_tokens + usage.output_tokens)
+                            if usage else None),
         }
     except ImportError:
         return {"status": "error", "message": "anthropic package not installed"}
     except Exception as e:
-        return {"status": "error", "message": str(e)[:200]}
+        # Report WHICH backend failed. "Could not resolve authentication method"
+        # against api.anthropic.com and against a local Ollama are different
+        # problems with the same message.
+        return {"status": "error", "message": str(e)[:200],
+                "backend": backend_label(), "base_url": base_url()}
 
 
 # === GitHub App Installation Event ===
@@ -424,16 +469,24 @@ async def github_install_webhook(request: FastAPIRequest):
             results.append({"source": "propbench", "status": "error", "reason": str(e)[:200]})
         
         # For each repo: scan merged PRs via GitHub API + index into RAG
-        for repo in repos:
+        indexed_repos_count = 0
+        for repo in repos[:_repo_index.MAX_REPOS]:
             repo_name = repo.get("full_name", "")
             try:
                 # Scan merged PRs for fix patterns
                 pr_patterns = _index_merged_prs(repo_name, token, store)
+                # And build the DETERMINISTIC symbol index -- what this repo defines
+                # and references. This is what lets a PR in one repo be checked
+                # against every other, and it is a parse rather than a model call so
+                # the answer is exact. See app/repo_index.py.
+                sym = _build_symbol_index(repo_name, token)
+                indexed_repos_count += 1
                 results.append({
                     "repo": repo_name,
                     "status": "indexed",
                     "merged_prs_scanned": pr_patterns.get("prs_scanned", 0),
                     "patterns_extracted": pr_patterns.get("patterns_stored", 0),
+                    "symbol_index": sym,
                 })
             except Exception as e:
                 results.append({
@@ -441,11 +494,31 @@ async def github_install_webhook(request: FastAPIRequest):
                     "status": "error",
                     "reason": str(e)[:100],
                 })
-        
+
+        # The cap is DECLARED. An org with more repos than this gets told which ones
+        # were not indexed, because Stage 4 reporting "no consumers" for a repo it
+        # never read is the silent-partial-result failure this whole layer avoids.
+        over_cap = repos[_repo_index.MAX_REPOS:]
+        if over_cap:
+            skipped = [r.get("full_name", "") for r in over_cap]
+            _log_activity("repo_index_cap_reached", {
+                "cap": _repo_index.MAX_REPOS,
+                "indexed": indexed_repos_count,
+                "not_indexed": skipped[:10],
+                "note": "these repos have NO symbol index, so cross-repo analysis "
+                        "cannot see them -- they are unknown, not clean",
+            })
+            results.append({
+                "status": "repos_over_cap",
+                "cap": _repo_index.MAX_REPOS,
+                "not_indexed": skipped,
+            })
+
         return {
             "status": "installation_received",
             "org": org,
             "repos_to_learn": len(repos),
+            "repos_indexed": indexed_repos_count,
             "rag_store_size": store.count(),
             "results": results,
         }
@@ -535,6 +608,20 @@ async def github_webhook(request: FastAPIRequest):
             return _handle_pr_merged(payload, pr)
         else:
             return _handle_pr_rejected(payload, pr)
+
+    # Handle a PR being OPENED or UPDATED -> resolve which symbols it changed.
+    #
+    # Until this branch existed, Ripple was entirely push-triggered: it reacted to a
+    # contract file landing on the default branch. A pull request under review -- the
+    # moment when telling someone "this breaks three other repos" is actually useful --
+    # fell through to {"status": "ignored"} below.
+    #
+    # `synchronize` is included because a PR is a moving target: the author pushes
+    # again and the previous analysis is stale. `reopened` because a closed-then-
+    # reopened PR has had no analysis since it was closed.
+    if event_type == "pull_request" and payload.get("action") in (
+            "opened", "synchronize", "reopened"):
+        return await _handle_pr_opened(payload, payload.get("pull_request", {}))
     
     # Only handle push events for detection pipeline
     _log_activity("webhook_received", {"event": event_type, "repo": payload.get("repository", {}).get("full_name", "?")})
@@ -843,6 +930,46 @@ async def bitbucket_webhook(request: FastAPIRequest):
 
 # === GitLab Webhook ===
 
+async def _handle_gitlab_merge_request(payload: dict) -> dict:
+    """A GitLab merge request was opened. Same analysis, different envelope.
+
+    Deliberately thin: it normalises GitLab's `object_attributes` into the shape the
+    platform-neutral core already takes, and refuses rather than guessing when the
+    payload does not carry both revisions. `oldrev`/`base_sha` absent means there is
+    nothing to subtract, and inventing a base would make every symbol in the merge
+    request look either removed or untouched depending on which way it guessed.
+    """
+    attrs = payload.get("object_attributes") or {}
+    action = attrs.get("action", "")
+    if action not in ("open", "reopen", "update"):
+        return {"status": "ignored", "reason": f"mr action={action}"}
+
+    project = (payload.get("project") or {}).get("path_with_namespace", "")
+    iid = attrs.get("iid")
+    diff_refs = attrs.get("diff_refs") or {}
+    base_sha = diff_refs.get("base_sha") or attrs.get("oldrev") or ""
+    head_sha = diff_refs.get("head_sha") or attrs.get("last_commit", {}).get("id", "")
+
+    if not project or not iid:
+        return {"status": "refused",
+                "why": "the merge request payload carried no project or iid, so there "
+                       "is nothing to analyse and nothing to comment on"}
+    if not base_sha or not head_sha:
+        return {"status": "refused",
+                "why": "the merge request payload carried no base/head pair, so which "
+                       "symbols were removed is UNKNOWN rather than none"}
+
+    _log_activity("gitlab_mr_analysis_started", {
+        "project": project, "mr": iid, "action": action})
+
+    return {"status": "accepted", "platform": "gitlab",
+            "project": project, "mr": iid,
+            "base_sha": base_sha, "head_sha": head_sha,
+            "note": "symbol resolution and cross-repo impact are platform-neutral; "
+                    "the GitLab file-fetch adapter is the remaining piece and is "
+                    "NOT wired, so no comment is posted yet"}
+
+
 @app.post("/webhook/gitlab")
 async def gitlab_webhook(request: FastAPIRequest):
     """
@@ -864,8 +991,17 @@ async def gitlab_webhook(request: FastAPIRequest):
     if not verify_gitlab_signature(body, secret, token_header):
         raise HTTPException(status_code=401, detail="Invalid GitLab token")
     
-    # Only handle push events
     event_type = request.headers.get("X-Gitlab-Event", "")
+
+    # A merge request being opened is the GitLab equivalent of pull_request/opened,
+    # and it routes into the SAME analysis rather than a parallel implementation.
+    # Only the event shape differs; the symbol delta and the cross-repo search are
+    # platform-neutral by construction -- repo_index and impact never import a
+    # GitHub client. A second analysis path would be a second place to get the
+    # base/head the wrong way round.
+    if event_type == "Merge Request Hook":
+        return await _handle_gitlab_merge_request(payload)
+
     if event_type != "Push Hook":
         return {"status": "ignored", "reason": f"event_type={event_type}"}
     
@@ -1531,6 +1667,15 @@ async def _process_spec_change_inner(repo, spec_path, before_sha, after_sha, ins
     
     wire_only_changes = []
     _drop_consumer_trees()
+    # Fresh per-provider LLM budget for this push. Placed at the SAME convergence
+    # point as the consumer-tree eviction rather than at each call site: a budget is
+    # scoped to a push, _generate_with_llm runs once per consumer file, and a reset
+    # every caller had to remember is the shape that let the line-based fallback
+    # bypass the diff contract. Without it a provider closed by one push stays closed
+    # for the life of the process and every later push reports it rate-limited.
+    from .fix_generator import reset_llm_budget as _reset_llm_budget
+    _reset_llm_budget()
+    reset_prose_budget()
     for change in breaking_changes:
         # Determine contract type from spec file
         # ONE terminal state per breaking change, emitted on every exit path --
@@ -2317,6 +2462,474 @@ def _admit_consumers(candidates, fetch, *, field_name: str, language_of,
     return _mmr_rerank(scored, max_consumers)
 
 
+def _render_pr_narrative(change, consumer_file: str, residual_refs):
+    """Model-authored narrative for one PR, from the codemod's STRUCTURED facts.
+
+    The facts come from fix_templates._LAST_CODEMOD_RESULT -- the same edits/refusals/
+    notes the truthful explanation is built from -- rather than from prose the model
+    could be asked to expand on. That is the point: the model renders known facts and
+    is given nothing else, so it has nothing to embroider.
+
+    Uses prose_chain(), which is wider than fix_chain() and may include the local 3B
+    model. Justified by measurement rather than convenience: that model produced
+    compiling-but-wrong CODE on two of three codemod-refused shapes and no gate could
+    see it, whereas bad PROSE is read by a human and cannot break a build.
+    """
+    from . import llm_chain, pr_prose
+    from .fix_templates import _LAST_CODEMOD_RESULT
+
+    facts = {
+        # Read DIRECTLY, not via getattr with a default. Both fields are declared on
+        # BreakingChange, and the existing gate forbidding phantom getattr caught this
+        # here: a default silently absorbs a rename, so the narrative would render an
+        # empty field name and nothing would fail.
+        "change_type": change.change_type,
+        "field_name": change.field_name,
+        "language": _LAST_CODEMOD_RESULT.get("language", ""),
+        "consumer_file": consumer_file,
+        "edits": _LAST_CODEMOD_RESULT.get("edits") or [],
+        "refusals": _LAST_CODEMOD_RESULT.get("refusals") or [],
+        "notes": _LAST_CODEMOD_RESULT.get("notes") or [],
+        "residual_refs": residual_refs or [],
+    }
+
+    chain = llm_chain.prose_chain()
+    if not chain:
+        # No backend. The deterministic narrative is the answer, and pr_prose says so
+        # rather than producing a body that silently looks the same either way.
+        return pr_prose.render(facts)
+
+    def _call(prompt: str):
+        return llm_chain.run(lambda provider: _ask_provider(provider, prompt),
+                             chain=chain, budget=_prose_budget())
+
+    return pr_prose.render(facts, call_chain=_call)
+
+
+def _ask_provider(provider, prompt: str, max_tokens: int = 700) -> str:
+    """One request to one provider. The ONLY place a prose-grade call is made.
+
+    Shared by narrative rendering and impact ranking on purpose: a second client
+    would be a second place to read a credential or ignore `base_url`, which is the
+    defect the credential-scan gate exists to prevent and which /test-llm shipped
+    with for months.
+
+    max_tokens defaults to 700 because 400 truncated a three-sentence narrative
+    mid-word and looked like bad writing rather than a cut-off.
+    """
+    import anthropic
+
+    from .llm_config import credential_for, model as _m
+    client = anthropic.Anthropic(
+        api_key=credential_for(provider.key_env) or "not-needed",
+        base_url=provider.base_url)
+    resp = client.messages.create(
+        model=_m(), max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}])
+    return resp.content[0].text
+
+
+#: Prose has its own budget, separate from the fix budget.
+#:
+#: Sharing one would let narrative generation consume the ceiling that fix generation
+#: needs, and a push produces one narrative per PR -- so the cheaper, less important
+#: call would starve the expensive, load-bearing one.
+_PROSE_BUDGET = None
+
+
+def _prose_budget():
+    global _PROSE_BUDGET
+    if _PROSE_BUDGET is None:
+        from .llm_chain import Budget
+        _PROSE_BUDGET = Budget()
+    return _PROSE_BUDGET
+
+
+def reset_prose_budget() -> None:
+    """Fresh prose budget for a push. Called beside the fix budget reset."""
+    global _PROSE_BUDGET
+    _PROSE_BUDGET = None
+
+
+async def _handle_pr_opened(payload: dict, pr: dict) -> dict:
+    """A pull request was opened or updated. Resolve which symbols it changes.
+
+    THE WORK IS A PARSE, NOT A PROMPT
+    For every changed file this fetches the content at the BASE and at the HEAD, runs
+    the same extractor the install-time index uses, and diffs the exported symbol sets.
+    The result is exact for Python and pattern-matched elsewhere, and every delta says
+    which it was. No model is consulted here at all.
+
+    That is deliberate. Measured 2026-08-26, three local models were asked to repair a
+    field removal whose reference was a function parameter: the 3B and the 16B both
+    deleted the parameter and broke every caller, byte-identically. A model that gets
+    that wrong will just as confidently name a symbol the diff never touched. So the
+    question "what changed" is answered by reading the code, and the model's job starts
+    later, at ranking and explaining.
+
+    EVERY DELTA GETS A ChangeRun
+    Including the ones that lead nowhere. A PR whose changes turn out to be additive
+    must still emit a terminal state saying so, because "no breaking symbols" and "the
+    analysis never ran" are indistinguishable from the outside otherwise -- the same
+    reason the push path gives every breaking change a run.
+    """
+    repo = payload.get("repository", {}).get("full_name", "")
+    number = pr.get("number")
+    installation_id = payload.get("installation", {}).get("id")
+    base_sha = (pr.get("base") or {}).get("sha", "")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+    action = payload.get("action", "")
+
+    _log_activity("pr_analysis_started", {
+        "repo": repo, "pr": number, "action": action,
+        "base": base_sha[:8], "head": head_sha[:8],
+    })
+
+    if not (repo and number and base_sha and head_sha):
+        # Refused, not ignored. A malformed payload is a fact worth recording, and
+        # "ignored" would make it look like a PR we chose not to analyse.
+        _log_activity("pr_analysis_refused", {
+            "repo": repo, "pr": number,
+            "reason": "payload lacks repo, number, base sha or head sha",
+        })
+        return {"status": "refused", "reason": "incomplete pull_request payload",
+                "repo": repo, "pr": number}
+
+    token = _get_token(installation_id)
+    if not token:
+        _log_activity("pr_analysis_refused", {
+            "repo": repo, "pr": number,
+            "reason": "no installation token, so neither revision can be fetched",
+        })
+        return {"status": "refused", "reason": "no installation token",
+                "repo": repo, "pr": number}
+
+    files = _github_api("GET", f"/repos/{repo}/pulls/{number}/files?per_page=100",
+                        token)
+    if isinstance(files, dict) and "error" in files:
+        _log_activity("pr_analysis_refused", {
+            "repo": repo, "pr": number,
+            "reason": f"could not list changed files: {str(files)[:120]}"})
+        return {"status": "refused", "reason": "could not list changed files",
+                "repo": repo, "pr": number}
+
+    deltas, skipped, unreliable = [], [], []
+    for entry in (files or [])[:_PR_FILE_CAP]:
+        path = entry.get("filename", "")
+        status = entry.get("status", "")
+        if not _is_code_file(path):
+            skipped.append({"path": path, "why": "not a scannable source file"})
+            continue
+        if status == "added":
+            # Nothing existed at the base, so nothing can have been removed. Recorded
+            # rather than dropped, so the counts in the response add up.
+            skipped.append({"path": path, "why": "added file, no base revision"})
+            continue
+
+        base_src = None if status == "added" else _fetch_file_at_sha(
+            repo, path, base_sha, token)
+        head_src = "" if status == "removed" else _fetch_file_at_sha(
+            repo, path, head_sha, token)
+
+        if base_src is None:
+            # Cannot know what the file used to define, so cannot know what it lost.
+            # UNKNOWN, not clean -- see _fetch_file_at_sha on why "" was ambiguous.
+            unreliable.append({"path": path,
+                               "why": "base revision could not be fetched, so the "
+                                      "symbols it defined are unknown"})
+            continue
+        if head_src is None:
+            unreliable.append({"path": path,
+                               "why": "head revision could not be fetched; treating "
+                                      "it as empty would report every symbol as "
+                                      "removed"})
+            continue
+
+        if status == "removed":
+            # The whole file went, so every symbol it defined is gone. Reliable as
+            # long as the base parsed, which delta() checks.
+            base_facts = _repo_index.extract(path, base_src)
+            d = _repo_index.delta(
+                base_facts, _repo_index.FileFacts(
+                    path=path, language=base_facts.language,
+                    method=base_facts.method))
+        else:
+            d = _repo_index.delta(_repo_index.extract(path, base_src),
+                                  _repo_index.extract(path, head_src))
+
+        if not d.reliable:
+            unreliable.append({"path": d.path, "why": d.reason})
+            continue
+        if d.removed:
+            deltas.append(d)
+
+    # Every removed symbol gets its own run, exactly as the push path does per
+    # breaking change.
+    runs = []
+    for d in deltas:
+        for symbol in d.removed:
+            with ChangeRun(change_type="removed_symbol", spec=d.path,
+                           repo=repo) as run:
+                impact = _analyse_pr_impact(repo, symbol, d, token,
+                                            installation_id)
+                for hit in impact.get("affected", []):
+                    run.consumer_found(f"{hit['repo']}:{hit['path']}")
+                for why in impact.get("refusals", []):
+                    run.refused(symbol, why)
+                if not impact.get("affected") and not impact.get("refusals"):
+                    run.requires_no_change()
+                runs.append({"symbol": symbol, "path": d.path,
+                             "method": d.method,
+                             # The BASE line the symbol occupied, which is the only
+                             # line a comment about a removal can anchor to. 0 means
+                             # no anchor was established -- never a guessed line.
+                             "line": d.removed_at.get(symbol, 0),
+                             **impact})
+
+    # A PR with nothing removed still terminates explicitly. Silence here would be
+    # indistinguishable from the analysis having crashed.
+    if not deltas:
+        with ChangeRun(change_type="removed_symbol",
+                       spec=f"pull/{number}", repo=repo) as run:
+            if unreliable:
+                for u in unreliable:
+                    run.refused(u["path"], u["why"])
+            else:
+                run.requires_no_change()
+
+    review = _post_review_comments(repo, number, head_sha, runs, token)
+    follow_ons = _plan_follow_on_prs(repo, number, runs)
+
+    result = {
+        "status": "analysed",
+        "repo": repo, "pr": number, "action": action,
+        "files_considered": len(files or []),
+        "symbols_removed": sum(len(d.removed) for d in deltas),
+        "runs": runs,
+        "skipped": skipped[:10],
+        "unreliable": unreliable[:10],
+        "review": review,
+        "follow_ons": follow_ons,
+    }
+    _log_activity("pr_analysis_finished", {
+        k: v for k, v in result.items() if k != "runs"})
+    return result
+
+
+def _post_review_comments(repo, number, head_sha, runs, token) -> dict:
+    """Comment on the pull request, once per removed symbol.
+
+    Separate from the analysis so the analysis is still recorded when commenting
+    fails -- a token without `pull_requests: write` must not discard a completed
+    cross-repo search. The returned dict states which happened.
+    """
+    if not runs:
+        return {"status": "nothing_to_say",
+                "why": "no removed symbol produced an impact result"}
+
+    review_plan = _review_comments.plan(runs)
+    if not review_plan.all_comments:
+        return {"status": "nothing_to_say", "why": review_plan.summary(),
+                "skipped": review_plan.skipped}
+
+    _log_activity("pr_review_planned", {
+        "repo": repo, "pr": number, "plan": review_plan.summary()})
+
+    try:
+        posted = _review_comments.post(repo, number, head_sha, review_plan, token,
+                                       api=_github_api)
+    except Exception as exc:
+        # The analysis is already complete and recorded by this point. Losing it
+        # because a comment could not be posted would throw away the expensive,
+        # correct part of the work for the cheap, cosmetic part -- and the reason is
+        # RETURNED rather than swallowed, so a permissions problem is visible.
+        return {"status": "post_failed", "error": f"{type(exc).__name__}: {exc}",
+                "plan": review_plan.summary()}
+
+    posted["plan"] = review_plan.summary()
+    if review_plan.truncated_at:
+        posted["truncated_at"] = review_plan.truncated_at
+    if review_plan.skipped:
+        posted["skipped"] = review_plan.skipped
+    _log_activity("pr_review_posted", {k: v for k, v in posted.items()
+                                       if k != "plan"})
+    return posted
+
+
+def _plan_follow_on_prs(repo, number, runs) -> dict:
+    """What would be opened in the implicated repositories, and what would not.
+
+    PLANNED, not opened. Opening a change in a repository the author does not own is
+    the largest side effect in this system, and the plan is returned so the decision
+    to execute it is separate from the decision to compute it. `follow_on` states the
+    two rules that gate it: an approximate match is never edited, and an incomplete
+    search still raises what it found while saying the set may be short.
+    """
+    proposals, mentioned, capped = [], [], 0
+    for run in runs:
+        if "affected" not in run:
+            continue
+        fp = _follow_on.plan_follow_ons(run.get("symbol", ""), repo, number, run)
+        proposals.extend({"repo": f.repo, "symbol": f.symbol, "branch": f.branch,
+                          "title": f.title,
+                          "files": [x["path"] for x in f.files],
+                          "exact_only": f.exact_only}
+                         for f in fp.proposals)
+        mentioned.extend(fp.mentioned_only)
+        capped = capped or fp.truncated_at
+
+    out = {"proposals": proposals, "mentioned_only": mentioned}
+    if capped:
+        out["truncated_at"] = capped
+    _log_activity("follow_on_planned", {
+        "repo": repo, "pr": number,
+        "proposals": len(proposals), "mentioned_only": len(mentioned)})
+    return out
+
+
+#: Changed files considered per PR. A 400-file refactor is not what this is for, and
+#: reading every revision of it would cost two API calls per file.
+_PR_FILE_CAP = 60
+
+
+def _granted_repos(installation_id) -> list:
+    """Repos this installation was granted, or [] if that cannot be established.
+
+    Used to tell "indexed and clean" apart from "never indexed". Returning [] on
+    failure understates `unsearchable` rather than inventing repo names, and the
+    caller states that the grant list was unavailable.
+    """
+    if not installation_id or not is_app_configured():
+        return []
+    try:
+        return [r for r in (list_installation_repositories(installation_id) or []) if r]
+    except AppAuthError:
+        # A token problem is not evidence about repositories. Callers get [] and a
+        # stated reason; they must not read it as "only the indexed repos exist".
+        return []
+
+
+def _analyse_pr_impact(repo: str, symbol: str, d, token: str,
+                       installation_id=None) -> dict:
+    """Which other repos does this removed symbol affect?
+
+    The INDEX answers this, not the model. `impact.find` searches every stored repo
+    index deterministically; `impact.rank` then asks the local model only to order
+    the hits and annotate them, and discards any path the index never produced. That
+    ordering is the whole reason a demo of this can be trusted: every file named is
+    backed by a parse or a pattern match in a file that actually exists.
+
+    An empty `affected` is only returned when the search was complete. Otherwise the
+    refusals say what was not searched, because "nothing is affected" and "I did not
+    look" must never render identically.
+    """
+    indexes = _repo_index.indexed_repos()
+    granted = _granted_repos(installation_id)
+
+    result = _impact.analyse(symbol, repo, d.path, indexes=indexes,
+                             known_repos=granted,
+                             call_chain=_impact_ranker())
+    out = result.to_dict()
+
+    if not indexes:
+        out["refusals"].append(
+            f"no repo index exists, so which repos use {symbol!r} is UNKNOWN rather "
+            f"than none -- Ripple indexes repos when it is installed")
+    if not granted:
+        out["refusals"].append(
+            "the granted-repository list was unavailable, so repos that were never "
+            "indexed cannot be named here")
+    return out
+
+
+def _impact_ranker():
+    """A `call_chain(prompt) -> ChainResult` for ranking, or None to skip ranking.
+
+    Prose-grade, not fix-grade: this call writes an ordering and a clause, and a
+    weak answer here is visible in the PR rather than compiled into a build. See
+    llm_chain.prose_chain for that asymmetry.
+    """
+    from . import llm_chain
+
+    chain = llm_chain.prose_chain()
+    if not chain:
+        return None
+
+    def _call(prompt: str):
+        return llm_chain.run(lambda provider: _ask_provider(provider, prompt),
+                             chain=chain, budget=_prose_budget())
+
+    return _call
+
+
+def _build_symbol_index(repo: str, token: str) -> dict:
+    """Build and persist the deterministic symbol index for one repo.
+
+    Reuses `repo_workspace.fetch_tree` -- the same extraction the validator already
+    uses, with the same archive containment and size caps -- rather than adding a
+    second way to read a repository. A second fetcher would be a second place to get
+    the containment wrong.
+
+    Returns the index STATS, which go into the install response so the caller can see
+    what was actually read: file count, symbol count, per-extractor split, and anything
+    skipped. A caller who cannot see `truncated` cannot tell "this repo has no
+    consumers" from "I stopped reading it".
+    """
+    import shutil as _shutil
+
+    from .repo_workspace import RepoTooLarge, WorkspaceError, fetch_tree
+
+    try:
+        tree, cleanup_root = fetch_tree(repo, "HEAD", token)
+    except RepoTooLarge as exc:
+        return {"status": "skipped", "reason": f"repo too large: {exc}"}
+    except WorkspaceError as exc:
+        return {"status": "error", "reason": f"could not fetch tree: {exc}"}
+
+    # WALK `tree`, NOT `cleanup_root`.
+    #
+    # fetch_tree returns two paths on purpose: `tree` is the repository's own root and
+    # `cleanup_root` is the temp parent, because GitHub wraps an archive in a
+    # {owner}-{repo}-{sha}/ directory. Walking the parent made EVERY indexed path
+    # carry that wrapper -- `tree/owner-repo-abc123/src/pay.py` instead of
+    # `src/pay.py`. Nothing local catches it: the index is self-consistent, the
+    # cross-repo search still matches symbols, and the comment renders. It only breaks
+    # where it is most visible -- the comment names a file that does not exist in the
+    # repository, and a follow-on pull request tries to edit that nonexistent path.
+    #
+    # This is the install path, so the bug could not appear until a real repository
+    # was granted; the Stage 2 self-test passed entries in directly and never used it.
+    try:
+        def _entries():
+            for dirpath, dirs, files in os.walk(tree):
+                dirs[:] = [d for d in dirs
+                           if d not in (".git", "node_modules", "__pycache__",
+                                        "build")]
+                for name in files:
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, tree)
+                    try:
+                        with open(full, encoding="utf-8", errors="ignore") as fh:
+                            yield rel, fh.read()
+                    except OSError:
+                        # None means UNREADABLE, which repo_index counts separately
+                        # from "not scannable" -- a file it could not open is
+                        # unknown, not clean.
+                        yield rel, None
+
+        idx = _repo_index.build(repo, _entries())
+        _repo_index.save(idx)
+        stats = idx.stats()
+    finally:
+        # fetch_tree's contract: the CALLER removes cleanup_root. Without this every
+        # installation leaked one temp tree per repository, up to MAX_REPOS of them,
+        # and an install is the one moment this runs 25 times in a row.
+        _shutil.rmtree(cleanup_root, ignore_errors=True)
+
+    _log_activity("symbol_index_built", stats)
+    return {"status": "indexed", **stats}
+
+
 def _record_pr_provenance(pr_url: str, *, platform: str, repo: str, change,
                           consumer_file: str, language: str, explanation: str,
                           validated, level: str) -> None:
@@ -2541,12 +3154,30 @@ def _validate_fix_against_tree(tree: str, consumer_file: str,
     return None, detail            # UNABLE_TO_VALIDATE is not a pass
 
 
-def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str) -> str:
-    """Fetch file content at a specific commit SHA."""
+def _fetch_file_at_sha(repo: str, path: str, sha: str, token: str):
+    """File content at a commit, "" for a genuinely empty file, None if it could not
+    be fetched.
+
+    WHY None AND NOT ""
+    It returned "" for both cases, and that conflation is invisible until something
+    reasons about the DIFFERENCE between two revisions. The PR analyser does exactly
+    that: it extracts the exported symbols at the base and at the head and subtracts.
+    With "" standing in for a failure:
+
+        head fetch fails   -> head parses as an empty file -> EVERY symbol the base
+                              defined looks removed -> a false breaking change on
+                              every file in the PR
+        base fetch fails   -> base looks empty -> nothing looks removed -> a real
+                              breaking change reported as clean
+
+    Both are confident and wrong in opposite directions. The three older callers test
+    truthiness (`if content:` / `if not old or not new`), so None behaves identically
+    for them, and the analyser can now tell "unreadable" from "empty".
+    """
     data = _github_api("GET", f"/repos/{repo}/contents/{path}?ref={sha}", token)
-    if "content" in data:
+    if isinstance(data, dict) and "content" in data:
         return base64.b64decode(data["content"]).decode()
-    return ""
+    return None
 
 
 def _outcome_is_contaminated(pr: dict, row) -> tuple:
@@ -3624,6 +4255,14 @@ def _create_fix_pr(
     
     # Generate PR body with confidence scoring
     change_description = f"`{change.change_type}` on field `{change.field_name}` in `{change.path or 'spec'}`"
+
+    # The NARRATIVE is model-authored; the LEDGER below it is not. See app/pr_prose.py
+    # for why that boundary matters -- a model writing the ledger would reintroduce the
+    # fabricated-shape-list defect in a form no regex could pin. Prose overclaiming is
+    # rejected outright rather than sanitised, and the provenance line names the author
+    # on BOTH paths so unlabelled prose never reads as human-written.
+    prose = _render_pr_narrative(change, file_path, residual_refs)
+
     pr_body = format_pr_body(
         change_description=change_description,
         source_repo=source_repo,
@@ -3634,7 +4273,13 @@ def _create_fix_pr(
         residual_refs=residual_refs,
         consumer_file=file_path,
         decision=decision,
+        fix_summary=f"{prose.text}\n\n{prose.provenance_line()}",
     )
+    _log_activity("pr_narrative", {
+        "source": prose.source,
+        "reason": prose.reason[:160],
+        "violations": [p for p, _ in prose.violations],
+    })
     
     # Create PR
     pr_data = _github_api("POST", f"/repos/{repo}/pulls", token, {

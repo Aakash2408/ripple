@@ -1712,6 +1712,2178 @@ def _main() -> int:
     return 1 if failed else 0
 
 
+def test_every_llm_client_is_wrapped_by_the_diff_contract():
+    """No LLM generator may be reachable except through generate_fix().
+
+    WHY AN AST CHECK AND NOT A MONKEYPATCH
+    Two existing gates verify the LLM path is contract-checked by monkeypatching
+    `fix_generator._generate_with_llm` and asserting the result is rejected. Both are
+    keyed on that one NAME. Measured consequence of adding a second client: a
+    `_generate_with_openai` would be unpatched by either test, so the diff contract
+    could fail to wrap it and both gates would stay green -- a gate passing while
+    asserting nothing about the thing that was added. That is the defect shape this
+    repo has now found roughly forty times, and here it would arrive four at once.
+
+    So this asserts the STRUCTURE instead: every function named in
+    llm_providers.FORMAT_CLIENTS must exist, and must be called from inside
+    `generate_fix`, which is where diff_contract.check() lives. A generator called
+    from anywhere else bypasses verification no matter what a monkeypatch proves.
+    """
+    import ast
+
+    from app.llm_providers import FORMAT_CLIENTS
+
+    assert FORMAT_CLIENTS, (
+        "no wire format claims a client, so this check would pass over an empty set")
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    for fmt, (module, func) in sorted(FORMAT_CLIENTS.items()):
+        path = os.path.join(root, "app", f"{module}.py")
+        assert os.path.exists(path), (
+            f"wire format {fmt!r} names app/{module}.py, which does not exist")
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        defined = {n.name for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        assert func in defined, (
+            f"wire format {fmt!r} claims client {module}.{func}, which is not "
+            f"defined. Declaring a format without writing its client makes "
+            f"llm_providers.usable_today() report a provider as reachable when "
+            f"nothing can speak to it.")
+
+        # The generator must be called from within generate_fix, because the diff
+        # contract lives there. Anything else reaches the model unverified.
+        wrapper = next((n for n in ast.walk(tree)
+                        if isinstance(n, ast.FunctionDef)
+                        and n.name == "generate_fix"), None)
+        assert wrapper is not None, (
+            f"app/{module}.py defines no generate_fix, so there is nowhere for the "
+            f"diff contract to sit")
+        called = {n.func.id for n in ast.walk(wrapper)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert func in called, (
+            f"{module}.{func} is NOT called from generate_fix. The diff contract "
+            f"that verifies an LLM patch lives in generate_fix; a generator invoked "
+            f"anywhere else returns unverified model output straight to the caller.")
+
+        # And generate_fix must actually consult the contract, or wrapping is empty.
+        wrapper_src = ast.dump(wrapper)
+        assert "diff_contract" in wrapper_src or "_diff_check" in wrapper_src, (
+            f"generate_fix does not reference the diff contract, so wrapping "
+            f"{func} in it verifies nothing")
+
+
+def _with_provider_credentials():
+    """Give every registry provider a credential, and restore the environment after.
+
+    The chains are CREDENTIAL-FILTERED -- a provider with no key is excluded, because
+    including it makes the chain three names over one endpoint (measured: a local
+    Ollama reply was reported as `answered by openrouter`). That is correct behaviour
+    and it makes chain composition depend on ambient environment, so a test that reads
+    the environment asserts whatever the developer's shell happens to hold. Both of
+    the tests below failed on a bare environment for exactly that reason.
+    """
+    import contextlib
+    import os as _os
+
+    from app.llm_providers import PROVIDERS
+
+    @contextlib.contextmanager
+    def _ctx():
+        names = {p.key_env for p in PROVIDERS.values() if p.key_env}
+        saved = {n: _os.environ.get(n) for n in names}
+        try:
+            for n in names:
+                _os.environ[n] = "test-credential"
+            yield
+        finally:
+            for n, v in saved.items():
+                if v is None:
+                    _os.environ.pop(n, None)
+                else:
+                    _os.environ[n] = v
+    return _ctx()
+
+
+def test_model_prose_that_overclaims_is_rejected_not_sanitised():
+    """A model asked not to overclaim will sometimes overclaim anyway.
+
+    The prompt says "do not claim anything was verified". That is a REQUEST.
+    FORBIDDEN_CLAIMS is the enforcement, and rejection rather than sanitisation is
+    deliberate: stripping the offending phrase leaves prose built around a claim it no
+    longer makes, and hides that the model overclaimed at all. An invisible failure is
+    the shape of every defect in this codebase's history.
+    """
+    from app import pr_prose
+
+    facts = {"change_type": "removed_field", "field_name": "phone_number",
+             "language": "typescript", "consumer_file": "src/contact.ts",
+             "edits": [{"shape": "object-literal property"}],
+             "refusals": ["line 9: function parameter -- breaks every caller"]}
+
+    class _R:
+        def __init__(self, text):
+            self.text, self.ok, self.attempts = text, True, ()
+            self.answered_by = "test-model"
+
+        def stated_outcome(self):
+            return "answered by test-model"
+
+    # Each forbidden phrase must actually cause a rejection.
+    assert pr_prose.FORBIDDEN_CLAIMS, "no claims are forbidden -- vacuous"
+    for phrase in sorted(pr_prose.FORBIDDEN_CLAIMS):
+        res = pr_prose.render(
+            facts, call_chain=lambda p, _t=phrase: _R(
+                f"This change matters. I {_t} the result before opening this."))
+        assert res.source == "template", (
+            f"prose containing {phrase!r} was accepted as model-authored")
+        assert phrase in res.reason, (
+            f"the rejection does not name the offending claim: {res.reason}")
+        assert phrase not in res.text.lower(), (
+            f"the rejected claim survived into the body: {res.text}")
+
+    # Clean prose IS used, or the check is just a way of never using the model.
+    clean = ("The upstream contract dropped this field, so the call here now sends "
+             "something the API will ignore. Start at the changed lines, then decide "
+             "what to do about the parameter that was left alone.")
+    ok = pr_prose.render(facts, call_chain=lambda p: _R(clean))
+    assert ok.source == "model", (ok.source, ok.reason)
+    assert ok.text == clean
+    assert not ok.violations
+
+    # And the checker is usable on its own, in both directions.
+    assert pr_prose.check(clean) == []
+    assert pr_prose.check("I verified every reference") != []
+
+
+def test_the_narrative_never_writes_the_ledger():
+    """The model gets the FACTS and is asked for prose. It must not supply counts.
+
+    Two guarantees, and the second is the load-bearing one:
+
+    1. The prompt contains the structured facts, so the model has something true to
+       render and no reason to invent.
+    2. When the model is not used, the body still carries a narrative -- the
+       deterministic one -- so the PR's shape does not depend on whether a backend
+       happened to be reachable. A body that silently loses a section when the LLM is
+       down is how "the model was rate limited" becomes invisible.
+    """
+    from app import pr_prose
+
+    facts = {"change_type": "removed_field", "field_name": "phone_number",
+             "language": "python", "consumer_file": "src/checkout.py",
+             "edits": [{"shape": "dict-literal entry"}],
+             "refusals": ["line 4: function parameter"],
+             "notes": ["line 12: mentioned in a comment"]}
+
+    seen = {}
+
+    class _R:
+        text, ok, attempts, answered_by = "Fine prose about the change.", True, (), "m"
+
+        def stated_outcome(self):
+            return "answered by m"
+
+    def _capture(prompt):
+        seen["prompt"] = prompt
+        return _R()
+
+    pr_prose.render(facts, call_chain=_capture)
+    prompt = seen["prompt"]
+    for token in ("removed_field", "phone_number", "dict-literal entry",
+                  "function parameter"):
+        assert token in prompt, f"the model was not told {token!r}, so it cannot render it"
+    assert "Do not add to them" in prompt, "the prompt does not forbid invention"
+
+    # No model at all: still a narrative, and it says it is not model-written.
+    none = pr_prose.render(facts)
+    assert none.text.strip(), "no narrative at all when no model is configured"
+    assert none.source == "template"
+    assert "phone_number" in none.text
+    # A refusal exists, so the deterministic narrative must not read as complete.
+    assert "decision" in none.text.lower(), none.text
+
+
+def test_narrative_provenance_is_stated_on_both_paths():
+    """Unlabelled prose must never be able to read as human-written.
+
+    If only model-written narrative carried a label, a reader would learn that
+    unlabelled prose is human -- and every deterministic narrative would then be
+    silently miscredited. So both paths state their author.
+
+    This is also the one place the user-facing goal and the codebase's honesty rule
+    meet: the prose is allowed to read like a person wrote it, and is required to say
+    that a machine did.
+    """
+    from app import pr_prose
+
+    class _R:
+        text, ok, attempts, answered_by = "Readable prose.", True, (), "openrouter"
+
+        def stated_outcome(self):
+            return "answered by openrouter"
+
+    model = pr_prose.render({"field_name": "x"}, call_chain=lambda p: _R())
+    template = pr_prose.render({"field_name": "x"})
+
+    for res in (model, template):
+        line = res.provenance_line()
+        assert line.strip(), f"{res.source} path states no provenance"
+        assert "_" in line, "provenance is not rendered as markdown emphasis"
+
+    assert "written by" in model.provenance_line().lower()
+    assert "openrouter" in model.provenance_line()
+    assert "not model-written" in template.provenance_line()
+    assert model.provenance_line() != template.provenance_line()
+
+
+def test_the_pr_narrative_is_reachable_from_the_webhook():
+    """A narrative renderer nobody calls is the built-but-unreachable shape again.
+
+    The learning loop's author-fetch was written, tested and unreachable for weeks.
+    This asserts the wiring rather than trusting it: the renderer must be called, its
+    output must reach format_pr_body, and its budget must be reset per push.
+    """
+    import inspect
+    import ast
+
+
+    from app import webhook as W
+
+    assert hasattr(W, "_render_pr_narrative"), "no narrative renderer exists"
+    assert hasattr(W, "reset_prose_budget"), "prose has no per-push budget reset"
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tree = ast.parse(open(os.path.join(root, "app", "webhook.py"),
+                          encoding="utf-8").read())
+
+    calls = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (getattr(node.func, "id", "")
+                    or getattr(node.func, "attr", ""))
+            if name in ("_render_pr_narrative", "reset_prose_budget",
+                        "format_pr_body"):
+                calls.setdefault(name, set()).add(fn.name)
+
+    assert calls.get("_render_pr_narrative"), (
+        "_render_pr_narrative is defined but never called -- the PR body would carry "
+        "no narrative and nothing would say so")
+    assert calls.get("reset_prose_budget"), (
+        "reset_prose_budget is never called, so a provider closed by one push stays "
+        "closed for the life of the process")
+
+    # The narrative must reach the body, not merely be computed.
+    shared = calls["_render_pr_narrative"] & calls.get("format_pr_body", set())
+    assert shared, (
+        f"_render_pr_narrative is called from {calls['_render_pr_narrative']} and "
+        f"format_pr_body from {calls.get('format_pr_body')} -- no function does both, "
+        f"so the narrative is computed and discarded")
+
+    # AND it must be PASSED IN. Both being called from the same function is not
+    # enough: deleting the keyword argument leaves the renderer running and its output
+    # dropped on the floor.
+    #
+    # The first version of this asserted `"fix_summary=" in inspect.getsource(W)`,
+    # with an `or` fallback that made it nearly unfalsifiable -- a mutation removing
+    # the keyword argument SURVIVED it. That is the same "gate that cannot be made to
+    # fail" shape the reachability audit records about its own first version.
+    passes_narrative = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (getattr(node.func, "id", "") or getattr(node.func, "attr", "")) \
+                != "format_pr_body":
+            continue
+        for kw in node.keywords:
+            if kw.arg and "prose" in ast.dump(kw.value):
+                passes_narrative = True
+    assert passes_narrative, (
+        "format_pr_body is called but no keyword argument carries the narrative, so "
+        "_render_pr_narrative runs and its output is discarded -- the PR body would "
+        "have no narrative and nothing would say why")
+
+
+def test_an_exhausted_llm_chain_states_what_happened():
+    """The failure must be legible afterwards, not a print() to stdout.
+
+    Replaced defect, app/fix_generator.py:
+
+        except Exception as e:
+            print(f"  ⚠️  LLM error: {e}. Using template fix.")
+            return _generate_with_template(...)
+
+    The template fix it returned was real and its provenance was honestly `template`.
+    What was wrong is that afterwards a RATE-LIMITED model and a NEVER-CONFIGURED one
+    were indistinguishable: the only record was stdout, there was no activity event,
+    and the PR body said nothing about an attempt having been made.
+    """
+    from app import llm_chain as C
+
+    class _Boom(Exception):
+        def __init__(self, status):
+            super().__init__(f"status {status}")
+            self.status_code = status
+
+    with _with_provider_credentials():
+        chain = C.fix_chain()
+        assert chain, "fix chain is empty even with credentials present"
+
+        # Every provider rate-limits.
+        res = C.run(lambda p: (_ for _ in ()).throw(_Boom(429)), chain=chain,
+                    budget=C.Budget())
+        assert not res.ok
+        assert res.text == "" and res.answered_by == ""
+        stated = res.stated_outcome()
+        assert stated, "an exhausted chain returned no statement of what happened"
+        assert "rate_limited" in stated, stated
+        assert chain[0].name in stated, (
+            f"the statement does not name the providers tried: {stated}")
+
+    # And nothing configured at all is a DIFFERENT statement, not the same silence.
+    empty = C.run(lambda p: "x", chain=[], budget=C.Budget())
+    assert not empty.ok
+    assert "none configured" in empty.stated_outcome(), empty.stated_outcome()
+    assert empty.stated_outcome() != stated, (
+        "a rate-limited chain and an unconfigured one produce the same statement, "
+        "which is the ambiguity this replaces")
+
+
+def test_a_provider_with_no_credential_is_not_in_the_chain():
+    """Three names over one endpoint is not a fallback chain.
+
+    The first draft of _generate_with_llm read llm_config.base_url() for every entry,
+    so each provider in the chain hit the SAME endpoint and the answer was credited to
+    whichever came first. Measured: with no OpenRouter key set, a local Ollama reply
+    was reported as `answered by openrouter`. Same misreporting backend_label() exists
+    to prevent, reached from the other side -- a correctly-named model that was never
+    called.
+
+    Two things stop it: each entry now uses its own base_url and its own credential,
+    and an entry with no credential is excluded rather than being a guaranteed 401.
+    """
+    import os as _os
+
+    from app import llm_chain as C
+    from app.llm_providers import PROVIDERS
+
+    keyed = [p for p in PROVIDERS.values() if p.key_env]
+    assert keyed, "no provider declares a credential -- this check would be vacuous"
+
+    saved = {p.key_env: _os.environ.get(p.key_env) for p in keyed}
+    try:
+        for p in keyed:
+            _os.environ.pop(p.key_env, None)
+        names = {p.name for p in C.prose_chain()}
+        for p in keyed:
+            assert p.name not in names, (
+                f"{p.name} needs {p.key_env}, which is unset, yet it is in the chain")
+        # Keyless providers remain, because a self-hosted endpoint that
+        # authenticates nothing is a legitimate configuration.
+        keyless = {p.name for p in PROVIDERS.values()
+                   if not p.key_env and p.usable_today}
+        assert names == keyless, f"expected only keyless providers, got {names}"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+def test_a_malformed_request_stops_the_chain_instead_of_multiplying():
+    """400 is OUR bug. Asking three providers the same bad question hides the cause."""
+    from app import llm_chain as C
+
+    class _Boom(Exception):
+        def __init__(self, status):
+            super().__init__(f"status {status}")
+            self.status_code = status
+
+    with _with_provider_credentials():
+        chain = C.fix_chain()
+    assert len(chain) >= 1, "fix chain empty with credentials present"
+
+    calls = []
+
+    def _bad(p):
+        calls.append(p.name)
+        raise _Boom(400)
+
+    res = C.run(_bad, chain=chain, budget=C.Budget())
+    assert not res.ok
+    assert len(calls) == 1, (
+        f"a malformed request was retried against {len(calls)} providers; 400 is "
+        f"terminal because the payload will fail everywhere")
+    assert "bad_request" in res.stated_outcome()
+
+    # A retryable status DOES advance, or the chain is pointless.
+    retried = []
+
+    def _limited(p):
+        retried.append(p.name)
+        raise _Boom(429)
+
+    C.run(_limited, chain=chain, budget=C.Budget())
+    assert len(retried) == len(chain), (
+        f"429 should try every provider; tried {len(retried)} of {len(chain)}")
+
+    # Classification is the thing both behaviours rest on.
+    assert C.classify(_Boom(429))[0] == "rate_limited"
+    assert C.classify(_Boom(402))[0] == "no_credit"
+    assert C.classify(_Boom(401))[0] == "auth"
+    assert C.classify(_Boom(400))[0] == "bad_request"
+    assert C.classify(_Boom(503))[0] == "unreachable"
+    assert C.classify(OSError("connection refused"))[0] == "unreachable", (
+        "a refused connection must be transient, or a stopped local Ollama would "
+        "terminate the chain")
+    for retryable in C.RETRYABLE:
+        assert retryable not in C.TERMINAL
+
+
+def test_an_empty_model_response_is_a_failure_not_a_fix():
+    """A blank body looks like success and would be reported as the wrong cause.
+
+    Left unhandled it returns "" to generate_fix, the diff contract rejects it as an
+    empty fix, and the PR records a contract violation rather than "the model returned
+    nothing" -- a true statement about the wrong layer.
+    """
+    from app import llm_chain as C
+
+    with _with_provider_credentials():
+        chain = C.fix_chain()
+    res = C.run(lambda p: "   \n  ", chain=chain, budget=C.Budget())
+    assert not res.ok, "whitespace was accepted as a fix"
+    assert "empty_response" in res.stated_outcome(), res.stated_outcome()
+
+
+def test_a_symbol_delta_never_reports_unknown_as_clean():
+    """An unparsable revision must not read as "nothing was removed".
+
+    This is the whole reason `SymbolDelta.reliable` exists. A PR containing a syntax
+    error would otherwise be announced as safe, because the head parses to zero symbols
+    and the subtraction comes out empty.
+    """
+    from app import repo_index as R
+
+    base = R.extract("src/user.py",
+                     "class User:\n    pass\n\ndef helper(): pass\n\nMAX = 1\n")
+    head = R.extract("src/user.py", "class User:\n    pass\n\nMAX = 1\n")
+
+    d = R.delta(base, head)
+    assert d.removed == ("helper",), d.removed
+    assert d.added == ()
+    assert d.method == "ast" and d.reliable and d.is_breaking
+
+    # Reverse direction is an ADDITION, which is not breaking.
+    rev = R.delta(head, base)
+    assert rev.added == ("helper",) and rev.removed == ()
+    assert not rev.is_breaking
+
+    # The dangerous case.
+    broken = R.extract("src/user.py", "class User:\n  def (((\n")
+    u = R.delta(base, broken)
+    assert u.removed == (), "a delta against an unparsable head must not guess"
+    assert u.reliable is False, (
+        "an unparsable revision was reported as reliable, so a syntax error would be "
+        "announced as 'no symbols removed'")
+    assert u.is_breaking is False
+    assert "unknown rather than empty" in u.reason, u.reason
+
+    # Mixed exactness downgrades to the weaker side rather than claiming exact.
+    tb = R.extract("a.ts", "export const A = 1\nexport const B = 2\n")
+    th = R.extract("a.ts", "export const A = 1\n")
+    m = R.delta(tb, th)
+    assert m.removed == ("B",) and m.method == "regex", (m.removed, m.method)
+
+
+def test_a_failed_revision_fetch_is_not_an_empty_file():
+    """`_fetch_file_at_sha` returned "" for both, and the PR analyser subtracts.
+
+    With "" standing in for a failure, the two directions are confidently wrong:
+
+        head fetch fails -> head looks empty -> EVERY base symbol looks removed
+        base fetch fails -> base looks empty -> a real removal reported as clean
+
+    The three older callers test truthiness, so None is behaviourally identical for
+    them; only the analyser needed the distinction.
+    """
+    import inspect
+
+    from app import webhook as W
+
+    src = inspect.getsource(W._fetch_file_at_sha)
+    assert "return None" in src, (
+        "_fetch_file_at_sha no longer signals failure distinctly, so an unfetchable "
+        "revision parses as an empty file")
+    assert 'return ""' not in src.split("def ")[-1] or "content" in src
+
+    # Every older caller must still be truthiness-based, or None breaks them.
+    whole = inspect.getsource(W)
+    for guard in ("if config_content:", "if not old_content or not new_content:"):
+        assert guard in whole, (
+            f"caller guard {guard!r} is gone -- verify it still tolerates None")
+
+
+def test_a_pull_request_being_opened_is_analysed_not_ignored():
+    """The trigger Ripple did not have.
+
+    Before this, `pull_request` + `opened` fell through to {"status": "ignored"}: Ripple
+    reacted only to a push landing on the default branch, never to a PR under review --
+    which is the moment telling someone "this breaks three other repos" is useful.
+
+    Driven with a stubbed GitHub API so it needs no token and no network, but through
+    the REAL handler, because a test that reimplements the dispatch proves nothing about
+    the dispatch.
+    """
+    import asyncio
+
+    from app import webhook as W
+
+    BASE = ("class User:\n    pass\n\n\ndef legacy_helper():\n    return 1\n")
+    HEAD = ("class User:\n    pass\n")
+
+    calls = []
+
+    def _fake_api(method, path, token, data=None, **kw):
+        calls.append(path)
+        if "/pulls/7/files" in path:
+            return [{"filename": "src/user.py", "status": "modified"},
+                    {"filename": "docs/readme.md", "status": "modified"},
+                    {"filename": "src/brand_new.py", "status": "added"}]
+        return {"error": "unexpected"}
+
+    def _fake_fetch(repo, p, sha, token):
+        if p != "src/user.py":
+            return None
+        return BASE if sha == "base111" else HEAD
+
+    saved = (W._github_api, W._fetch_file_at_sha, W._get_token)
+    W._github_api = _fake_api
+    W._fetch_file_at_sha = _fake_fetch
+    W._get_token = lambda _id: "tok"
+    try:
+        payload = {
+            "action": "opened",
+            "repository": {"full_name": "acme/api", "default_branch": "main"},
+            "installation": {"id": 42},
+            "pull_request": {"number": 7,
+                             "base": {"sha": "base111"},
+                             "head": {"sha": "head222"}},
+        }
+        res = asyncio.new_event_loop().run_until_complete(
+            W._handle_pr_opened(payload, payload["pull_request"]))
+    finally:
+        W._github_api, W._fetch_file_at_sha, W._get_token = saved
+
+    assert res["status"] == "analysed", res
+    assert res["repo"] == "acme/api" and res["pr"] == 7
+    assert res["symbols_removed"] == 1, res
+    syms = [r["symbol"] for r in res["runs"]]
+    assert syms == ["legacy_helper"], syms
+    assert res["runs"][0]["method"] == "ast", "an exact parse was reported as inexact"
+
+    # A markdown file is skipped with a reason, not silently dropped.
+    assert any("readme" in s["path"] for s in res["skipped"]), res["skipped"]
+    # An added file has no base revision, so nothing can have been removed from it.
+    assert any("brand_new" in s["path"] for s in res["skipped"]), res["skipped"]
+
+    # AND THE DISPATCH MUST ROUTE HERE -- proven by DRIVING THE REAL ROUTE, not by
+    # reading it.
+    #
+    # Two weaker versions were tried and both had a mutant survive:
+    #   1. `assert "_handle_pr_opened" in routed`  -- a mutation to `if False and ...`
+    #      survived, because the call was still present, merely unreachable. Presence
+    #      is not reachability.
+    #   2. checking the branch tests `event_type` -- a mutation to
+    #      `if event_type == "push"` survived, because it still references the name
+    #      while comparing it to the wrong value.
+    #
+    # Structural checks have a floor there. `_verify_signature` is a no-op with no
+    # WEBHOOK_SECRET set, so the route can be driven with a minimal request and the
+    # dispatch answers for itself.
+    import asyncio as _aio
+    import json as _json
+
+    class _Req:
+        def __init__(self, payload, event):
+            self._body = _json.dumps(payload).encode()
+            self.headers = {"X-GitHub-Event": event}
+
+        async def body(self):
+            return self._body
+
+    saved2 = (W._github_api, W._fetch_file_at_sha, W._get_token)
+    W._github_api = _fake_api
+    W._fetch_file_at_sha = _fake_fetch
+    W._get_token = lambda _id: "tok"
+    saved_secret = os.environ.pop("WEBHOOK_SECRET", None)
+    try:
+        routed_res = _aio.new_event_loop().run_until_complete(
+            W.github_webhook(_Req(payload, "pull_request")))
+    finally:
+        W._github_api, W._fetch_file_at_sha, W._get_token = saved2
+        if saved_secret is not None:
+            os.environ["WEBHOOK_SECRET"] = saved_secret
+
+    assert routed_res.get("status") == "analysed", (
+        f"a real pull_request webhook did not reach the analyser -- got "
+        f"{routed_res!r}. Either the dispatch branch is missing, guarded by a "
+        f"constant, or comparing event_type to the wrong value.")
+    assert routed_res.get("pr") == 7, routed_res
+    assert routed_res.get("symbols_removed") == 1, routed_res
+
+
+def test_a_pr_with_nothing_removed_still_terminates_explicitly():
+    """"No breaking symbols" must be distinguishable from "the analysis crashed".
+
+    Same rule the push path follows: every change gets a ChangeRun so a run that leads
+    nowhere still emits a terminal state. A PR that returns silence is indistinguishable
+    from one Ripple never looked at.
+    """
+    import asyncio
+
+    from app import webhook as W
+
+    def _fake_api(method, path, token, data=None, **kw):
+        if "/files" in path:
+            return [{"filename": "src/user.py", "status": "modified"}]
+        return {"error": "unexpected"}
+
+    # Additive change only: a symbol gained, none lost.
+    def _fake_fetch(repo, p, sha, token):
+        return ("def a(): pass\n" if sha == "b1"
+                else "def a(): pass\n\n\ndef b(): pass\n")
+
+    saved = (W._github_api, W._fetch_file_at_sha, W._get_token)
+    W._github_api, W._fetch_file_at_sha = _fake_api, _fake_fetch
+    W._get_token = lambda _id: "tok"
+    try:
+        payload = {"action": "synchronize",
+                   "repository": {"full_name": "acme/api"},
+                   "installation": {"id": 1},
+                   "pull_request": {"number": 3, "base": {"sha": "b1"},
+                                    "head": {"sha": "h1"}}}
+        res = asyncio.new_event_loop().run_until_complete(
+            W._handle_pr_opened(payload, payload["pull_request"]))
+    finally:
+        W._github_api, W._fetch_file_at_sha, W._get_token = saved
+
+    assert res["status"] == "analysed"
+    assert res["symbols_removed"] == 0
+    assert res["runs"] == [], "no symbol was removed, so there is nothing to run"
+
+    # A missing token or a malformed payload REFUSES rather than ignoring, because
+    # "ignored" reads as a choice not to look.
+    empty = asyncio.new_event_loop().run_until_complete(
+        W._handle_pr_opened({"action": "opened", "repository": {},
+                             "pull_request": {}}, {}))
+    assert empty["status"] == "refused", empty
+    assert "payload" in empty["reason"], empty
+
+
+def _impact_fixture(truncated=False):
+    """Three indexed repos: a producer, an exact consumer, an approximate one."""
+    from app import repo_index as R
+
+    producer = R.build("acme/models", [
+        ("src/user.py", "class User:\n    phone_number = ''\n"),
+    ])
+    consumer = R.build("acme/checkout", [
+        ("src/pay.py", "from src.user import User\n\ndef pay(u):\n"
+                       "    return u.phone_number\n"),
+        ("src/unrelated.py", "def totals():\n    return 1\n"),
+    ])
+    web = R.build("acme/web", [("app/form.ts", "const x = row.phone_number\n")])
+    web.truncated = truncated
+    return [producer, consumer, web]
+
+
+class _FakeChain:
+    """Stands in for a ChainResult so ranking can be driven without a model."""
+
+    def __init__(self, text, ok=True, outcome="no model answered"):
+        self.text, self.ok, self._outcome = text, ok, outcome
+        self.attempts = ()
+
+    def stated_outcome(self):
+        return self._outcome
+
+
+def test_impact_analysis_refuses_rather_than_claiming_nothing_is_affected():
+    """"Nothing is affected" and "I did not look" must never render identically.
+
+    This gate outlived the Stage 3 seam it was written for. The seam returned a
+    hardcoded refusal; Stage 4 replaced it with a real cross-repo search, so the
+    property is now asserted in BOTH directions -- an unsearched estate refuses, and
+    a fully searched one is allowed to answer. Only asserting the refusal would let
+    a search that finds nothing ever pass by refusing always.
+    """
+    import contextlib
+
+    from app import impact as I
+    from app import repo_index as R
+    from app import webhook as W
+
+    @contextlib.contextmanager
+    def _estate(indexes):
+        """Control what the search can see.
+
+        `indexes` is patched rather than RIPPLE_DATA_DIR because that variable is read
+        into _DATA_DIR_CANDIDATES at IMPORT time -- setting it inside a test that has
+        already imported the module has no effect, and the first version of this gate
+        silently wrote a fixture index into the real data directory as a result.
+        """
+        saved = W._repo_index.indexed_repos
+        W._repo_index.indexed_repos = lambda: list(indexes)
+        try:
+            yield
+        finally:
+            W._repo_index.indexed_repos = saved
+
+    facts = R.extract("src/u.py", "def gone(): pass\n")
+    d = R.delta(facts, R.FileFacts(path="src/u.py", language="python", method="ast"))
+
+    # No index exists at all -> UNKNOWN, never "none".
+    with _estate([]):
+        out = W._analyse_pr_impact("acme/api", "gone", d, "tok")
+
+    assert out["affected"] == [], out["affected"]
+    assert out["refusals"], (
+        "impact analysis returned no affected repos AND no refusal, which the funnel "
+        "would record as 'nothing is affected'")
+    assert any("UNKNOWN rather than none" in r for r in out["refusals"]), out["refusals"]
+
+    # A COMPLETE search over a real estate is allowed to answer, and does.
+    found = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture(),
+                   known_repos=["acme/models", "acme/checkout", "acme/web"])
+    keys = [c.key() for c in found.candidates]
+    assert "acme/checkout:src/pay.py" in keys, keys
+    assert "acme/models:src/user.py" not in keys, (
+        "the file whose change started the analysis was reported as its own consumer")
+    assert "acme/checkout:src/unrelated.py" not in keys, (
+        "an unrelated file was named, which is the false positive that would make a "
+        "live demo untrustworthy")
+
+    # And a genuinely unused symbol over a complete estate is a FACT, not a refusal.
+    clean = I.find("no_such_symbol_anywhere", "acme/models", "src/user.py",
+                   indexes=_impact_fixture(),
+                   known_repos=["acme/models", "acme/checkout", "acme/web"])
+    assert clean.candidates == []
+    assert clean.is_confident_none(), (
+        "a complete search that found nothing must be able to SAY nothing is "
+        "affected -- otherwise the refusal is unfalsifiable and carries no signal")
+
+
+def test_the_model_cannot_add_a_file_the_index_did_not_find():
+    """The architecture rule, enforced rather than documented.
+
+    A model asked "which files use this?" will answer with plausible paths, and a
+    plausible path that does not exist is a false positive delivered with full
+    confidence. Ranking is therefore intersected with the candidate set: an invented
+    path is discarded and RECORDED, never returned.
+    """
+    from app import impact as I
+
+    found = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture())
+    real = {c.key() for c in found.candidates}
+    assert len(real) >= 2, real
+
+    lying = _FakeChain(
+        "acme/web:app/form.ts | renders the field\n"
+        "acme/checkout:src/pay.py | reads it during payment\n"
+        "acme/billing:src/invoice.py | I am confident this exists\n")
+    ranked = I.rank(found, call_chain=lambda _p: lying)
+
+    returned = {c.key() for c in ranked.candidates}
+    assert returned == real, (
+        f"ranking changed the candidate SET, not just its order: {returned ^ real}")
+    assert "acme/billing:src/invoice.py" not in returned
+    assert any("acme/billing" in v for v in ranked.violations), ranked.violations
+
+
+def test_the_model_cannot_delete_a_candidate_the_index_found():
+    """Omission is not counter-evidence.
+
+    A deterministic hit is a parse or a pattern match in a file that exists. A model
+    forgetting to list it says nothing about the file, so an omitted candidate is
+    APPENDED with the omission recorded -- dropping it would let a model silently
+    shrink the impact set, which is the same dishonesty as inventing one, inverted.
+    """
+    from app import impact as I
+
+    found = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture())
+    real = {c.key() for c in found.candidates}
+
+    forgetful = _FakeChain("acme/web:app/form.ts | renders the field\n")
+    ranked = I.rank(found, call_chain=lambda _p: forgetful)
+
+    assert {c.key() for c in ranked.candidates} == real, (
+        "a candidate the index found was dropped because the model did not mention it")
+    assert any("omitted" in v for v in ranked.violations), ranked.violations
+
+
+def test_a_granted_repo_that_was_never_indexed_is_not_reported_as_clean():
+    """A repo nobody read must not look like a repo with no consumers.
+
+    This is the distinction that makes the whole answer usable: an estate of ten
+    repos where two were indexed can only speak for two. `unsearchable` names the
+    rest, and `is_confident_none` refuses while any of them remain.
+    """
+    from app import impact as I
+
+    found = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture(),
+                   known_repos=["acme/models", "acme/checkout", "acme/web",
+                                "acme/legacy", "acme/mobile"])
+
+    unsearched = {u["repo"] for u in found.unsearchable}
+    assert unsearched == {"acme/legacy", "acme/mobile"}, unsearched
+    assert not found.searched_everything
+
+    clean = I.find("nothing_uses_this", "acme/models", "src/user.py",
+                   indexes=_impact_fixture(), known_repos=["acme/legacy"])
+    assert clean.candidates == []
+    assert not clean.is_confident_none(), (
+        "an estate with an unindexed repo reported 'nothing is affected' as a fact")
+    assert clean.refusals, "the incomplete search produced no refusal"
+
+
+def test_an_approximate_match_is_not_presented_as_an_exact_one():
+    """A regex hit and an AST hit are both "found"; only one is a fact.
+
+    Python is parsed. TypeScript is pattern-matched, so a name inside a comment or a
+    string can over-match. Both are worth showing, but a reviewer reading top-down
+    must meet the parse results first and must be told which is which.
+    """
+    from app import impact as I
+
+    found = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture())
+    conf = [(c.key(), c.confidence) for c in found.candidates]
+
+    assert ("acme/checkout:src/pay.py", "exact") in conf, conf
+    assert ("acme/web:app/form.ts", "approximate") in conf, conf
+
+    order = [c.confidence for c in found.candidates]
+    assert order == sorted(order, key=lambda c: c != "exact"), (
+        f"an approximate match outranked an exact one: {conf}")
+
+
+def test_a_truncated_index_makes_the_answer_partial():
+    """An index that stopped reading cannot support "no consumers".
+
+    The file cap is declared in repo_index rather than discovered, and it has to
+    survive into the answer -- a repo indexed up to 2000 files and a repo fully
+    indexed give the same empty list for a symbol in file 2001.
+    """
+    from app import impact as I
+
+    found = I.find("nothing_uses_this", "acme/models", "src/user.py",
+                   indexes=_impact_fixture(truncated=True),
+                   known_repos=["acme/models", "acme/checkout", "acme/web"])
+
+    assert found.partial, "a truncated index produced a non-partial answer"
+    assert not found.is_confident_none()
+    assert any("file cap" in r for r in found.refusals), found.refusals
+
+
+def test_an_ambiguous_symbol_says_so_instead_of_listing_noise():
+    """`phone_number` matching four files is evidence; `id` matching four hundred is not.
+
+    A bare-name index cannot tell a reference from a coincidence, so ambiguity is
+    reported as a property of the symbol rather than being hidden inside a confident
+    ranking.
+    """
+    from app import impact as I
+
+    short = I.find("id", "acme/models", "src/user.py", indexes=_impact_fixture())
+    assert short.ambiguity, "a two-character symbol was treated as unambiguous"
+    assert any("coincidence" in r for r in short.refusals), short.refusals
+    assert not short.is_confident_none()
+
+    named = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture())
+    assert not named.ambiguity, named.ambiguity
+
+
+def test_cross_repo_impact_is_reachable_from_the_real_pr_route():
+    """Driven through the actual dispatch, not a structural check.
+
+    Stage 3 learned this the hard way: asserting the call APPEARS in the source
+    survived both `if False and ...` and a wrong-valued condition, because presence
+    is not reachability. So this drives the webhook route end to end and asserts a
+    consumer in a DIFFERENT repo comes back on the response.
+    """
+    import asyncio
+
+    from app import repo_index as R
+    from app import webhook as W
+
+    # `phone_number` is a CLASS attribute -- the shape every worked example uses, and
+    # the one the extractor originally missed entirely.
+    BASE = "class User:\n    phone_number = ''\n"
+    HEAD = "class User:\n    pass\n"
+
+    def _fake_api(method, path, token, data=None, **kw):
+        if "/pulls/7/files" in path:
+            return [{"filename": "src/user.py", "status": "modified"}]
+        return {"error": "unexpected"}
+
+    def _fake_fetch(repo, p, sha, token):
+        if p != "src/user.py":
+            return None
+        return BASE if sha == "base111" else HEAD
+
+    # A consumer in ANOTHER repo, indexed exactly as installation would index it, and
+    # injected rather than written to disk: R.save() here wrote a fixture into the real
+    # data directory, because RIPPLE_DATA_DIR is read at import time.
+    consumer = R.build("acme/checkout", [
+        ("src/pay.py", "from src.user import User\n\ndef pay(u):\n"
+                       "    return u.phone_number\n")])
+
+    saved = (W._github_api, W._fetch_file_at_sha, W._get_token,
+             W._repo_index.indexed_repos)
+    W._github_api = _fake_api
+    W._fetch_file_at_sha = _fake_fetch
+    W._get_token = lambda _id: "tok"
+    W._repo_index.indexed_repos = lambda: [consumer]
+    try:
+        payload = {
+            "action": "opened",
+            "repository": {"full_name": "acme/api", "default_branch": "main"},
+            "installation": {"id": 42},
+            "pull_request": {"number": 7,
+                             "base": {"sha": "base111"},
+                             "head": {"sha": "head222"}},
+        }
+        res = asyncio.new_event_loop().run_until_complete(
+            W._handle_pr_opened(payload, payload["pull_request"]))
+    finally:
+        (W._github_api, W._fetch_file_at_sha, W._get_token,
+         W._repo_index.indexed_repos) = saved
+
+    assert res["status"] == "analysed", res
+    assert res["symbols_removed"] == 1, (
+        f"a removed CLASS ATTRIBUTE was not detected: {res}")
+    runs = res["runs"]
+    assert runs, res
+    affected = [(h["repo"], h["path"]) for r in runs for h in r.get("affected", [])]
+    assert ("acme/checkout", "src/pay.py") in affected, (
+        f"the cross-repo consumer never reached the PR response: {affected}")
+    assert all(h.get("confidence") in ("exact", "approximate")
+               for r in runs for h in r.get("affected", [])), runs
+
+
+def test_only_one_prose_grade_transport_exists():
+    """Narrative and ranking must share one client.
+
+    Two prose call sites means two places to read a credential, ignore `base_url`, or
+    hardcode a model -- exactly the four-bug shape `/test-llm` shipped with for
+    months. The diagnostic endpoint keeps its own client on purpose: its job is to
+    report what a raw call does, so routing it through the shared helper would make
+    it test the helper instead of the configuration. Every other constructor is a
+    regression, so the OWNERS are named rather than merely counted.
+    """
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path("app/webhook.py").read_text(encoding="utf-8"))
+
+    owners = sorted(
+        f.name for f in ast.walk(tree)
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "Anthropic" for n in ast.walk(f))
+    )
+    assert owners == ["_ask_provider", "test_llm"], (
+        f"an unexpected Anthropic client was constructed in {owners}; prose-grade "
+        f"calls must go through _ask_provider")
+
+    callers = {
+        f.name for f in ast.walk(tree)
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "_ask_provider" for n in ast.walk(f))
+    }
+    assert "_impact_ranker" in callers, (
+        "impact ranking does not go through the shared transport")
+    assert "_render_pr_narrative" in callers, (
+        "narrative rendering no longer goes through the shared transport")
+
+
+def test_a_ranking_note_goes_through_the_same_claim_check_as_the_narrative():
+    """A second prose surface must not bypass the first one's guardrail.
+
+    This is how a gate quietly stops applying: `pr_prose.check` was written to hold
+    PR narrative to earned claims, then ranking added a NEW model-authored sentence
+    beside it. The first real run against a local model produced
+    "necessitating changes to maintain the integrity and functionality of the
+    application" -- an invented consequence, on a pull request, unchecked.
+
+    Notes are DROPPED rather than edited: rewriting a model's sentence to remove a
+    claim leaves prose the model never wrote, presented as though it did.
+    """
+    from app import impact as I
+
+    found = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture())
+    keys = [c.key() for c in found.candidates]
+    assert len(keys) >= 2, keys
+
+    overclaiming = _FakeChain(
+        f"{keys[0]} | this has been verified and is safe to merge\n"
+        f"{keys[1]} | reads the field during checkout\n")
+    ranked = I.rank(found, call_chain=lambda _p: overclaiming)
+
+    by_key = {c.key(): c for c in ranked.candidates}
+    assert by_key[keys[0]].note == "", (
+        f"an unearned claim reached the pull request: {by_key[keys[0]].note!r}")
+    assert by_key[keys[1]].note, "a clean note was dropped along with the bad one"
+    assert any("note dropped" in v for v in ranked.violations), ranked.violations
+
+    # The CANDIDATE survives a bad note. The index found it; the prose is separate.
+    assert set(by_key) == set(keys), (
+        "a candidate was discarded because its note was rejected -- the deterministic "
+        "hit is evidence and does not depend on the model writing well about it")
+
+    # Hedging about a reference the index established exactly is also dropped, and
+    # matched as a FAMILY: the first version listed "may contain" and a real model run
+    # immediately produced "may reference", so every spelling below must be caught by
+    # one pattern rather than by an enumeration that grows one bug at a time.
+    for hedge in ("this file likely contains references to it",
+                  "it may reference the symbol in its code",
+                  "might possibly use the field",
+                  "appears to reference the removed name",
+                  "could import the removed helper"):
+        fresh = I.find("phone_number", "acme/models", "src/user.py",
+                       indexes=_impact_fixture())
+        weak = _FakeChain(f"{keys[0]} | {hedge}\n")
+        got = I.rank(fresh, call_chain=lambda _p: weak)
+        note = {c.key(): c.note for c in got.candidates}[keys[0]]
+        assert note == "", f"a hedge was published: {hedge!r} -> {note!r}"
+        assert any("hedged" in v for v in got.violations), (hedge, got.violations)
+
+    # PADDING is dropped too. These are VERBATIM notes from a real deepseek-coder-v2
+    # run: given only a path and a language, the model restated the candidate row for
+    # every single candidate, despite a prompt forbidding exactly that. Publishing them
+    # would make the pull request read like a generated form.
+    for padding in (
+        "This file is written in Python and contains an exact match to the removed "
+        "symbol, suggesting it may be part of a larger module",
+        "This file is written in TypeScript and contains an approximate match to the "
+        "removed symbol",
+        "The exact match for the removed symbol indicates a direct reference",
+    ):
+        fresh = I.find("phone_number", "acme/models", "src/user.py",
+                       indexes=_impact_fixture())
+        padded = _FakeChain(f"{keys[0]} | {padding}\n")
+        got = I.rank(fresh, call_chain=lambda _p: padded)
+        note = {c.key(): c.note for c in got.candidates}[keys[0]]
+        assert note == "", f"padding was published: {note!r}"
+        assert set(c.key() for c in got.candidates) == set(keys), (
+            "a candidate was lost when its note was dropped as padding")
+
+    # And a clause that says something real survives, so the check is not vacuous.
+    fresh = I.find("phone_number", "acme/models", "src/user.py",
+                   indexes=_impact_fixture())
+    good = _FakeChain(f"{keys[0]} | reads the field when building the payment "
+                      f"payload, so the call site changes shape\n")
+    kept = I.rank(fresh, call_chain=lambda _p: good)
+    assert {c.key(): c.note for c in kept.candidates}[keys[0]], (
+        "an informative note was dropped, so the check rejects everything and carries "
+        "no signal")
+
+
+def _pr_run(symbol="phone_number", path="src/user.py", line=5, **over):
+    """One analysed run, in the flattened shape the PR handler produces."""
+    run = {
+        "symbol": symbol, "path": path, "line": line, "method": "ast",
+        "affected": [
+            {"repo": "acme/checkout", "path": "src/pay.py", "language": "python",
+             "confidence": "exact", "note": "reads it when building the payload"},
+            {"repo": "acme/web", "path": "app/P.tsx", "language": "typescript",
+             "confidence": "approximate", "note": ""},
+        ],
+        "refusals": [], "unsearchable": [], "violations": [],
+        "ambiguity": "", "partial": False,
+    }
+    run.update(over)
+    return run
+
+
+class _FakeGitHub:
+    """Records calls and replays whatever comments have been "posted" so far."""
+
+    def __init__(self, review=None, issue=None, fail_read=False):
+        self.calls = []
+        self.review = list(review or [])
+        self.issue = list(issue or [])
+        self.fail_read = fail_read
+        self._next_id = 100
+
+    def __call__(self, method, path, token, data=None, **kw):
+        self.calls.append((method, path, data))
+        if method == "GET" and "/pulls/" in path and "/comments" in path:
+            return {"error": "boom"} if self.fail_read else list(self.review)
+        if method == "GET" and "/issues/" in path:
+            return {"error": "boom"} if self.fail_read else list(self.issue)
+        if method == "POST" and path.endswith("/reviews"):
+            for c in (data or {}).get("comments", []):
+                self._next_id += 1
+                self.review.append({"id": self._next_id, "body": c["body"]})
+            return {"id": 1}
+        if method == "POST" and "/issues/" in path:
+            self._next_id += 1
+            self.issue.append({"id": self._next_id, "body": (data or {})["body"]})
+            return {"id": self._next_id}
+        if method == "PATCH":
+            target = int(path.rsplit("/", 1)[-1])
+            for bucket in (self.review, self.issue):
+                for c in bucket:
+                    if c["id"] == target:
+                        c["body"] = (data or {})["body"]
+            return {"id": target}
+        return {"error": f"unexpected {method} {path}"}
+
+
+def test_a_review_comment_anchors_to_a_line_that_is_actually_in_the_diff():
+    """The one physical constraint that shapes this whole feature.
+
+    GitHub accepts an inline comment only on a line in THIS pull request's diff, and
+    the affected files are in OTHER repositories -- so there is no line to attach
+    them to. The comment therefore anchors on the line where the symbol was REMOVED,
+    which is in the diff on the BASE side, and names the consumers in its body.
+
+    `side` must be LEFT: a removed line exists only in the base revision, and asking
+    for it on the RIGHT is a 422.
+    """
+    from app import repo_index as R
+    from app import review_comments as RC
+
+    base = R.extract("src/user.py",
+                     "import os\n\nclass User:\n    email = ''\n    phone_number = ''\n")
+    head = R.extract("src/user.py", "import os\n\nclass User:\n    email = ''\n")
+    d = R.delta(base, head)
+
+    assert d.removed == ("phone_number",), d.removed
+    assert d.removed_at == {"phone_number": 5}, (
+        f"the base line of the removed symbol was not established: {d.removed_at}")
+
+    p = RC.plan([_pr_run(line=d.removed_at["phone_number"])])
+    assert len(p.anchored) == 1 and not p.unanchored, p.summary()
+    c = p.anchored[0]
+    assert c.to_github() == {"path": "src/user.py", "line": 5, "side": "LEFT",
+                             "body": c.body}, c.to_github()
+
+
+def test_a_comment_with_no_anchor_is_not_given_an_invented_line():
+    """A guessed line number is worse than no line number.
+
+    If the base line could not be established -- an unparsable base, or a regex
+    language where the definition was matched but not located -- the comment goes to
+    pull-request level. Defaulting to line 1 would either 422 or land an
+    authoritative-looking comment on an import statement.
+    """
+    from app import review_comments as RC
+
+    p = RC.plan([_pr_run(line=0)])
+    assert not p.anchored and len(p.unanchored) == 1, p.summary()
+    assert p.unanchored[0].line == 0
+    assert not p.unanchored[0].anchored
+
+    # It still carries the full body -- unanchored is about placement, not content.
+    assert "acme/checkout" in p.unanchored[0].body
+
+
+def test_re_running_on_the_same_pull_request_updates_instead_of_duplicating():
+    """`synchronize` fires on every push, so this runs repeatedly by design.
+
+    Identity is an invisible marker naming the symbol and file, not the body text --
+    matching on text would break precisely when a re-run changes the narrative, which
+    is the only reason to re-run at all.
+    """
+    from app import review_comments as RC
+
+    gh = _FakeGitHub()
+    first = RC.post("acme/api", 7, "headsha", RC.plan([_pr_run()]), "tok", api=gh)
+    assert first["created"] == ["phone_number"], first
+    assert len(gh.review) == 1, gh.review
+
+    # Second run, DIFFERENT body -- the note changed, as it would on a re-analysis.
+    changed = _pr_run()
+    changed["affected"][0]["note"] = "a completely different clause"
+    second = RC.post("acme/api", 7, "headsha", RC.plan([changed]), "tok", api=gh)
+
+    assert second["updated"] == ["phone_number"], second
+    assert second["created"] == [], second
+    assert len(gh.review) == 1, (
+        f"a second comment was posted for the same symbol: {len(gh.review)} comments")
+    assert "a completely different clause" in gh.review[0]["body"], (
+        "the comment was not actually updated with the new body")
+
+    patches = [c for c in gh.calls if c[0] == "PATCH"]
+    assert len(patches) == 1, patches
+
+
+def test_posting_refuses_when_existing_comments_cannot_be_read():
+    """Failing to read is not the same as there being nothing there.
+
+    If the existing-comment read fails and the code treats it as "no comments yet",
+    every push duplicates every comment. That is the behaviour that gets an app
+    uninstalled, so a read failure REFUSES to post and says why.
+    """
+    from app import review_comments as RC
+
+    gh = _FakeGitHub(fail_read=True)
+    out = RC.post("acme/api", 7, "headsha", RC.plan([_pr_run()]), "tok", api=gh)
+
+    assert out["created"] == [] and out["updated"] == [], out
+    assert out["refused"], "a read failure silently proceeded to post"
+    assert "duplicat" in out["refused"][0], out["refused"]
+    assert not any(m == "POST" for m, _p, _d in gh.calls), (
+        "a comment was posted despite the read failing")
+
+
+def test_the_comment_body_lists_only_files_the_index_found():
+    """The ledger is template-written. The model contributes prose, never paths.
+
+    A model that cannot be trusted to enumerate files is not asked to. The narrative
+    is appended as a separate paragraph, so a model that names a file it invented adds
+    a sentence -- it cannot add a row.
+    """
+    from app import review_comments as RC
+
+    run = _pr_run()
+    body = RC.body_for("phone_number", "src/user.py", run,
+                       narrative="The consumer builds its payload from this field.")
+
+    for c in run["affected"]:
+        assert c["path"] in body, f"{c['path']} is missing from the comment"
+    assert "acme/nonexistent" not in body
+
+    rows = [ln for ln in body.splitlines() if ln.startswith("- `acme/")]
+    assert len(rows) == len(run["affected"]), (
+        f"the ledger has {len(rows)} rows for {len(run['affected'])} affected files")
+
+    assert "exact match" in body and "approximate match" in body, (
+        "confidence was not carried into the comment, so a regex guess and a parse "
+        "result read identically")
+
+
+def test_a_comment_states_what_was_not_searched():
+    """A comment listing two consumers and silent about eight unindexed repos reads
+    as a complete answer.
+
+    Same property `impact.is_confident_none` protects, one layer out: by the time it
+    is prose on a pull request, an omitted caveat is invisible.
+    """
+    from app import review_comments as RC
+
+    partial = _pr_run(
+        affected=[],
+        unsearchable=[{"repo": "acme/legacy", "reason": "granted but never indexed"}],
+        refusals=["acme/web was indexed up to its file cap"],
+        partial=True)
+    body = RC.body_for("phone_number", "src/user.py", partial)
+
+    assert "Not established" in body, body
+    assert "acme/legacy" in body and "unknown" in body
+    assert "file cap" in body
+    assert "Every granted repository was indexed" not in body, (
+        "an incomplete search claimed a complete one")
+
+    # And the honest complete case is allowed to say so, or the caveat carries no
+    # signal because it is always present.
+    clean = _pr_run(affected=[], unsearchable=[], refusals=[], partial=False)
+    clean_body = RC.body_for("phone_number", "src/user.py", clean)
+    assert "Every granted repository was indexed" in clean_body, clean_body
+    assert "Not established" not in clean_body
+
+
+def test_a_symbol_with_no_analysis_gets_no_comment_at_all():
+    """Silence is better than a comment asserting something nobody checked.
+
+    A run with no impact keys means the analysis never ran for that symbol. Rendering
+    it would produce "No indexed file references it" -- a claim with nothing behind
+    it, on someone's pull request.
+    """
+    from app import review_comments as RC
+
+    p = RC.plan([{"symbol": "mystery", "path": "src/x.py", "line": 3}])
+    assert not p.all_comments, p.summary()
+    assert p.skipped and p.skipped[0]["symbol"] == "mystery", p.skipped
+    assert "never" in p.skipped[0]["why"] or "no impact" in p.skipped[0]["why"]
+
+
+def test_the_comment_cap_is_stated_rather_than_silently_applied():
+    """A refactor removing 200 symbols must not bury the review under its output.
+
+    The cap is fine; a cap that hides how much it dropped is not -- the reviewer
+    would read 20 comments as the complete set.
+    """
+    from app import review_comments as RC
+
+    runs = [_pr_run(symbol=f"sym_{i}") for i in range(RC.MAX_COMMENTS_PER_PR + 5)]
+    p = RC.plan(runs)
+
+    assert len(p.all_comments) == RC.MAX_COMMENTS_PER_PR, len(p.all_comments)
+    assert p.truncated_at == RC.MAX_COMMENTS_PER_PR, p.truncated_at
+    assert len(p.skipped) == 5, p.skipped
+    assert "capped" in p.summary(), p.summary()
+
+
+def test_review_comments_are_posted_from_the_real_pull_request_route():
+    """Driven through the actual dispatch, for the reason Stage 3 established.
+
+    Asserting the call appears in the source survived both `if False and ...` and a
+    wrong-valued condition. So this drives `_handle_pr_opened` end to end and asserts
+    a comment carrying the marker was actually POSTed.
+    """
+    import asyncio
+
+    from app import repo_index as R
+    from app import review_comments as RC
+    from app import webhook as W
+
+    BASE = "class User:\n    email = ''\n    phone_number = ''\n"
+    HEAD = "class User:\n    email = ''\n"
+
+    gh = _FakeGitHub()
+
+    def api(method, path, token, data=None, **kw):
+        if "/pulls/9/files" in path:
+            return [{"filename": "src/user.py", "status": "modified"}]
+        return gh(method, path, token, data, **kw)
+
+    consumer = R.build("acme/checkout", [
+        ("src/pay.py", "from models.user import User\n\ndef pay(u):\n"
+                       "    return u.phone_number\n")])
+
+    saved = (W._github_api, W._fetch_file_at_sha, W._get_token,
+             W._repo_index.indexed_repos, W._granted_repos)
+    W._github_api = api
+    W._fetch_file_at_sha = lambda r, p, sha, t: (
+        None if p != "src/user.py" else (BASE if sha == "b1" else HEAD))
+    W._get_token = lambda _i: "tok"
+    W._repo_index.indexed_repos = lambda: [consumer]
+    W._granted_repos = lambda _i: ["acme/api", "acme/checkout"]
+    try:
+        payload = {"action": "opened",
+                   "repository": {"full_name": "acme/api", "default_branch": "main"},
+                   "installation": {"id": 42},
+                   "pull_request": {"number": 9, "base": {"sha": "b1"},
+                                    "head": {"sha": "h2"}}}
+        res = asyncio.new_event_loop().run_until_complete(
+            W._handle_pr_opened(payload, payload["pull_request"]))
+    finally:
+        (W._github_api, W._fetch_file_at_sha, W._get_token,
+         W._repo_index.indexed_repos, W._granted_repos) = saved
+
+    assert res["status"] == "analysed", res
+    assert res.get("review"), f"no review was attempted: {res.get('review')}"
+    assert res["review"].get("created") == ["phone_number"], res["review"]
+
+    posted = [d for m, p, d in gh.calls if m == "POST" and p.endswith("/reviews")]
+    assert posted, f"no review was POSTed: {[c[:2] for c in gh.calls]}"
+    comments = posted[0]["comments"]
+    assert len(comments) == 1, comments
+    assert comments[0]["side"] == "LEFT" and comments[0]["line"] == 3, comments[0]
+    assert RC.marker_in(comments[0]["body"]) == ("phone_number", "src/user.py")
+    assert "acme/checkout" in comments[0]["body"], comments[0]["body"]
+
+
+def test_a_failure_to_comment_does_not_discard_the_analysis():
+    """The expensive part is the cross-repo search. The cheap part is the comment.
+
+    A token without `pull_requests: write` must not throw away a completed analysis,
+    and the reason must be RETURNED rather than swallowed -- a permissions problem
+    that renders as "nothing to say" is indistinguishable from a clean result.
+
+    Both halves inject a fake API. The first version of this test left `_github_api`
+    real for its happy-path sanity check and made two live requests to api.github.com
+    with a bogus token; they failed, `existing_markers` refused, and the assertion
+    `assert out` was satisfied by that refusal. It passed for the wrong reason and was
+    network-dependent.
+    """
+    from app import webhook as W
+
+    def exploding(*_a, **_k):
+        raise RuntimeError("403 Resource not accessible by integration")
+
+    gh = _FakeGitHub()
+    saved_api = W._github_api
+    W._github_api = gh
+    try:
+        ok = W._post_review_comments("acme/api", 7, "sha", [_pr_run()], "tok")
+        assert ok.get("created") == ["phone_number"], (
+            f"the happy path did not post: {ok}")
+
+        saved_post = W._review_comments.post
+        W._review_comments.post = exploding
+        try:
+            failed = W._post_review_comments("acme/api", 7, "sha", [_pr_run()], "tok")
+        finally:
+            W._review_comments.post = saved_post
+    finally:
+        W._github_api = saved_api
+
+    assert failed["status"] == "post_failed", failed
+    assert "403" in failed["error"], failed
+    assert failed["status"] != "nothing_to_say", (
+        "a permissions failure was reported as having nothing to say")
+
+
+def test_no_gate_reaches_the_real_github_api():
+    """No test may make a live request. Asserted, not trusted.
+
+    Written because one did: the failure-to-comment gate above left `_github_api`
+    unpatched and hit api.github.com twice per run. A network-dependent test is flaky
+    in CI, and one that passes BECAUSE the request failed is worse than no test.
+    """
+    from app import webhook as W
+
+    attempted = []
+    saved = W._github_api
+    W._github_api = lambda m, p, t, d=None, **k: (
+        attempted.append((m, p)) or {"error": "no network in tests"})
+    try:
+        for name in ("test_a_failure_to_comment_does_not_discard_the_analysis",
+                     "test_review_comments_are_posted_from_the_real_pull_request_route",
+                     "test_re_running_on_the_same_pull_request_updates_instead_of_"
+                     "duplicating"):
+            globals()[name]()
+    finally:
+        W._github_api = saved
+
+    assert attempted == [], (
+        f"a gate called the module-level GitHub client instead of an injected fake, "
+        f"which in CI is a live request: {attempted}")
+
+
+def test_a_regex_language_reports_the_line_the_symbol_is_actually_on():
+    """The anchor for a non-Python file must be right, and nothing else covered it.
+
+    Written because a mutation survived. The anchor gate uses a `.py` file, so it
+    exercises the AST extractor only -- the regex path had no line-number coverage at
+    all, and the bug it hides is subtle: every `_REGEX_DEFINES` pattern opens with
+    `^\\s*`, and `\\s` matches a newline, so a definition preceded by a blank line
+    matches STARTING on that blank line. `export function bar` on line 3 reported as
+    line 2.
+
+    One line early is not a rounding error. GitHub rejects a comment on a line that
+    is not in the diff, and when it does not reject it, the comment lands on
+    unrelated code while looking authoritative.
+    """
+    from app import repo_index as R
+
+    ts = R.extract("a.ts", "export const Foo = 1\n"        # line 1
+                           "\n"                            # line 2 -- blank
+                           "export function bar() {}\n"     # line 3
+                           "\n"                            # line 4
+                           "export class Baz {}\n")         # line 5
+    assert ts.method == "regex", ts.method
+    assert ts.defines_at.get("Foo") == 1, ts.defines_at
+    assert ts.defines_at.get("bar") == 3, (
+        f"a definition preceded by a blank line was located one line early: "
+        f"{ts.defines_at}")
+    assert ts.defines_at.get("Baz") == 5, ts.defines_at
+
+    # Same shape in a second regex language, so the fix is in the shared path.
+    go = R.extract("m.go", "package m\n\n\nfunc Handle() {}\n")
+    assert go.defines_at.get("Handle") == 4, go.defines_at
+
+    # And the line survives a persistence round trip, since the anchor is read back
+    # from the stored index rather than recomputed at comment time.
+    idx = R.build("acme/web", [("a.ts", "export const Foo = 1\n\n"
+                                        "export function bar() {}\n")])
+    back = R.RepoIndex.from_dict(idx.to_dict())
+    assert back.files["a.ts"].defines_at == {"Foo": 1, "bar": 3}, (
+        f"line numbers were lost or corrupted on round trip: "
+        f"{back.files['a.ts'].defines_at}")
+
+
+def test_installing_indexes_repository_paths_without_the_archive_wrapper():
+    """The install path had never run for real, and it was wrong in two ways.
+
+    `fetch_tree` returns (tree, cleanup_root): GitHub wraps an archive in a
+    `{owner}-{repo}-{sha}/` directory, so `tree` is the repository root and
+    `cleanup_root` is the temp parent the CALLER must remove.
+
+    Walking the parent made every indexed path carry the wrapper --
+    `tree/owner-repo-abc123/src/pay.py` instead of `src/pay.py`. Nothing local catches
+    that: the index stays self-consistent, symbol matching still works, the comment
+    renders. It breaks exactly where it is most visible -- the comment names a file
+    that does not exist in the repository, and a follow-on pull request tries to edit
+    that nonexistent path.
+
+    Not walking with a `finally` also leaked one temp tree per repository, and an
+    installation is the one moment this runs up to MAX_REPOS times in a row.
+
+    Driven with a REAL wrapped directory, because a flat fixture cannot tell the two
+    paths apart and would pass either way.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    from app import repo_index as R
+    from app import webhook as W
+
+    parent = tempfile.mkdtemp(prefix="ripple-test-tree-")
+    wrapped = os.path.join(parent, "tree", "acme-checkout-abc123")
+    os.makedirs(os.path.join(wrapped, "src"))
+    with open(os.path.join(wrapped, "src", "pay.py"), "w") as fh:
+        fh.write("def pay(u):\n    return u.phone_number\n")
+
+    # A file OUTSIDE the wrapper. Without it the gate cannot fail: walking the temp
+    # parent finds exactly the same file set as walking the tree, so a mutant that
+    # walks the wrong root still produces the right answer. The first version of this
+    # test had only the wrapped file and both mutants survived it.
+    with open(os.path.join(parent, "STRAY.py"), "w") as fh:
+        fh.write("SHOULD_NOT_BE_INDEXED = 1\n")
+
+    import app.repo_workspace as RW
+    saved = (RW.fetch_tree, R.save)
+    stored = {}
+    RW.fetch_tree = lambda repo, ref, token, **kw: (wrapped, parent)
+    R.save = lambda idx: stored.setdefault("idx", idx) and ""
+    try:
+        stats = W._build_symbol_index("acme/checkout", "tok")
+        # Checked BEFORE this test does its own cleanup. The first version asserted
+        # after the finally block that removed `parent` itself, so the leak assertion
+        # could never fail -- the same unfalsifiable-gate shape as the Stage 3
+        # reachability checks.
+        leaked = os.path.exists(parent)
+    finally:
+        RW.fetch_tree, R.save = saved
+        shutil.rmtree(parent, ignore_errors=True)
+
+    assert stats["status"] == "indexed", stats
+    idx = stored["idx"]
+    paths = sorted(idx.files)
+    assert paths == ["src/pay.py"], (
+        f"indexed paths carry the archive wrapper or reach outside the repository "
+        f"tree, so a comment would name a file that does not exist: {paths}")
+    assert not any("acme-checkout-abc123" in p for p in paths), paths
+    assert not any("STRAY" in p or p.startswith("..") for p in paths), (
+        f"a file outside the repository tree was indexed: {paths}")
+
+    assert not leaked, (
+        "the temp tree was leaked; an install runs this once per granted repository, "
+        "up to MAX_REPOS times in a row")
+
+
+def test_an_approximate_match_is_never_turned_into_a_commit():
+    """The bar for editing someone else's repo is higher than for mentioning it.
+
+    A regex hit is good enough to say "this may need a look" in a comment and not
+    good enough to open a pull request against. Stage 5 reports both; Stage 6 edits
+    only what was parsed.
+    """
+    from app import follow_on as F
+
+    impact = {
+        "affected": [
+            {"repo": "acme/checkout", "path": "src/pay.py", "language": "python",
+             "confidence": "exact"},
+            {"repo": "acme/web", "path": "app/P.tsx", "language": "typescript",
+             "confidence": "approximate"},
+        ],
+        "partial": False, "unsearchable": [],
+    }
+    p = F.plan_follow_ons("phone_number", "acme/api", 7, impact)
+
+    repos = [x.repo for x in p.proposals]
+    assert repos == ["acme/checkout"], repos
+    assert any(m["repo"] == "acme/web" and "approximate" in m["why"]
+               for m in p.mentioned_only), p.mentioned_only
+    assert all(x.exact_only for x in p.proposals)
+
+
+def test_the_originating_repo_does_not_get_a_rival_pull_request():
+    """It is already fixing itself in the pull request under review.
+
+    Opening a second PR against the same repo would race the one being reviewed and
+    conflict with it.
+    """
+    from app import follow_on as F
+
+    impact = {"affected": [
+        {"repo": "acme/api", "path": "src/other.py", "language": "python",
+         "confidence": "exact"}],
+        "partial": False, "unsearchable": []}
+    p = F.plan_follow_ons("phone_number", "acme/api", 7, impact)
+
+    assert p.proposals == [], [x.repo for x in p.proposals]
+    assert "same repository" in p.mentioned_only[0]["why"], p.mentioned_only
+
+
+def test_one_follow_on_per_repo_not_one_per_file():
+    """Three files in one repo is one change, not three reviews.
+
+    Also what makes idempotency tractable: the branch is derived from the symbol, so
+    a re-run finds its own branch rather than opening a rival.
+    """
+    from app import follow_on as F
+
+    impact = {"affected": [
+        {"repo": "acme/checkout", "path": f"src/f{i}.py", "language": "python",
+         "confidence": "exact"} for i in range(3)],
+        "partial": False, "unsearchable": []}
+    p = F.plan_follow_ons("phone_number", "acme/api", 7, impact)
+
+    assert len(p.proposals) == 1, [x.repo for x in p.proposals]
+    assert len(p.proposals[0].files) == 3
+    for i in range(3):
+        assert f"src/f{i}.py" in p.proposals[0].body
+
+    b1 = F.branch_name("phone_number", "acme/api", 7)
+    b2 = F.branch_name("phone_number", "acme/api", 7)
+    assert b1 == b2 and b1 == p.proposals[0].branch, (b1, b2)
+
+
+def test_a_follow_on_says_when_the_upstream_search_was_incomplete():
+    """It still raises what it found -- withholding a real consumer helps nobody --
+    but the body must not present a partial set as the full blast radius."""
+    from app import follow_on as F
+
+    impact = {"affected": [
+        {"repo": "acme/checkout", "path": "src/pay.py", "language": "python",
+         "confidence": "exact"}],
+        "partial": True,
+        "unsearchable": [{"repo": "acme/legacy", "reason": "never indexed"}]}
+    p = F.plan_follow_ons("phone_number", "acme/api", 7, impact)
+
+    assert len(p.proposals) == 1
+    body = p.proposals[0].body
+    assert "incomplete" in body, body
+    assert "never indexed" in body or "were never indexed" in body, body
+
+
+def test_a_failed_read_does_not_open_a_duplicate_pull_request():
+    """`synchronize` fires on every push. Without this, each push opens another PR in
+    every implicated repository -- the fastest way to get an app banned.
+
+    A FAILED read is treated as "already open" on purpose: the safe direction when
+    the alternative is spamming a repository the author does not own.
+    """
+    from app import follow_on as F
+
+    impact = {"affected": [
+        {"repo": "acme/checkout", "path": "src/pay.py", "language": "python",
+         "confidence": "exact"}], "partial": False, "unsearchable": []}
+    prop = F.plan_follow_ons("phone_number", "acme/api", 7, impact).proposals[0]
+
+    assert F.already_open(prop, "tok", api=lambda *a, **k: {"error": "boom"}), (
+        "a failed read was treated as 'nothing open', which duplicates on every push")
+    assert F.already_open(
+        prop, "tok", api=lambda *a, **k: [{"head": {"ref": prop.branch}}])
+    assert not F.already_open(
+        prop, "tok", api=lambda *a, **k: [{"head": {"ref": "someone/else"}}])
+
+
+def test_the_follow_on_repo_cap_is_stated():
+    """Beyond the cap a human should decide, and the reviewer must be told the number
+    they can see is not the number affected."""
+    from app import follow_on as F
+
+    impact = {"affected": [
+        {"repo": f"acme/r{i}", "path": "src/x.py", "language": "python",
+         "confidence": "exact"} for i in range(F.MAX_FOLLOW_ON_REPOS + 3)],
+        "partial": False, "unsearchable": []}
+    p = F.plan_follow_ons("phone_number", "acme/api", 7, impact)
+
+    assert len(p.proposals) == F.MAX_FOLLOW_ON_REPOS, len(p.proposals)
+    assert p.truncated_at == F.MAX_FOLLOW_ON_REPOS
+    assert "capped" in p.summary(), p.summary()
+
+
+def test_a_gitlab_merge_request_refuses_rather_than_guessing_a_base():
+    """GitLab parity routes into the SAME analysis, and refuses on a missing base.
+
+    A merge request payload without both revisions has nothing to subtract. Inventing
+    a base would make every symbol look either removed or untouched depending on
+    which way it guessed -- confident, and wrong in one direction or the other.
+    """
+    import asyncio
+
+    from app import webhook as W
+
+    run = asyncio.new_event_loop().run_until_complete
+
+    ok = run(W._handle_gitlab_merge_request({
+        "project": {"path_with_namespace": "grp/api"},
+        "object_attributes": {"action": "open", "iid": 4,
+                              "diff_refs": {"base_sha": "b1", "head_sha": "h2"}}}))
+    assert ok["status"] == "accepted", ok
+    assert ok["platform"] == "gitlab" and ok["mr"] == 4, ok
+    assert "NOT wired" in ok["note"], (
+        "the GitLab path claimed more than it does -- the file-fetch adapter is "
+        "still missing and the response must say so")
+
+    no_base = run(W._handle_gitlab_merge_request({
+        "project": {"path_with_namespace": "grp/api"},
+        "object_attributes": {"action": "open", "iid": 4}}))
+    assert no_base["status"] == "refused", no_base
+    assert "UNKNOWN rather than none" in no_base["why"], no_base
+
+    ignored = run(W._handle_gitlab_merge_request({
+        "project": {"path_with_namespace": "grp/api"},
+        "object_attributes": {"action": "close", "iid": 4}}))
+    assert ignored["status"] == "ignored", ignored
+
+
+def test_follow_ons_are_planned_from_the_real_pull_request_route():
+    """Reachability driven, not asserted structurally -- the Stage 3 lesson."""
+    import asyncio
+
+    from app import repo_index as R
+    from app import webhook as W
+
+    BASE = "class User:\n    email = ''\n    phone_number = ''\n"
+    HEAD = "class User:\n    email = ''\n"
+    gh = _FakeGitHub()
+
+    def api(method, path, token, data=None, **kw):
+        if "/pulls/21/files" in path:
+            return [{"filename": "src/user.py", "status": "modified"}]
+        return gh(method, path, token, data, **kw)
+
+    consumer = R.build("acme/checkout", [
+        ("src/pay.py", "from models.user import User\n\ndef pay(u):\n"
+                       "    return u.phone_number\n")])
+
+    saved = (W._github_api, W._fetch_file_at_sha, W._get_token,
+             W._repo_index.indexed_repos, W._granted_repos)
+    W._github_api = api
+    W._fetch_file_at_sha = lambda r, p, s, t: (
+        None if p != "src/user.py" else (BASE if s == "b1" else HEAD))
+    W._get_token = lambda _i: "tok"
+    W._repo_index.indexed_repos = lambda: [consumer]
+    W._granted_repos = lambda _i: ["acme/api", "acme/checkout"]
+    try:
+        payload = {"action": "opened",
+                   "repository": {"full_name": "acme/api", "default_branch": "main"},
+                   "installation": {"id": 42},
+                   "pull_request": {"number": 21, "base": {"sha": "b1"},
+                                    "head": {"sha": "h2"}}}
+        res = asyncio.new_event_loop().run_until_complete(
+            W._handle_pr_opened(payload, payload["pull_request"]))
+    finally:
+        (W._github_api, W._fetch_file_at_sha, W._get_token,
+         W._repo_index.indexed_repos, W._granted_repos) = saved
+
+    fo = res.get("follow_ons")
+    assert fo, f"follow-on planning never ran: {res.keys()}"
+    assert [p["repo"] for p in fo["proposals"]] == ["acme/checkout"], fo
+    assert fo["proposals"][0]["exact_only"] is True, fo
+    assert "src/pay.py" in fo["proposals"][0]["files"], fo
+
+
+def test_the_symbol_index_records_exact_versus_approximate():
+    """A regex hit and an AST hit must not present with the same confidence.
+
+    Python is parsed with `ast`, which is exact. TypeScript, Go and the rest are
+    regex-matched, which is not -- a symbol inside a comment or a template literal can
+    be missed or over-matched. Stage 4 ranks candidates, and a ranker that cannot tell
+    a parse fact from a pattern guess will show a false positive with full confidence.
+
+    Same reasoning as `source_regions.SCANNED` declaring which languages have a real
+    scanner instead of pretending they all do.
+    """
+    from app import repo_index as R
+
+    py = R.extract("src/models.py", "class User:\n    pass\n\nMAX = 5\n")
+    assert py.method == "ast", py.method
+    assert "User" in py.defines
+    assert "MAX" in py.defines, (
+        "module-level constants are exported symbols; a self-test on this repo caught "
+        "FORBIDDEN_CLAIMS reporting 'defined in 0 files' while living in pr_prose.py")
+
+    ts = R.extract("src/models.ts", "export interface User { id: string }\n")
+    assert ts.method == "regex", ts.method
+    assert "User" in ts.defines
+
+    # A file that does not parse is UNPARSED, not empty. "Defines nothing" and "I could
+    # not read this" are different facts and Stage 4 must not confuse them.
+    broken = R.extract("src/broken.py", "def (((\n")
+    assert broken.method == "unparsed", broken.method
+    assert broken.defines == ()
+
+    # An unsupported language says so rather than silently contributing nothing.
+    other = R.extract("README.md", "# hello\n")
+    assert other.method in ("unsupported", "regex"), other.method
+
+    # Local variables must not pollute the module surface, or ranking drowns in noise.
+    fn = R.extract("src/f.py", "def go():\n    tmp = 1\n    return tmp\n")
+    assert "go" in fn.defines
+    assert "tmp" not in fn.defines, (
+        "a local variable is not part of the module's surface")
+
+
+def test_a_partial_index_says_so_rather_than_looking_clean():
+    """"No consumers found" and "I stopped reading" must be distinguishable.
+
+    Install-time indexing scales with `installs x repo_size` rather than with change
+    volume, so the caps are real and small. The failure they invite is the dangerous
+    one: a repo that was truncated looks, to a later cross-repo search, exactly like a
+    repo with nothing in it.
+    """
+    from app import repo_index as R
+
+    # Over the file cap -> truncated is TRUE and the reason is counted.
+    many = ((f"src/f{i}.py", f"def f{i}(): pass\n") for i in range(R.MAX_FILES_PER_REPO + 5))
+    idx = R.build("acme/big", many)
+    assert idx.truncated is True
+    assert idx.skipped.get("file_cap", 0) >= 5, idx.skipped
+    assert idx.stats()["truncated"] is True, "stats hide the truncation"
+
+    # A file too large is skipped with its own reason, not merged into a total.
+    big = R.build("acme/one", [("src/huge.py", "x = 1\n" * (R.MAX_FILE_BYTES))])
+    assert big.skipped.get("too_large") == 1, big.skipped
+    assert not big.files
+
+    # Unreadable is separate from not-scannable: one is unknown, the other is by design.
+    mixed = R.build("acme/mix", [
+        ("src/a.py", "def a(): pass\n"),
+        ("src/b.py", None),
+        ("docs/readme.md", "# hi\n"),
+    ])
+    assert "a" in [s for f in mixed.files.values() for s in f.defines]
+    assert mixed.skipped.get("unreadable") == 1, mixed.skipped
+    assert mixed.skipped.get("not_scannable", 0) + \
+           mixed.skipped.get("unsupported_language", 0) >= 1, mixed.skipped
+
+    # A corrupt stored index reads back as None -- re-index -- NOT as an empty index,
+    # which would make a broken file look like a repo with no symbols.
+    import os as _os
+    path = R._path_for("acme/corrupt")
+    with open(path, "w") as fh:
+        fh.write("{not json")
+    try:
+        assert R.load("acme/corrupt") is None
+    finally:
+        _os.remove(path)
+
+
+def test_installing_builds_the_symbol_index_and_declares_the_repo_cap():
+    """Indexing must happen with no command, and the cap must be visible.
+
+    "Whenever Ripple is given access to a repo, it learns it" is the requirement, so an
+    index that only appears when someone calls an endpoint does not satisfy it. And an
+    org over MAX_REPOS must be TOLD which repos have no index -- unindexed repos are
+    unknown to cross-repo analysis, not clean.
+    """
+    import ast
+
+    from app import repo_index as R
+    from app import webhook as W
+
+    assert hasattr(W, "_build_symbol_index"), "no symbol-index builder is wired"
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tree = ast.parse(open(os.path.join(root, "app", "webhook.py"),
+                          encoding="utf-8").read())
+
+    callers, cap_readers = set(), set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            name = (getattr(getattr(node, "func", None), "id", "")
+                    or getattr(getattr(node, "func", None), "attr", ""))
+            if isinstance(node, ast.Call) and name == "_build_symbol_index":
+                callers.add(fn.name)
+            if isinstance(node, ast.Attribute) and node.attr == "MAX_REPOS":
+                cap_readers.add(fn.name)
+
+    assert callers, (
+        "_build_symbol_index is defined but never called, so installing an app would "
+        "index nothing and cross-repo analysis would have no data")
+    assert any("install" in c for c in callers), (
+        f"the index is built from {sorted(callers)}, none of which is the install "
+        f"handler -- it would not happen automatically on being granted a repo")
+    assert cap_readers & callers, (
+        f"MAX_REPOS is not consulted where indexing happens ({sorted(callers)}), so an "
+        f"org over the cap would silently get a partial picture")
+
+    # And the cap must be a real number, not a placeholder.
+    assert 1 <= R.MAX_REPOS <= 500
+    assert 1 <= R.MAX_FILES_PER_REPO <= 100_000
+    assert R.MAX_FILE_BYTES >= 1024
+
+
+def test_the_index_finds_a_symbol_across_repos():
+    """The whole point: a symbol changed in one repo, found in another.
+
+    Stage 4 depends on this exact shape, so it is asserted here rather than assumed.
+    """
+    from app import repo_index as R
+
+    producer = R.build("acme/models", [
+        ("src/user.py", "class User:\n    phone_number: str\n"),
+    ])
+    consumer = R.build("acme/checkout", [
+        ("src/pay.py", "from src.user import User\n\ndef pay(u: User):\n"
+                       "    return u.phone_number\n"),
+        ("src/unrelated.py", "def totals():\n    return 1\n"),
+    ])
+
+    assert [f.path for f in producer.definers("User")] == ["src/user.py"]
+    refs = [f.path for f in consumer.referencers("phone_number")]
+    assert refs == ["src/pay.py"], refs
+    assert "src/unrelated.py" not in refs, (
+        "an unrelated file was reported as a consumer, which is the false positive that "
+        "would make the demo untrustworthy")
+
+    # AST hits sort before regex hits, so ranking sees the confident ones first.
+    mixed = R.build("acme/mixed", [
+        ("a.ts", "export const User = 1\n"),
+        ("b.py", "class User: pass\n"),
+    ])
+    methods = [f.method for f in mixed.definers("User")]
+    assert methods and methods[0] == "ast", methods
+
+
+def test_fix_capability_is_a_property_of_the_model_not_the_server():
+    """Same Ollama, same wire format, opposite trust -- decided by the loaded model.
+
+    `Provider.fix_capable` used to be a provider-level flag carrying model-level
+    reasoning: the ollama note read "qwen2.5-coder:3b ... NOT as a fix engine", which is
+    a fact about a MODEL attached to a SERVER. Measured 2026-08-26, on one host:
+
+        qwen2.5-coder:3b        deleted the function parameter -> breaks every caller
+        deepseek-coder-v2:16b   BYTE-IDENTICAL wrong answer, at 5x the size
+        qwen3-coder:30b         returned the file UNCHANGED, matching the codemod's
+                                refusal. Confirmed from chain provenance that the model
+                                answered rather than the template falling back.
+
+    The flag was wrong in the DANGEROUS direction the moment a better model was
+    configured: reporting a capable backend as incapable is safe, the reverse is not.
+    """
+    import os as _os
+
+    from app import llm_chain as C
+    from app.llm_providers import (MODEL_MEASUREMENTS, RECOMMENDED_FIX_MODEL,
+                                   RECOMMENDED_PROSE_MODEL, model_is_fix_capable)
+
+    assert MODEL_MEASUREMENTS, "no models measured -- every assertion here is vacuous"
+
+    # Every entry must carry evidence, and a capable one must say what it PASSED.
+    for name, facts in MODEL_MEASUREMENTS.items():
+        assert facts.evidence.strip(), f"{name} has no evidence for its rating"
+        assert facts.gen > 0 and facts.prompt > 0, f"{name} has no measured throughput"
+        if facts.fix_capable:
+            assert len(facts.evidence) > 60, (
+                f"{name} is trusted to write code on a one-line justification; say "
+                f"what it was probed with and what it did")
+
+    # An unmeasured model gets no benefit of the doubt.
+    assert not model_is_fix_capable("some-model-nobody-measured")
+    assert not model_is_fix_capable("")
+
+    # The recommendations must exist in the table and be self-consistent.
+    assert model_is_fix_capable(RECOMMENDED_FIX_MODEL), (
+        f"{RECOMMENDED_FIX_MODEL} is recommended for fixes but not marked capable")
+    assert RECOMMENDED_PROSE_MODEL in MODEL_MEASUREMENTS
+    # Prose is allowed to use a model fixes may not -- that asymmetry is the point.
+    prose_facts = MODEL_MEASUREMENTS[RECOMMENDED_PROSE_MODEL]
+    fix_facts = MODEL_MEASUREMENTS[RECOMMENDED_FIX_MODEL]
+    assert prose_facts.prompt > fix_facts.prompt, (
+        "the prose model is recommended for ingesting context faster; if that is no "
+        "longer true the recommendation has no basis")
+
+    # And the chain must actually consult the model. Env-isolated, because chain
+    # composition depends on configuration and a test reading the ambient shell
+    # asserts whatever the developer happens to have exported.
+    saved = {k: _os.environ.get(k) for k in
+             ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN")}
+    try:
+        _os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:11434"
+        _os.environ["ANTHROPIC_AUTH_TOKEN"] = "test-credential"
+
+        _os.environ["ANTHROPIC_MODEL"] = RECOMMENDED_FIX_MODEL
+        assert "ollama" in [p.name for p in C.fix_chain()], (
+            "the recommended fix model does not put the local backend in the fix chain")
+
+        incapable = next(m for m, f in MODEL_MEASUREMENTS.items() if not f.fix_capable)
+        _os.environ["ANTHROPIC_MODEL"] = incapable
+        assert "ollama" not in [p.name for p in C.fix_chain()], (
+            f"{incapable} is measured as unfit to write code, yet the local backend is "
+            f"still in the fix chain -- capability is not being read from the model")
+        assert "ollama" in [p.name for p in C.prose_chain()], (
+            "a model unfit for code is still fit for prose; excluding it from prose is "
+            "stricter than the measurement supports")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+def test_the_local_3b_model_is_not_in_the_fix_chain():
+    """Measured: it produces compiling-but-wrong code on the shapes that matter.
+
+    On the three shapes the deterministic codemod REFUSES -- the only shapes where an
+    LLM adds anything -- qwen2.5-coder:3b got two of three wrong on 2026-08-26:
+
+        function parameter  export function dial(): void { console.log(); }
+        aliased then used   export function label(user) { return ''; }
+
+    Both are brace-balanced with the target removed, so the diff contract passes them
+    and tsc compiles them. NO GATE HERE CAN SEE THE DIFFERENCE, which is exactly why
+    the exclusion has to be a rule rather than a review habit: a fallback to this model
+    would degrade fixes invisibly while still reporting `[llm]`.
+
+    Prose is the other way round -- a weak model writing a bad PR description is
+    visible to whoever reads it and cannot break a build -- so prose_chain() is wider
+    on purpose, and this pins the asymmetry.
+    """
+    from app import llm_chain as C
+    from app.llm_providers import PROVIDERS
+
+    # Credentials injected: the chains are credential-filtered, so without this the
+    # composition would depend on the developer's shell rather than on the rule.
+    with _with_provider_credentials():
+        fix_names = {p.name for p in C.fix_chain()}
+        prose_names = {p.name for p in C.prose_chain()}
+
+    assert PROVIDERS["ollama"].fix_capable is False, (
+        "ollama is marked fix_capable; the measurement above says otherwise")
+    assert "ollama" not in fix_names, (
+        f"the local 3B model is in the FIX chain: {sorted(fix_names)}")
+    assert "ollama" in prose_names, (
+        "ollama is excluded from prose too, which is stricter than the measurement "
+        "supports -- bad prose is visible, bad code is not")
+    assert fix_names, "the fix chain is empty, so no fix could ever be generated"
+    assert fix_names < prose_names, (
+        f"prose must be a strict superset of fix; fix={sorted(fix_names)} "
+        f"prose={sorted(prose_names)}")
+
+    # Every excluded provider must carry the reason, or the exclusion is folklore.
+    for prov in PROVIDERS.values():
+        if not prov.fix_capable:
+            assert "MEASURED" in prov.note, (
+                f"{prov.name} is excluded from the fix chain with no measurement "
+                f"recorded in its note")
+
+
+def test_the_llm_budget_is_reset_once_per_push():
+    """A budget nobody resets closes every provider and then reports them closed.
+
+    The ceiling is module-level because its scope is the PUSH while
+    _generate_with_llm runs once per CONSUMER FILE -- a budget created inside the
+    generator would reset on every call and cap nothing. That makes the reset call a
+    wiring requirement, and a wiring requirement with no gate is how the learning
+    loop's author-fetch ended up built and unreachable.
+    """
+    import ast
+
+    from app import fix_generator as F
+    from app.llm_chain import Budget
+
+    assert hasattr(F, "reset_llm_budget"), "no reset function exists"
+
+    # It must actually be called from the per-push entry, not merely defined.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tree = ast.parse(open(os.path.join(root, "app", "webhook.py"),
+                          encoding="utf-8").read())
+    callers = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            name = (getattr(getattr(node, "func", None), "id", "")
+                    or getattr(getattr(node, "func", None), "attr", ""))
+            if isinstance(node, ast.Call) and name.endswith("reset_llm_budget"):
+                callers.add(fn.name)
+    assert callers, (
+        "reset_llm_budget is defined but never called from app/webhook.py, so the "
+        "per-provider ceiling would persist across every push for the life of the "
+        "process")
+
+    # Budget semantics: a rate-limited provider is CLOSED, not merely counted.
+    b = Budget(per_provider=3)
+    assert b.allows("x")
+    b.record("x", "ok")
+    assert b.allows("x"), "one successful call must not exhaust a budget of 3"
+    b.record("x", "rate_limited")
+    assert not b.allows("x"), (
+        "a rate-limited provider must be closed for the rest of the run -- asking "
+        "again is a question already answered")
+    assert "rate limited" in b.why_skipped("x")
+
+    b2 = Budget(per_provider=2)
+    b2.record("y", "ok")
+    b2.record("y", "ok")
+    assert not b2.allows("y"), "the numeric ceiling is not enforced"
+    assert "budget" in b2.why_skipped("y")
+
+
+def test_provider_registry_never_claims_an_unreachable_backend():
+    """`usable_today` must be derived from what can speak the format, not declared.
+
+    The registry exists because the FORMAT TRAP in llm_config was read as "every free
+    provider needs a second client first", and that turned out to be false: OpenRouter
+    serves a native Anthropic Messages endpoint, so it is reachable by the client that
+    already exists. Measured 2026-08-26 by error-envelope fingerprint and confirmed
+    against OpenRouter's API reference.
+
+    The risk in writing that down is a catalogue that drifts into wishful thinking --
+    a provider marked usable because someone hopes it is. So `usable_today` reads
+    FORMAT_CLIENTS, and this pins the consequences in both directions.
+    """
+    from app import llm_providers as P
+
+    assert P.PROVIDERS, "empty registry -- every assertion below would be vacuous"
+
+    # Every usable provider's format has a named client.
+    for prov in P.usable():
+        assert prov.wire_format in P.FORMAT_CLIENTS, (
+            f"{prov.name} reports usable_today but no client speaks "
+            f"{prov.wire_format!r}")
+
+    # Every provider whose format has NO client must report unusable. This is the
+    # direction that would let the catalogue lie.
+    for prov in P.PROVIDERS.values():
+        if prov.wire_format not in P.FORMAT_CLIENTS:
+            assert not prov.usable_today, (
+                f"{prov.name} speaks {prov.wire_format!r}, which no client here "
+                f"implements, yet it reports usable_today")
+
+    # The measured finding, asserted so a regression is loud: at least one FREE
+    # provider is reachable with the client that already exists.
+    free_usable = {p.name for p in P.free_and_usable()}
+    assert free_usable, (
+        "no free provider is reachable today. If that is now true, the OpenRouter "
+        "Anthropic-format endpoint has gone away and the plan that depends on it "
+        "needs revisiting")
+    assert "openrouter" in free_usable, (
+        f"openrouter is the measured free Anthropic-format backend; got {free_usable}")
+
+    # And the ones genuinely blocked are blocked for the stated reason.
+    blocked = {p.name for p in P.blocked_on_a_client()}
+    assert blocked == {"groq", "cerebras"}, (
+        f"expected groq and cerebras to be the OpenAI-format holdouts, got {blocked}")
+
+    # Every note must say what was measured -- a catalogue of unsourced claims is how
+    # the pipeline census and the '17.5%' number went wrong.
+    for prov in P.PROVIDERS.values():
+        assert prov.note.strip(), f"{prov.name} has no note"
+        assert any(w in prov.note for w in ("MEASURED", "UNVERIFIED", "default")), (
+            f"{prov.name}'s note does not say whether its claims were measured, "
+            f"documented, or unverified: {prov.note[:60]}")
+
+
 def test_llm_key_is_resolved_only_through_llm_config():
     """Two sites GATED on os.environ["ANTHROPIC_API_KEY"] while the call they
     guarded built its client from llm_config.api_key(). An LLM-gateway setup
@@ -1721,23 +3893,88 @@ def test_llm_key_is_resolved_only_through_llm_config():
     proxy: 0 requests arrived until the gates were fixed.
 
     Pins the STRUCTURE, not the behaviour: any new direct read reintroduces the
-    same silent divergence, and no unit test of either function would fail."""
+    same silent divergence, and no unit test of either function would fail.
+
+    GENERALISED from the single literal ANTHROPIC_API_KEY. The scan is now over every
+    credential env var any provider in the registry declares, because the failure has
+    nothing to do with which provider it is: a module that reads a key directly
+    bypasses whatever fallback llm_config applies, and gates closed while the caller
+    believed the LLM had answered. A second provider family (GROQ_API_KEY,
+    CEREBRAS_API_KEY) read directly would have been invisible to the old scan.
+
+    AND IT IS AN AST SCAN, NOT A TEXT SCAN, for two measured reasons.
+
+    The text version matched `environ.get("ANTHROPIC_API_KEY")` exactly, so the
+    TWO-ARGUMENT form in webhook.py's /test-llm -- `environ.get("ANTHROPIC_API_KEY",
+    "")` -- slipped past it for as long as it existed. That endpoint gated on the wrong
+    variable, ignored ANTHROPIC_BASE_URL and ANTHROPIC_MODEL, and reported a hardcoded
+    model name, so the one diagnostic for "does my LLM config work" tested a different
+    backend from the fix path.
+
+    Then, once the real read was fixed, the text scan flagged the DOCSTRING that quotes
+    the old line as documentation. Rewording the prose to dodge the matcher is the
+    wrong repair: the same "a matcher that cannot tell code from prose" hazard was hit
+    three times in the codemod fixtures, and the lesson each time was to make the
+    matcher syntax-aware rather than to censor the writing.
+    """
+    import ast
     import os as _os
+
     root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     app = _os.path.join(root, "app")
+
+    from app.ast_compat import str_literal
+    from app.llm_providers import PROVIDERS
+    creds = {p.key_env for p in PROVIDERS.values() if p.key_env}
+    creds.add("ANTHROPIC_API_KEY")      # the original case, kept explicit
+    creds.add("ANTHROPIC_AUTH_TOKEN")   # the token llm_config prefers
+    assert creds, "no credential env vars to scan for -- would pass vacuously"
+
+    def _env_reads(tree):
+        """Every env var name this AST actually READS, ignoring strings and comments."""
+        found = set()
+        for node in ast.walk(tree):
+            # os.environ["X"]
+            if isinstance(node, ast.Subscript):
+                target = node.value
+                if isinstance(target, ast.Attribute) and target.attr == "environ":
+                    name = str_literal(getattr(node, "slice", None)) or str_literal(
+                        getattr(getattr(node, "slice", None), "value", None))
+                    if name:
+                        found.add(name)
+                continue
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            fn = node.func
+            # os.environ.get("X") / environ.get("X") / os.getenv("X") / getenv("X")
+            attr = getattr(fn, "attr", None) or getattr(fn, "id", None)
+            if attr not in ("get", "getenv"):
+                continue
+            if attr == "get":
+                owner = getattr(fn, "value", None)
+                owner_name = (getattr(owner, "attr", None)
+                              or getattr(owner, "id", None))
+                if owner_name != "environ":
+                    continue
+            name = str_literal(node.args[0])
+            if name:
+                found.add(name)
+        return found
+
     offenders = []
     for name in sorted(_os.listdir(app)):
         if not name.endswith(".py") or name == "llm_config.py":
             continue
-        src = open(_os.path.join(app, name)).read()
-        for pat in ('environ.get("ANTHROPIC_API_KEY")',
-                    'environ["ANTHROPIC_API_KEY"]',
-                    'getenv("ANTHROPIC_API_KEY")'):
-            if pat in src:
-                offenders.append(f"{name}: {pat}")
+        path = _os.path.join(app, name)
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read())
+        except SyntaxError as exc:
+            raise AssertionError(f"app/{name} does not parse: {exc}") from exc
+        for var in sorted(_env_reads(tree) & creds):
+            offenders.append(f"{name}: {var}")
     assert not offenders, (
-        "ANTHROPIC_API_KEY read outside llm_config -- use llm_config.api_key() "
-        f"so ANTHROPIC_AUTH_TOKEN is honoured: {offenders}"
+        "provider credential read outside llm_config -- route it through "
+        f"llm_config so the token fallback is honoured: {offenders}"
     )
 
 
@@ -7103,20 +9340,38 @@ def test_the_llm_path_is_declared_in_the_reachability_gate():
     assert hasattr(R, "FUNCTION_LAYERS"), (
         "the reachability gate has no FUNCTION_LAYERS table, so a safety-relevant "
         "branch inside an imported module cannot be declared at all")
-    key = ("fix_generator", "_generate_with_llm")
-    assert key in R.FUNCTION_LAYERS, (
-        f"{key} is not declared. The LLM branch is safety-relevant: it is the only "
-        f"path on which customer source leaves the machine.")
-    entry = R.FUNCTION_LAYERS[key]
-    assert entry.get("role"), "the declaration has no stated role"
-    if entry.get("reachable"):
-        assert not entry.get("consequence"), (
-            "a reachable layer must not still carry a consequence for being "
-            "unreachable -- delete it and say what is true now")
-    else:
-        assert entry.get("consequence"), (
-            "an unreachable layer must name its cost, or the declaration is just "
-            "a note")
+
+    # DERIVED FROM THE REGISTRY, not pinned to one name. Every wire format that
+    # claims a client must name a function, and every such function is on the path
+    # where customer source leaves the machine -- so every one must be declared.
+    #
+    # The original asserted the single literal ("fix_generator",
+    # "_generate_with_llm"). Measured consequence: adding a second client
+    # (_generate_with_openai for Groq/Cerebras, both OpenAI-format) would leave this
+    # gate GREEN while the new path went undeclared -- one of four gates that all
+    # keyed on that one name and would all have passed without asserting anything
+    # about it. Deriving from FORMAT_CLIENTS means declaring a format without
+    # declaring its function fails here.
+    from app.llm_providers import FORMAT_CLIENTS
+
+    assert FORMAT_CLIENTS, (
+        "no wire format claims a client, so this check would pass over an empty set")
+
+    for fmt, key in sorted(FORMAT_CLIENTS.items()):
+        assert key in R.FUNCTION_LAYERS, (
+            f"wire format {fmt!r} claims client {key}, which is not declared in the "
+            f"reachability gate. The LLM path is safety-relevant: it is the only "
+            f"path on which customer source leaves the machine.")
+        entry = R.FUNCTION_LAYERS[key]
+        assert entry.get("role"), f"{key} is declared with no stated role"
+        if entry.get("reachable"):
+            assert not entry.get("consequence"), (
+                f"{key} is a reachable layer but still carries a consequence for "
+                f"being unreachable -- delete it and say what is true now")
+        else:
+            assert entry.get("consequence"), (
+                f"{key} is declared unreachable and must name its cost, or the "
+                f"declaration is just a note")
 
 
 def test_a_keyless_self_hosted_backend_can_actually_construct_a_client():
@@ -8489,8 +10744,9 @@ def test_the_commit_authors_are_actually_fetched_not_read_from_the_payload():
     credited as a clean merge. Loosening the count while the author check was
     dead would have made the system LESS safe, not more.
     """
-    import ast
     import inspect
+    import ast
+
     import pathlib
 
     from app import webhook

@@ -112,6 +112,52 @@ FIXED: dict[tuple, str] = {
 
 # (file, function, kind, caught, ordinal) -> (bucket, reason)
 TRIAGE: dict[tuple, tuple] = {
+    ("webhook.py", "_granted_repos", "swallowed_except", "AppAuthError", 0): (
+        LEGITIMATE,
+        "A token failure while listing an installation's repositories returns [], and "
+        "the CALLER states that the grant list was unavailable rather than treating "
+        "[] as 'only the indexed repos exist'. This matters in one direction only: "
+        "the grant list exists to name repos that were GRANTED but never INDEXED, so "
+        "an empty list UNDERSTATES what is unsearchable. It can never invent a repo "
+        "or hide a real consumer -- the candidate list comes from the stored indexes, "
+        "not from here. Raising would abort a pull-request analysis whose "
+        "deterministic part has already succeeded."),
+    ("webhook.py", "_granted_repos", "silent_empty_return", "", 0): (
+        LEGITIMATE,
+        "Returning [] when there is no installation id or the app is not configured. "
+        "That is the ordinary local/CLI state, not a failure -- there is no GitHub "
+        "installation whose grants could be listed. The caller states that the grant "
+        "list was unavailable, so an empty list is never read as 'every repo is "
+        "indexed'."),
+    ("repo_index.py", "_data_dir", "swallowed_except", "OSError", 0): (
+        LEGITIMATE,
+        "Walking the candidate data directories in order, exactly as rag_store and "
+        "pr_ledger do. An unwritable candidate is not an error, it is the reason the "
+        "list has more than one entry -- /app/data exists in the container and not on "
+        "a dev desktop. The loop does NOT end in silence: if every candidate fails it "
+        "raises RuntimeError, so 'nowhere to write the index' is loud while 'this "
+        "particular path is not it' is not."),
+    ("repo_index.py", "load", "swallowed_except", "(json.JSONDecodeError, OSError)", 0): (
+        LEGITIMATE,
+        "A corrupt or unreadable stored index returns None, which the caller reads as "
+        "'not indexed yet' and re-indexes. Raising here would crash the webhook that "
+        "is trying to answer a pull request, over a cache file. Crucially None is NOT "
+        "an empty index: an empty RepoIndex would make a broken file look like a repo "
+        "with no symbols, and the cross-repo search would then report 'no consumers' "
+        "for a repo it never actually read."),
+    ("repo_index.py", "load", "silent_empty_return", "", 0): (
+        LEGITIMATE,
+        "Returning None when the index file does not exist. This is the ordinary "
+        "first-run state, not a failure -- a repo is unindexed until installation "
+        "indexes it. The caller distinguishes None (re-index) from an empty RepoIndex "
+        "(genuinely no symbols), which is the distinction that matters."),
+    ("repo_index.py", "indexed_repos", "swallowed_except", "OSError", 0): (
+        LEGITIMATE,
+        "Listing the data directory to enumerate stored indexes. If the directory "
+        "cannot be listed there are no indexes to report, and returning [] is the "
+        "same answer as an empty directory. Individual corrupt files are already "
+        "dropped by load() returning None, so a partial list is a list of the indexes "
+        "that are actually usable rather than a claim that the rest are clean."),
 
     # ------------------------------------------------------------ NEEDS_SIGNAL
     ("api_watcher.py", "_fetch_spec", "swallowed_except", "Exception", 0): (

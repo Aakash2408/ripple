@@ -332,7 +332,6 @@ def _generate_with_llm(
     # empty credential even against a server that authenticates nothing, so a
     # keyless self-hosted model failed here AFTER is_configured() had opened the
     # gate -- and fell silently through to the template.
-    client = anthropic.Anthropic(api_key=_llm_client_key(), base_url=_llm_base())
 
     prompt = f"""You are a code assistant. An API has a breaking change. Fix the consumer code.
 
@@ -357,37 +356,121 @@ FINALLY:
 
 FIXED CODE:"""
 
-    try:
+    from . import llm_chain
+
+    def _ask(provider) -> str:
+        """One request to ONE provider, using THAT provider's endpoint and key.
+
+        The first draft read llm_config.base_url() for every entry, so a three-name
+        chain was really one endpoint called three times and the answer was credited
+        to whichever name came first -- measured: a local Ollama reply reported as
+        `answered by openrouter` with no OpenRouter key set. Each entry now carries
+        its own connection details, and llm_config remains the only module that reads
+        a credential.
+        """
+        from .llm_config import credential_for
+        client = anthropic.Anthropic(
+            api_key=credential_for(provider.key_env) or "not-needed",
+            base_url=provider.base_url,
+        )
         response = client.messages.create(
             model=_llm_model(),
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
-        
-        fixed_code = response.content[0].text.strip()
+        return response.content[0].text
 
-        # Strip markdown code fences if present
-        if fixed_code.startswith("```"):
-            lines = fixed_code.split("\n")
-            # Remove first and last lines (fences)
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            fixed_code = "\n".join(lines)
+    def _ask_configured(_provider) -> str:
+        """The explicitly configured backend, whatever it is.
 
-        # The trailing newline is restored centrally in generate_fix(), where
-        # both generator paths converge -- see the note there.
+        ANTHROPIC_BASE_URL pointing at a custom gateway is the pre-existing
+        single-backend contract and must keep working, so it is tried FIRST and named
+        by backend_label() rather than borrowing a registry provider's name.
+        """
+        client = anthropic.Anthropic(api_key=_llm_client_key(), base_url=_llm_base())
+        response = client.messages.create(
+            model=_llm_model(),
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text
 
-        # The explanation is what a human reads in the PR body, so it must describe
-        # what was actually DONE. It was hardcoded to "Added required field" for
-        # every operation -- the same defect as the prompt, and visible to customers:
-        # a removal PR announced itself as an addition.
-        explanation = _llm_explanation(breaking_change)
-        return fixed_code, explanation
-        
-    except Exception as e:
-        print(f"  ⚠️  LLM error: {e}. Using template fix.")
-        return _generate_with_template(original_code, consumer, breaking_change)
+    chain = llm_chain.fix_chain()
+    budget = _llm_budget()
+    result = None
+
+    from .llm_config import backend_label as _label, base_url as _base_raw
+    import os as _os
+    if _os.environ.get("ANTHROPIC_BASE_URL"):
+        # Try the configured backend first, under its own honest label.
+        configured = llm_chain.Configured(name=_label(), base_url=_base_raw())
+        result = llm_chain.run(_ask_configured, chain=[configured], budget=budget)
+
+    if result is None or not result.ok:
+        chained = llm_chain.run(_ask, chain=chain, budget=budget)
+        result = llm_chain.merge(result, chained)
+
+    if not result.ok:
+        # STATED, not silent. The old path printed "LLM error: ... Using template fix"
+        # to stdout and returned the template, so afterwards a rate-limited model and
+        # a never-configured one were indistinguishable -- and the reason existed
+        # nowhere a reader would look.
+        #
+        # The template fix is still returned, and its provenance is still `template`,
+        # which is TRUE. What changes is that the explanation now carries why the LLM
+        # did not answer, so the PR body says it and _record_pr_provenance still
+        # derives the honest source from the prefix.
+        fixed, expl = _generate_with_template(original_code, consumer, breaking_change)
+        return fixed, f"{expl}\nLLM NOT USED: {result.stated_outcome()}"
+
+    fixed_code = result.text.strip()
+
+    # Strip markdown code fences if present
+    if fixed_code.startswith("```"):
+        lines = fixed_code.split("\n")
+        # Remove first and last lines (fences)
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        fixed_code = "\n".join(lines)
+
+    # The trailing newline is restored centrally in generate_fix(), where
+    # both generator paths converge -- see the note there.
+
+    # The explanation is what a human reads in the PR body, so it must describe
+    # what was actually DONE. It was hardcoded to "Added required field" for
+    # every operation -- the same defect as the prompt, and visible to customers:
+    # a removal PR announced itself as an addition.
+    #
+    # And it now names WHICH backend answered. With a chain, "[llm]" alone would
+    # hide that a fallback provider produced the patch -- the same misreporting
+    # llm_config.backend_label() exists to prevent for the single-backend case.
+    explanation = _llm_explanation(breaking_change)
+    return fixed_code, f"{explanation}\n{result.stated_outcome()}"
+
+
+#: Per-push call ceiling, shared by every consumer file in one push.
+#:
+#: Module-level because the scope that matters is the PUSH and _generate_with_llm is
+#: called once per consumer file, so a budget created inside it would reset on every
+#: call and cap nothing. reset_llm_budget() is called by the webhook at push entry;
+#: a gate asserts that, because a budget nobody resets slowly closes every provider
+#: and then reports them closed forever.
+_LLM_BUDGET = None
+
+
+def _llm_budget():
+    global _LLM_BUDGET
+    if _LLM_BUDGET is None:
+        from .llm_chain import Budget
+        _LLM_BUDGET = Budget()
+    return _LLM_BUDGET
+
+
+def reset_llm_budget() -> None:
+    """Start a fresh per-provider budget. Called once per push."""
+    global _LLM_BUDGET
+    _LLM_BUDGET = None
 
 
 def _generate_with_template(

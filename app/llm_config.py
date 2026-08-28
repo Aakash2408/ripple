@@ -54,6 +54,28 @@ def api_key() -> str:
             or os.environ.get("ANTHROPIC_API_KEY", ""))
 
 
+def credential_for(env_name: str) -> str:
+    """The credential for ONE named provider, resolved here and nowhere else.
+
+    Added for the provider chain. Every chain entry needs its OWN key, and the
+    credential-scan gate forbids reading one anywhere but this module -- which is
+    working as intended: the first draft of the chain skipped this and reused
+    base_url() for every provider, so each entry hit the SAME endpoint and the result
+    was attributed to whichever provider happened to be first. A run against a local
+    Ollama reported `answered by openrouter` with no OpenRouter key present.
+
+    That is the same misreporting backend_label() exists to prevent, reached by a
+    different route: not a mislabelled model, but a correctly-labelled model that was
+    never called.
+
+    An empty name means keyless (a self-hosted endpoint that authenticates nothing),
+    which is a valid configuration -- see is_self_hosted().
+    """
+    if not env_name:
+        return ""
+    return os.environ.get(env_name, "")
+
+
 def base_url() -> str:
     return os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") or ANTHROPIC_DEFAULT_BASE
 
