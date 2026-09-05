@@ -3281,6 +3281,229 @@ def test_installing_indexes_repository_paths_without_the_archive_wrapper():
         "up to MAX_REPOS times in a row")
 
 
+class _FakeForkAPI:
+    """Stands in for the GitHub API across the fork/branch/PR sequence."""
+
+    def __init__(self, *, login="ripplebot", upstream_info=None, fork_exists=False,
+                 fork_ready_after=0, open_prs=None, fail_pr_list=False,
+                 upstream_sha="upstreamsha1234", fail_ref=False, fail_commit=False,
+                 fail_pr=False):
+        self.calls = []
+        self.login = login
+        self.upstream_info = upstream_info if upstream_info is not None else {
+            "default_branch": "main", "archived": False}
+        self.fork_exists = fork_exists
+        self.fork_ready_after = fork_ready_after   # polls before the fork answers
+        self._polls = 0
+        self.open_prs = list(open_prs or [])
+        self.fail_pr_list = fail_pr_list
+        self.upstream_sha = upstream_sha
+        self.fail_ref = fail_ref
+        self.fail_commit = fail_commit
+        self.fail_pr = fail_pr
+        self.created_refs = []
+        self.committed = []
+        self.pr_payload = None
+
+    def __call__(self, method, path, token, data=None, **kw):
+        self.calls.append((method, path, data))
+
+        if method == "GET" and path == "/user":
+            return {"login": self.login}
+        if method == "GET" and path.startswith("/repos/") and path.count("/") == 3:
+            owner = path.split("/")[2]
+            if owner == self.login:                     # the fork
+                if self.fork_exists:
+                    return {"default_branch": "main"}
+                if self._polls >= self.fork_ready_after:
+                    return {"default_branch": "main"}
+                self._polls += 1
+                return {"error": "404 Not Found"}
+            return dict(self.upstream_info)              # the upstream
+        if method == "POST" and path.endswith("/forks"):
+            return {"full_name": f"{self.login}/repo"}
+        if method == "GET" and "/pulls?state=open" in path:
+            return {"error": "boom"} if self.fail_pr_list else list(self.open_prs)
+        if method == "GET" and "/git/ref/heads/" in path:
+            return ({"error": "404"} if not self.upstream_sha
+                    else {"object": {"sha": self.upstream_sha}})
+        if method == "POST" and path.endswith("/git/refs"):
+            if self.fail_ref:
+                return {"error": "422 Reference already exists"}
+            self.created_refs.append((path, data))
+            return {"ref": data["ref"]}
+        if method == "GET" and "/contents/" in path:
+            return {"error": "404 Not Found"}            # new file
+        if method == "PUT" and "/contents/" in path:
+            if self.fail_commit:
+                return {"error": "403 Forbidden"}
+            self.committed.append(path)
+            return {"commit": {"sha": "newcommit"}}
+        if method == "POST" and path.endswith("/pulls"):
+            if self.fail_pr:
+                return {"error": "422 Validation Failed"}
+            self.pr_payload = data
+            return {"number": 7, "html_url": f"https://github.com/{path.split('/')[2]}"
+                                             f"/{path.split('/')[3]}/pull/7"}
+        return {"error": f"unexpected {method} {path}"}
+
+
+def test_a_fork_branch_is_cut_from_the_upstream_sha_not_the_fork_default():
+    """The bug that gets a bot blocked.
+
+    If the fork already exists and is 200 commits behind, branching from the FORK's
+    default branch produces a pull request whose diff contains every intervening
+    upstream commit -- hundreds of unrelated files. The branch must be cut from the
+    UPSTREAM head sha, which is reachable inside the fork because a fork shares its
+    object store with the parent.
+    """
+    from app import fork_pr as F
+
+    gh = _FakeForkAPI(fork_exists=True, upstream_sha="deadbeefcafe")
+    res = F.open_fork_pr("acme/upstream", "ripple/drop-x", "fix: drop x", "body",
+                         [("src/pay.py", "Y29udGVudA==")], "tok", api=gh,
+                         sleep=lambda _s: None)
+
+    assert res.opened, res.refusals
+    assert gh.created_refs, "no branch was created"
+    _path, payload = gh.created_refs[0]
+    assert payload["sha"] == "deadbeefcafe", (
+        f"the branch was cut from {payload['sha']!r}, not the upstream head -- a stale "
+        f"fork would put every intervening upstream commit in the diff")
+    # The fork of acme/upstream is ripplebot/upstream -- the NAME is inherited, the
+    # owner is the token's account.
+    assert _path == "/repos/ripplebot/upstream/git/refs", (
+        f"the branch was created on the wrong repository: {_path}")
+
+
+def test_the_pull_request_crosses_the_fork_boundary_and_targets_the_upstream():
+    """`head` must be `owner:branch`, and the PR must be POSTed to the UPSTREAM.
+
+    Posting to the fork opens a pull request from the fork to itself, which nobody
+    ever sees. A bare branch name in `head` is a 422 across forks.
+    """
+    from app import fork_pr as F
+
+    gh = _FakeForkAPI(fork_exists=True)
+    res = F.open_fork_pr("acme/upstream", "ripple/drop-x", "fix: drop x", "body",
+                         [("src/pay.py", "Y29udGVudA==")], "tok", api=gh,
+                         sleep=lambda _s: None)
+
+    assert res.opened, res.refusals
+    assert gh.pr_payload["head"] == "ripplebot:ripple/drop-x", gh.pr_payload
+    assert gh.pr_payload["base"] == "main", gh.pr_payload
+
+    pr_posts = [p for m, p, _d in gh.calls if m == "POST" and p.endswith("/pulls")]
+    assert pr_posts == ["/repos/acme/upstream/pulls"], (
+        f"the pull request was not opened against the upstream: {pr_posts}")
+
+    # And the commit went to the FORK, never the upstream.
+    assert all("/repos/ripplebot/" in p for p in gh.committed), gh.committed
+
+
+def test_an_async_fork_is_waited_for_and_refused_if_it_never_appears():
+    """`POST /forks` returns 202 -- queued, not done.
+
+    Creating a ref against a fork that has not materialised fails in a way that reads
+    like a bad sha. And if it never appears, that must be a stated refusal rather than
+    a confusing downstream error.
+    """
+    from app import fork_pr as F
+
+    slept = []
+    gh = _FakeForkAPI(fork_exists=False, fork_ready_after=3)
+    fork = F.ensure_fork("acme/upstream", "tok", api=gh, sleep=slept.append)
+    assert fork.usable, fork.refusals
+    assert fork.created and fork.ready
+    assert slept, "the fork was assumed ready immediately -- no polling happened"
+
+    never = _FakeForkAPI(fork_exists=False, fork_ready_after=10**6)
+    out = F.ensure_fork("acme/upstream", "tok", api=never, sleep=lambda _s: None)
+    assert not out.usable
+    assert any("UNKNOWN" in r for r in out.refusals), out.refusals
+    assert any("nothing was pushed" in r for r in out.refusals), out.refusals
+
+
+def test_a_failed_pr_list_read_does_not_open_a_duplicate():
+    """`synchronize` fires on every push, so this runs repeatedly.
+
+    A failed read is treated as "already open" on purpose: duplicating pull requests
+    on a repository you do not own is how an integration gets banned, and it is not
+    recoverable by the person who did it.
+    """
+    from app import fork_pr as F
+
+    blind = _FakeForkAPI(fork_exists=True, fail_pr_list=True)
+    assert F.existing_pr_for_head("acme/upstream", "ripplebot:b", "tok", api=blind)
+
+    res = F.open_fork_pr("acme/upstream", "ripple/drop-x", "t", "b",
+                         [("a.py", "eA==")], "tok", api=blind, sleep=lambda _s: None)
+    assert res.already_open and not res.opened, res
+    assert not blind.committed, "content was committed despite the duplicate guard"
+
+    seen = _FakeForkAPI(fork_exists=True,
+                        open_prs=[{"head": {"label": "ripplebot:ripple/drop-x"}}])
+    again = F.open_fork_pr("acme/upstream", "ripple/drop-x", "t", "b",
+                           [("a.py", "eA==")], "tok", api=seen, sleep=lambda _s: None)
+    assert again.already_open and not again.opened, again
+
+
+def test_an_archived_upstream_is_refused_before_anything_is_forked():
+    """Discovering an archived repo after forking litters the user's account.
+
+    Also the reason the check is a refusal with a sentence rather than a bare False --
+    a 403 surfacing three calls deeper reads like a credential problem.
+    """
+    from app import fork_pr as F
+
+    gh = _FakeForkAPI(upstream_info={"default_branch": "main", "archived": True})
+    res = F.open_fork_pr("acme/dead", "ripple/x", "t", "b", [("a.py", "eA==")],
+                         "tok", api=gh, sleep=lambda _s: None)
+
+    assert not res.opened
+    assert any("archived" in r for r in res.refusals), res.refusals
+    assert not any(p.endswith("/forks") for _m, p, _d in gh.calls), (
+        "a fork was created for an archived repository")
+
+    off = _FakeForkAPI(upstream_info={"default_branch": "main",
+                                      "has_pull_requests": False})
+    res2 = F.open_fork_pr("acme/noprs", "ripple/x", "t", "b", [("a.py", "eA==")],
+                          "tok", api=off, sleep=lambda _s: None)
+    assert any("pull requests disabled" in r for r in res2.refusals), res2.refusals
+
+
+def test_no_pull_request_is_opened_when_nothing_committed():
+    """An empty pull request wastes a maintainer's attention, which is the whole
+    resource this strategy spends."""
+    from app import fork_pr as F
+
+    gh = _FakeForkAPI(fork_exists=True, fail_commit=True)
+    res = F.open_fork_pr("acme/upstream", "ripple/x", "t", "b",
+                         [("a.py", "eA==")], "tok", api=gh, sleep=lambda _s: None)
+
+    assert not res.opened
+    assert any("no file was committed" in r for r in res.refusals), res.refusals
+    assert not any(p.endswith("/pulls") and m == "POST"
+                   for m, p, _d in gh.calls), "an empty pull request was opened"
+
+
+def test_a_rejected_pull_request_says_the_branch_still_exists():
+    """The branch and commits are real even when the PR is rejected.
+
+    Reporting only "failed" would send someone hunting for a commit that is sitting
+    on their fork, and a retry would hit the already-exists path confused.
+    """
+    from app import fork_pr as F
+
+    gh = _FakeForkAPI(fork_exists=True, fail_pr=True)
+    res = F.open_fork_pr("acme/upstream", "ripple/x", "t", "b",
+                         [("a.py", "eA==")], "tok", api=gh, sleep=lambda _s: None)
+
+    assert not res.opened
+    assert any("exist on" in r and "rejected" in r for r in res.refusals), res.refusals
+    assert gh.committed, "the test did not reach the commit step"
+
+
 def test_an_approximate_match_is_never_turned_into_a_commit():
     """The bar for editing someone else's repo is higher than for mentioning it.
 

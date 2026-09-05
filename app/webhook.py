@@ -71,6 +71,7 @@ from .github_app_auth import (
 from .consumer_finder import ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from . import follow_on as _follow_on
+from . import fork_pr as _fork_pr
 from . import impact as _impact
 from . import review_comments as _review_comments
 from . import repo_index as _repo_index
@@ -2700,6 +2701,15 @@ async def _handle_pr_opened(payload: dict, pr: dict) -> dict:
     review = _post_review_comments(repo, number, head_sha, runs, token)
     follow_ons = _plan_follow_on_prs(repo, number, runs)
 
+    # Execute follow-on PRs when enabled. This is the highest-impact action in the
+    # pipeline — opening changes in repos the author does not own — so it is gated
+    # behind an explicit opt-in. RIPPLE_EXECUTE_FOLLOW_ONS=1 enables it; any other
+    # value (or absent) plans without executing.
+    follow_on_results = {}
+    if os.environ.get("RIPPLE_EXECUTE_FOLLOW_ONS") == "1" and follow_ons.get("proposals"):
+        follow_on_results = _execute_follow_on_prs(
+            follow_ons, repo, number, runs, token)
+
     result = {
         "status": "analysed",
         "repo": repo, "pr": number, "action": action,
@@ -2710,6 +2720,7 @@ async def _handle_pr_opened(payload: dict, pr: dict) -> dict:
         "unreliable": unreliable[:10],
         "review": review,
         "follow_ons": follow_ons,
+        "follow_on_results": follow_on_results,
     }
     _log_activity("pr_analysis_finished", {
         k: v for k, v in result.items() if k != "runs"})
@@ -2784,6 +2795,170 @@ def _plan_follow_on_prs(repo, number, runs) -> dict:
     _log_activity("follow_on_planned", {
         "repo": repo, "pr": number,
         "proposals": len(proposals), "mentioned_only": len(mentioned)})
+    return out
+
+
+def _execute_follow_on_prs(plan: dict, repo: str, number: int, runs: list,
+                           token: str, *, dry_run: bool = False) -> dict:
+    """Open follow-on PRs planned by _plan_follow_on_prs.
+
+    For each proposal:
+      1. Fetch the consumer file content from the target repo
+      2. Generate a fix (RAG → template → LLM, same stack as the push path)
+      3. Try direct push (pr_engine pattern). If 403/404, fall back to fork_pr.
+      4. Record what happened and why
+
+    Returns a dict of opened PRs and refusals, keyed by repo.
+
+    WHY THIS IS SEPARATE FROM _plan_follow_on_prs
+    Opening a change in someone else's repository is the single largest side effect
+    in this pipeline. Keeping plan and execute separate means the plan can be returned
+    to a dry-run caller, logged, or gated behind a configuration flag without the
+    executor needing to know about any of that.
+    """
+    proposals = plan.get("proposals", [])
+    if not proposals:
+        return {"opened": [], "skipped": [], "failed": []}
+
+    # Build a symbol→change lookup from the runs so we can generate fixes.
+    _change_by_symbol = {}
+    for run in runs:
+        sym = run.get("symbol", "")
+        if sym:
+            _change_by_symbol[sym] = run
+
+    opened, skipped, failed = [], [], []
+
+    for proposal in proposals:
+        target_repo = proposal["repo"]
+        symbol = proposal["symbol"]
+        branch = proposal["branch"]
+        title = proposal["title"]
+        files = proposal.get("files", [])
+
+        # Check idempotency: is there already an open PR from our branch?
+        if _follow_on.already_open(
+                _follow_on.FollowOn(
+                    repo=target_repo, symbol=symbol, files=(),
+                    branch=branch, title=title, body=""),
+                token, api=_github_api):
+            skipped.append({"repo": target_repo, "reason": "PR already open",
+                            "branch": branch})
+            _log_activity("follow_on_skipped", {
+                "repo": target_repo, "reason": "already_open", "branch": branch})
+            continue
+
+        if dry_run:
+            skipped.append({"repo": target_repo, "reason": "dry_run",
+                            "branch": branch, "files": files})
+            continue
+
+        # Resolve the change metadata for fix generation.
+        run_data = _change_by_symbol.get(symbol, {})
+
+        # For each consumer file: fetch content, generate fix, collect edits.
+        edits = []  # [(path, base64_content)]
+        edit_details = []
+        any_fix_generated = False
+
+        for file_path in files:
+            content = _fetch_file_at_sha(target_repo, file_path, "HEAD", token)
+            if content is None:
+                failed.append({"repo": target_repo, "file": file_path,
+                               "reason": "could not fetch file content"})
+                _log_activity("follow_on_fetch_failed", {
+                    "repo": target_repo, "file": file_path})
+                continue
+
+            # Build a ConsumerMatch for the fix generator.
+            consumer = ConsumerMatch(
+                file_path=file_path,
+                line_number=0,
+                code_snippet="",
+                confidence="high",
+                match_reason="Cross-repo exact match",
+                language=_detect_lang(file_path),
+            )
+
+            # Build a minimal BreakingChange from the run data for fix generation.
+            change = BreakingChange(
+                change_type=run_data.get("change_type", "removed"),
+                field_name=symbol,
+                field_type="",
+                path=run_data.get("path", ""),
+                method=run_data.get("method", ""),
+                description=f"{symbol} was removed in {repo}#{number}",
+                severity="high",
+            )
+
+            fixed_code, explanation = _generate_fix_with_rag_fallback(
+                content, consumer, change)
+
+            if fixed_code and fixed_code != content:
+                any_fix_generated = True
+                edits.append((file_path, base64.b64encode(fixed_code.encode()).decode()))
+                edit_details.append({
+                    "file": file_path,
+                    "explanation": explanation[:120] if explanation else "",
+                })
+            else:
+                # Fix generator returned identical content — nothing to commit.
+                edit_details.append({
+                    "file": file_path,
+                    "explanation": "no change generated",
+                })
+
+        if not any_fix_generated:
+            skipped.append({"repo": target_repo, "reason": "no fixes generated",
+                            "files": files})
+            _log_activity("follow_on_no_fixes", {
+                "repo": target_repo, "symbol": symbol, "files": files})
+            continue
+
+        # Build the PR body from follow_on's plan.
+        run_impact = run_data if run_data else {"affected": []}
+        fp = _follow_on.plan_follow_ons(symbol, repo, number, run_impact)
+        body = ""
+        for f in fp.proposals:
+            if f.repo == target_repo:
+                body = f.body
+                break
+        if not body:
+            body = (f"`{symbol}` was removed in {repo}#{number}. "
+                    f"This PR updates references in this repository.\n\n"
+                    f"Opened by [Ripple](https://github.com/aakash2408/ripple).")
+
+        # Try opening the PR. Start with fork-based (the common case for cross-repo
+        # follow-ons, since we typically don't have write access to consumer repos).
+        result = _fork_pr.open_fork_pr(
+            upstream=target_repo, branch=branch, title=title, body=body,
+            edits=edits, token=token, api=_github_api)
+
+        if result.opened:
+            opened.append({
+                "repo": target_repo, "pr_number": result.number,
+                "pr_url": result.url, "branch": branch,
+                "files": [e["file"] for e in edit_details if e.get("explanation") != "no change generated"],
+            })
+            _log_activity("follow_on_opened", {
+                "repo": target_repo, "pr": result.number, "url": result.url,
+                "branch": branch, "via": "fork_pr"})
+        elif result.already_open:
+            skipped.append({"repo": target_repo, "reason": "PR already open (fork check)",
+                            "branch": branch})
+            _log_activity("follow_on_skipped", {
+                "repo": target_repo, "reason": "already_open_fork", "branch": branch})
+        else:
+            failed.append({"repo": target_repo, "branch": branch,
+                           "refusals": result.refusals})
+            _log_activity("follow_on_failed", {
+                "repo": target_repo, "branch": branch,
+                "refusals": result.refusals[:3]})
+
+    out = {"opened": opened, "skipped": skipped, "failed": failed}
+    _log_activity("follow_on_executed", {
+        "repo": repo, "pr": number,
+        "opened": len(opened), "skipped": len(skipped), "failed": len(failed)})
     return out
 
 

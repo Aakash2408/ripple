@@ -122,6 +122,7 @@ def cmd_run():
     # Parse flags
     use_llm = "--no-llm" not in sys.argv
     dry_run = "--dry-run" in sys.argv
+    execute_follow_ons = "--execute-follow-ons" in sys.argv
     
     # Step 1: Detect breaking changes
     print()
