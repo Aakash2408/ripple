@@ -96,6 +96,7 @@ from .gitlab_setup import router as gitlab_setup_router
 from .gitlab_oauth import router as gitlab_oauth_router
 from .bitbucket_oauth import router as bitbucket_oauth_router
 from .dry_run import router as dry_run_router
+from .poll_endpoint import router as poll_router
 from . import token_store
 
 app = FastAPI(title="Ripple", description="Self-maintaining APIs")
@@ -116,6 +117,7 @@ app.include_router(gitlab_setup_router)
 app.include_router(gitlab_oauth_router)
 app.include_router(bitbucket_oauth_router)
 app.include_router(dry_run_router)
+app.include_router(poll_router)
 
 # SSL context for GitHub API calls (Amazon dev desktop fix)
 from .tls import make_ssl_context, describe as _describe_tls

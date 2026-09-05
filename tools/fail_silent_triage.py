@@ -426,6 +426,33 @@ TRIAGE: dict[tuple, tuple] = {
      "(IOError, OSError)", 0): (
         LEGITIMATE,
         "Candidate store directories are tried in order until one is writable."),
+
+    # ── poll_endpoint.py ───────────────────────────────────────────────
+    ("poll_endpoint.py", "_github_get", "swallowed_except", "HTTPError", 0): (
+        LEGITIMATE,
+        "A lightweight GET helper for the poll endpoint. HTTPError (4xx/5xx) "
+        "returns None. The caller checks for None and sets error status in the "
+        "poll response, so the silence does not hide a problem from the agent."),
+    ("poll_endpoint.py", "_github_get", "swallowed_except", "Exception", 1): (
+        LEGITIMATE,
+        "Catches network-level errors (timeouts, SSL, connection resets) that "
+        "are not HTTPError. Returns None, same handling as above."),
+    ("poll_endpoint.py", "_github_get", "silent_empty_return", "", 0): (
+        LEGITIMATE,
+        "Returns None on any HTTP or network error. The caller checks for None "
+        "and either returns '' or skips. The poll response states error when "
+        "HEAD resolution fails."),
+    ("poll_endpoint.py", "poll_repos", "swallowed_except", "Exception", 0): (
+        LEGITIMATE,
+        "GitHub App token retrieval failure when GITHUB_TOKEN is not set. Falls "
+        "through to the 401 check below, which raises HTTPException. The auth "
+        "failure is visible, not swallowed."),
+
+    # ── poll_store.py ──────────────────────────────────────────────────
+    ("poll_store.py", "_find_db_path", "swallowed_except", "(IOError, OSError)", 0): (
+        LEGITIMATE,
+        "Candidate DB directories are tried in order until one is writable. Same "
+        "pattern as token_store._find_store_dir."),
 }
 
 # A reason shorter than this is not a reason.
