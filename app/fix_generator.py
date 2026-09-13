@@ -404,10 +404,12 @@ FIXED CODE:"""
     if _os.environ.get("ANTHROPIC_BASE_URL"):
         # Try the configured backend first, under its own honest label.
         configured = llm_chain.Configured(name=_label(), base_url=_base_raw())
-        result = llm_chain.run(_ask_configured, chain=[configured], budget=budget)
+        result = llm_chain.run(_ask_configured, chain=[configured], budget=budget,
+                               payload=llm_chain.PAYLOAD_SOURCE)
 
     if result is None or not result.ok:
-        chained = llm_chain.run(_ask, chain=chain, budget=budget)
+        chained = llm_chain.run(_ask, chain=chain, budget=budget,
+                                payload=llm_chain.PAYLOAD_SOURCE)
         result = llm_chain.merge(result, chained)
 
     if not result.ok:

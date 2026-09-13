@@ -215,6 +215,19 @@ TRIAGE: dict[tuple, tuple] = {
     ("monorepo.py", "_git_grep", "silent_empty_return", "", 0): (
         NEEDS_SIGNAL, SAME_AS("monorepo.py", "_git_grep")),
 
+    ("fork_pr.py", "_git", "swallowed_except",
+     "(OSError, subprocess.SubprocessError)", 0): (
+        LEGITIMATE,
+        "Absent or failing git means the repository coordinates cannot be read, and "
+        "BOTH callers -- upstream_from_git_remote and repo_relative_path -- convert "
+        "the empty result into a (value, reason) refusal that the CLI prints per "
+        "file. So the swallow cannot become a silent success: the run states which "
+        "consumer was skipped and why, and proposes nothing for it. This is the "
+        "opposite of monorepo._git_grep, where an empty result is indistinguishable "
+        "from 'no matches' and the caller proceeds as though it had searched."),
+    ("fork_pr.py", "_git", "silent_empty_return", "", 0): (
+        LEGITIMATE, SAME_AS("fork_pr.py", "_git")),
+
     ("multi_step_reasoning.py", "resolve_fix_target", "swallowed_except",
      "ValueError", 0): (
         NEEDS_SIGNAL,

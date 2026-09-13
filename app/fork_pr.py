@@ -35,6 +35,7 @@ open" -- the safe direction, because duplicating pull requests on a repository y
 not own is how an integration gets banned.
 """
 
+import subprocess
 import time
 
 from dataclasses import dataclass, field as _field
@@ -70,6 +71,153 @@ class ForkPRResult:
     @property
     def opened(self) -> bool:
         return bool(self.url) and not self.already_open
+
+
+#: Remote URL forms git accepts, mapped to owner/repo.
+_REMOTE_FORMS = (
+    "https://github.com/",
+    "http://github.com/",
+    "git://github.com/",
+    "ssh://git@github.com/",
+    "git@github.com:",
+)
+
+
+def _git(args, cwd):
+    """Run one read-only git command, returning stdout or "" on any failure.
+
+    Read-only by construction: every caller passes a query verb. Failure is returned
+    as "" and every caller converts that into a STATED refusal rather than proceeding,
+    so nothing here returns a value a caller could mistake for success.
+    """
+    try:
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                              text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def upstream_from_git_remote(path):
+    """(owner/repo, reason) for the GitHub repository a local file belongs to.
+
+    WHY THIS LIVES HERE AND WHY IT IS NOT AN ENV VAR
+    `pr_engine._infer_repo` is a placeholder that reads RIPPLE_TARGET_REPO and returns
+    None otherwise, with the comment "in production, the GitHub App webhook provides
+    the repo context directly". That is true for the webhook and false for the CLI:
+    the CLI is given LOCAL DIRECTORIES with `--repos`, and ConsumerMatch carries only
+    a file_path, so there is no repository attribution anywhere in the CLI path.
+
+    One env var cannot supply it either, because a single run can span several
+    consumer directories that are different repositories -- and a wrong answer here
+    does not fail loudly, it opens a pull request against SOMEBODY ELSE'S repository.
+    So the coordinates are read from the clone itself, which is evidence rather than
+    configuration, and a directory that is not a clone is refused with the reason.
+    """
+    if not path:
+        return "", "no path given"
+    url = _git(["config", "--get", "remote.origin.url"], cwd=path)
+    if not url:
+        top = _git(["rev-parse", "--show-toplevel"], cwd=path)
+        if not top:
+            return "", f"{path} is not inside a git clone, so its GitHub repository is unknown"
+        return "", f"{top} has no `origin` remote, so its GitHub repository is unknown"
+    for prefix in _REMOTE_FORMS:
+        if url.startswith(prefix):
+            slug = url[len(prefix):]
+            break
+    else:
+        return "", f"origin remote {url!r} is not a github.com URL"
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+    slug = slug.strip("/")
+    if slug.count("/") != 1 or not all(slug.split("/")):
+        return "", f"origin remote {url!r} does not resolve to owner/repo"
+    return slug, ""
+
+
+def repo_relative_path(path):
+    """(path relative to the clone root, reason).
+
+    The GitHub contents API needs a repo-relative path. `pr_engine._relative_file_path`
+    guesses one by scanning for a path component named src, lib or app and falling back
+    to the BASENAME -- which silently writes to the wrong location for any project not
+    laid out that way, and for the locked target would turn
+    `do_mpc/sampling/_samplingplanner.py` into `_samplingplanner.py`, committing a new
+    top-level file instead of editing the real one. git already knows the answer.
+    """
+    if not path:
+        return "", "no path given"
+    import os as _os
+    directory = path if _os.path.isdir(path) else _os.path.dirname(path) or "."
+    top = _git(["rev-parse", "--show-toplevel"], cwd=directory)
+    if not top:
+        return "", f"{path} is not inside a git clone, so its repo-relative path is unknown"
+    # realpath, NOT abspath, on BOTH sides. abspath does not resolve symlinks, so on a
+    # host where /home is a link to /local/home the caller's path and git's answer are
+    # two spellings of the same directory and the containment check below fails --
+    # rejecting a file that is plainly inside the clone. Caught by running this against
+    # a real clone; the unit test's fake `git` could never see it, because a fake
+    # returns whatever spelling the test already used.
+    abs_path = _os.path.realpath(path)
+    top_abs = _os.path.realpath(top)
+    if not abs_path.startswith(top_abs + _os.sep):
+        return "", f"{path} is outside the clone root {top}"
+    return _os.path.relpath(abs_path, top_abs).replace(_os.sep, "/"), ""
+
+
+@dataclass
+class ForkPRRun:
+    """What a multi-repository fork-PR pass did. Every outcome is recorded.
+
+    `refused` is kept apart from `failed` because they need different responses: a
+    refusal is a decision this code made and states (no repository coordinates, an
+    archived upstream, a dry run), while a failure is the platform saying no.
+    """
+    opened: list = _field(default_factory=list)
+    already_open: list = _field(default_factory=list)
+    failed: list = _field(default_factory=list)
+    refused: list = _field(default_factory=list)
+
+    def summary(self) -> str:
+        return (f"{len(self.opened)} opened, {len(self.already_open)} already open, "
+                f"{len(self.failed)} failed, {len(self.refused)} refused")
+
+
+def open_fork_prs(groups, *, branch, title, body, token, api,
+                  dry_run=False, sleep=time.sleep):
+    """Open one fork-based pull request per upstream repository.
+
+    `groups` is {upstream: [(repo_relative_path, base64_content), ...]}, so this
+    function knows nothing about how a fix was produced -- keeping this module free of
+    any dependency on the app's types, which is what lets the CLI and the webhook both
+    reach it without either shape leaking into the other.
+
+    DRY RUN ISSUES NO REQUEST AT ALL. Not "issues requests and discards the result":
+    `ensure_fork` CREATES a fork, so a dry run that called through would leave a real
+    repository on the operator's account and, worse, would look harmless in the log.
+    """
+    run = ForkPRRun()
+    for upstream, edits in sorted(groups.items()):
+        if not edits:
+            run.refused.append((upstream, "no edits, so there is nothing to propose"))
+            continue
+        if dry_run:
+            run.refused.append((
+                upstream,
+                f"dry run: would open `{branch}` on {upstream} with "
+                f"{len(edits)} file(s): {', '.join(p for p, _ in edits)}"))
+            continue
+        result = open_fork_pr(upstream=upstream, branch=branch, title=title,
+                              body=body, edits=edits, token=token, api=api,
+                              sleep=sleep)
+        if result.opened:
+            run.opened.append((upstream, result.number, result.url))
+        elif result.already_open:
+            run.already_open.append((upstream, result.branch))
+        else:
+            run.failed.append((upstream, result.refusals))
+    return run
 
 
 def _viewer_login(token, *, api):

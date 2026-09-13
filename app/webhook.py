@@ -2504,7 +2504,8 @@ def _render_pr_narrative(change, consumer_file: str, residual_refs):
 
     def _call(prompt: str):
         return llm_chain.run(lambda provider: _ask_provider(provider, prompt),
-                             chain=chain, budget=_prose_budget())
+                             chain=chain, budget=_prose_budget(),
+                             payload=llm_chain.PAYLOAD_METADATA)
 
     return pr_prose.render(facts, call_chain=_call)
 
@@ -2905,16 +2906,30 @@ def _execute_follow_on_prs(plan: dict, repo: str, number: int, runs: list,
                 })
             else:
                 # Fix generator returned identical content — nothing to commit.
+                # The REASON is carried through rather than replaced by a fixed
+                # string. This branch used to record the literal "no change
+                # generated", discarding the explanation the generator had just
+                # produced -- so the follow-on log said a target was skipped and
+                # never said whether the shape was uncovered, the model was
+                # unavailable, or the model had simply declined.
                 edit_details.append({
                     "file": file_path,
-                    "explanation": "no change generated",
+                    "explanation": (explanation[:200] if explanation
+                                    else "no change generated (no reason reported)"),
                 })
 
         if not any_fix_generated:
+            # The REASONS, not just the verdict. "no fixes generated" alone cannot be
+            # acted on: it is the same string whether the change shape has no
+            # deterministic handler, the model was refused by the data boundary, or
+            # every candidate file turned out not to reference the symbol after all.
+            why = [f"{d['file']}: {d.get('explanation') or 'no reason reported'}"
+                   for d in edit_details]
             skipped.append({"repo": target_repo, "reason": "no fixes generated",
-                            "files": files})
+                            "files": files, "why": why})
             _log_activity("follow_on_no_fixes", {
-                "repo": target_repo, "symbol": symbol, "files": files})
+                "repo": target_repo, "symbol": symbol, "files": files,
+                "why": why[:6]})
             continue
 
         # Build the PR body from follow_on's plan.
@@ -3034,7 +3049,8 @@ def _impact_ranker():
 
     def _call(prompt: str):
         return llm_chain.run(lambda provider: _ask_provider(provider, prompt),
-                             chain=chain, budget=_prose_budget())
+                             chain=chain, budget=_prose_budget(),
+                             payload=llm_chain.PAYLOAD_METADATA)
 
     return _call
 
@@ -3825,9 +3841,18 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     # _LLM_INSTRUCTIONS allowlist (judgment ops are deliberately absent), the patch
     # must satisfy the diff contract, and AUTO still requires a real compile -- so an
     # LLM fix can at most earn REVIEW on a platform with no validator.
-    from .llm_config import is_configured as _llm_ready
+    from .llm_config import is_configured as _llm_ready, refusal_reason as _llm_why
     if not _llm_ready():
-        return content, ""
+        # STATED, NOT SILENT. This returned ("", i.e. content unchanged with an EMPTY
+        # explanation), and the caller then recorded the fixed literal string "no
+        # change generated" -- so a target was skipped with no record of WHY, and
+        # "the deterministic templates do not cover this shape" was indistinguishable
+        # from "the model was misconfigured". Both are actionable and they need
+        # opposite responses, which is exactly the distinction refusal_reason()
+        # exists to draw.
+        return content, (
+            f"no fix: the deterministic templates produced no change for "
+            f"{change.change_type} and no model was available -- {_llm_why()}")
     try:
         from .fix_generator import generate_fix as _generate_fix
         fix = _generate_fix(consumer, change, use_llm=True, original_code=content)
@@ -3840,12 +3865,14 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
             "err": f"{type(exc).__name__}: {str(exc)[:160]}",
             "falling_back_to": "no fix",
         })
-        return content, ""
+        return content, (
+            f"no fix: the deterministic templates produced no change and the model "
+            f"call raised {type(exc).__name__}: {str(exc)[:120]}")
     if fix and fix.fixed_code and fix.fixed_code != content:
         return fix.fixed_code, f"[llm] {fix.explanation}"
-    return content, ""
-    
-    return content, ""
+    return content, (
+        f"no fix: neither the deterministic templates nor the model changed the "
+        f"code for {change.change_type} on {getattr(consumer, 'language', '?')}")
 
 
 def _index_merged_prs(repo: str, token: str, store, platform: str = "github", max_prs: int = 100) -> dict:

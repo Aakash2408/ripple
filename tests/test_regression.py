@@ -23,6 +23,7 @@ Run:  python3.12 -m pytest tests/test_regression.py -q
 import json
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1041,11 +1042,22 @@ def test_llm_backend_is_overridable_and_labelled_honestly():
         for k in saved:
             os.environ.pop(k, None)
 
-        # Default: the real Anthropic API.
+        # Default: FREE and SELF-HOSTED. This asserted api.anthropic.com and
+        # is_anthropic() is True until 2026-09-13, pinning a default that FAILED OPEN
+        # to a metered third-party API. Reversed deliberately -- see llm_config's
+        # "FREE BY DEFAULT, PAID BY OPT-IN".
         importlib.reload(L)
-        assert L.base_url() == "https://api.anthropic.com"
-        assert L.is_anthropic() is True
-        assert "Anthropic" in L.backend_label()
+        assert L.base_url() == "http://localhost:11434", (
+            f"unconfigured install resolves to {L.base_url()} -- the default must be a "
+            f"free self-hosted endpoint, never a paid third-party API")
+        assert L.is_anthropic() is False
+        assert L.is_paid_backend() is False, "the default backend bills per token"
+        assert "Anthropic" not in L.backend_label()
+        # And it must not CLAIM a backend when none is reachable.
+        assert L.is_configured() is False, "default-off broke: something is configured"
+        assert L.backend_label() == "no model (deterministic only)", (
+            f"unconfigured install labels its provenance {L.backend_label()!r}, which "
+            f"would render into a PR body as a model that never answered")
 
         # Overridden: a proxy fronting something else.
         os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:4000"
@@ -2034,8 +2046,16 @@ def test_an_exhausted_llm_chain_states_what_happened():
         assert chain, "fix chain is empty even with credentials present"
 
         # Every provider rate-limits.
+        #
+        # payload=PAYLOAD_PUBLIC throughout this test and its siblings below: the
+        # prompt here is the literal fixture on the next line, so it carries nothing
+        # from any repository. These tests exercise the chain's FAILURE CLASSIFICATION,
+        # which is orthogonal to the data boundary -- and run()'s default is
+        # PAYLOAD_SOURCE, so without saying so a hosted provider would be refused
+        # before the classification under test ever ran. That refusal is asserted
+        # separately in test_a_hosted_provider_cannot_silently_receive_repository_content.
         res = C.run(lambda p: (_ for _ in ()).throw(_Boom(429)), chain=chain,
-                    budget=C.Budget())
+                    budget=C.Budget(), payload=C.PAYLOAD_PUBLIC)
         assert not res.ok
         assert res.text == "" and res.answered_by == ""
         stated = res.stated_outcome()
@@ -2114,7 +2134,7 @@ def test_a_malformed_request_stops_the_chain_instead_of_multiplying():
         calls.append(p.name)
         raise _Boom(400)
 
-    res = C.run(_bad, chain=chain, budget=C.Budget())
+    res = C.run(_bad, chain=chain, budget=C.Budget(), payload=C.PAYLOAD_PUBLIC)
     assert not res.ok
     assert len(calls) == 1, (
         f"a malformed request was retried against {len(calls)} providers; 400 is "
@@ -2128,7 +2148,7 @@ def test_a_malformed_request_stops_the_chain_instead_of_multiplying():
         retried.append(p.name)
         raise _Boom(429)
 
-    C.run(_limited, chain=chain, budget=C.Budget())
+    C.run(_limited, chain=chain, budget=C.Budget(), payload=C.PAYLOAD_PUBLIC)
     assert len(retried) == len(chain), (
         f"429 should try every provider; tried {len(retried)} of {len(chain)}")
 
@@ -2156,7 +2176,8 @@ def test_an_empty_model_response_is_a_failure_not_a_fix():
 
     with _with_provider_credentials():
         chain = C.fix_chain()
-    res = C.run(lambda p: "   \n  ", chain=chain, budget=C.Budget())
+    res = C.run(lambda p: "   \n  ", chain=chain, budget=C.Budget(),
+                payload=C.PAYLOAD_PUBLIC)
     assert not res.ok, "whitespace was accepted as a fix"
     assert "empty_response" in res.stated_outcome(), res.stated_outcome()
 
@@ -3286,8 +3307,8 @@ class _FakeForkAPI:
 
     def __init__(self, *, login="ripplebot", upstream_info=None, fork_exists=False,
                  fork_ready_after=0, open_prs=None, fail_pr_list=False,
-                 upstream_sha="upstreamsha1234", fail_ref=False, fail_commit=False,
-                 fail_pr=False):
+                 upstream_sha="upstreamsha1234", fork_sha="STALEforksha0000",
+                 fail_ref=False, fail_commit=False, fail_pr=False):
         self.calls = []
         self.login = login
         self.upstream_info = upstream_info if upstream_info is not None else {
@@ -3298,11 +3319,30 @@ class _FakeForkAPI:
         self.open_prs = list(open_prs or [])
         self.fail_pr_list = fail_pr_list
         self.upstream_sha = upstream_sha
+        #: The FORK's own default-branch head, DELIBERATELY different from the
+        #: upstream's.
+        #:
+        #: WHY THIS FIELD EXISTS. Without it this fake returned `upstream_sha` for
+        #: EVERY /git/ref/heads/ path, fork or upstream -- so a branch cut from the
+        #: fork's stale default was byte-identical to one cut from the upstream head,
+        #: and test_a_fork_branch_is_cut_from_the_upstream_sha_not_the_fork_default
+        #: passed either way. Measured by mutation on 2026-09-13: rewriting
+        #: open_fork_pr to read the fork's ref left that gate GREEN, so the gate whose
+        #: entire name is that property had been asserting nothing about it since it
+        #: was written. A fake that cannot express the difference cannot test it.
+        self.fork_sha = fork_sha
         self.fail_ref = fail_ref
         self.fail_commit = fail_commit
         self.fail_pr = fail_pr
         self.created_refs = []
         self.committed = []
+        #: (path, payload) per commit. Kept ALONGSIDE `committed` rather than
+        #: replacing it, because the existing gates compare `committed` as a list of
+        #: paths -- widening that field would have changed six assertions to prove
+        #: one new thing. This records the bytes, which is what an end-to-end check
+        #: needs in order to assert the committed content is the deterministic fix
+        #: and not something a model produced.
+        self.commits = []
         self.pr_payload = None
 
     def __call__(self, method, path, token, data=None, **kw):
@@ -3325,6 +3365,11 @@ class _FakeForkAPI:
         if method == "GET" and "/pulls?state=open" in path:
             return {"error": "boom"} if self.fail_pr_list else list(self.open_prs)
         if method == "GET" and "/git/ref/heads/" in path:
+            # The OWNER decides which sha comes back. Returning upstream_sha for both
+            # is what made the branch-provenance gate vacuous -- see fork_sha above.
+            if f"/repos/{self.login}/" in path:
+                return ({"error": "404"} if not self.fork_sha
+                        else {"object": {"sha": self.fork_sha}})
             return ({"error": "404"} if not self.upstream_sha
                     else {"object": {"sha": self.upstream_sha}})
         if method == "POST" and path.endswith("/git/refs"):
@@ -3338,6 +3383,7 @@ class _FakeForkAPI:
             if self.fail_commit:
                 return {"error": "403 Forbidden"}
             self.committed.append(path)
+            self.commits.append((path, data))
             return {"commit": {"sha": "newcommit"}}
         if method == "POST" and path.endswith("/pulls"):
             if self.fail_pr:
@@ -3348,6 +3394,113 @@ class _FakeForkAPI:
         return {"error": f"unexpected {method} {path}"}
 
 
+def test_a_fork_pr_resolves_end_to_end_with_no_model_and_commits_the_template_fix():
+    """The whole path, model-free: source in -> fork PR payload out. Added 2026-09-13.
+
+    The seven sibling gates above each pin ONE property of `open_fork_pr` against a
+    fake. This pins the property none of them can see: that the bytes which reach the
+    commit are the ones the DETERMINISTIC template produced, with no model configured
+    and no model reachable.
+
+    That matters because of where this runs. Railway has no model at all -- no local
+    Ollama, and the hosted providers are refused by the data boundary unless the
+    operator opts in. So if any part of this path needed inference, the deployed
+    service would resolve a fork, create a branch, and then commit nothing.
+
+    The model entry points are replaced with raisers rather than merely left
+    unconfigured: "no model was configured" and "no model was called" are different
+    claims, and only the second one is what this asserts.
+    """
+    import base64
+    import importlib
+    import os as _os
+
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN", "RIPPLE_ALLOW_PAID_MODEL",
+            "RIPPLE_ALLOW_HOSTED_MODEL", "RIPPLE_SELF_HOSTED")
+    saved = {k: _os.environ.get(k) for k in keys}
+
+    import app.fix_generator as fg
+    import app.llm_chain as lc
+
+    real_llm, real_run = fg._generate_with_llm, lc.run
+
+    def _boom(*a, **k):
+        raise AssertionError("a model was called on the deterministic path")
+
+    try:
+        for k in keys:
+            _os.environ.pop(k, None)
+        import app.llm_config as L
+        importlib.reload(L)
+        assert not L.is_configured()
+
+        fg._generate_with_llm = _boom
+        lc.run = _boom
+
+        from app.fix_templates import apply_fix_template
+        from app.fork_pr import open_fork_pr
+
+        # The locked target's shape: a removed numpy alias, reached as an attribute.
+        original = (
+            "import numpy as np\n"
+            "\n"
+            "def check(kwargs, keys, names):\n"
+            "    a = np.alltrue([isinstance(v, list) for v in kwargs.values()])\n"
+            "    b = np.alltrue([v in names for v in keys])\n"
+            "    return a and b\n"
+        )
+        fixed, _ = apply_fix_template(
+            code=original, language="python", change_type="field_renamed",
+            field_name="alltrue", new_name="all")
+        assert fixed != original and "np.alltrue" not in fixed
+
+        rel = "do_mpc/sampling/_samplingplanner.py"
+        gh = _FakeForkAPI(fork_exists=True, upstream_sha="realupstreamsha99")
+        result = open_fork_pr(
+            upstream="do-mpc/do-mpc", branch="ripple/field_renamed-alltrue",
+            title="fix: rename np.alltrue to np.all (removed in NumPy 2.0)",
+            body="body",
+            edits=[(rel, base64.b64encode(fixed.encode()).decode())],
+            token="t", api=gh, sleep=lambda s: None)
+
+        assert result.opened, f"resolution failed: {result.refusals}"
+
+        # The committed BYTES are the template's output -- the thing no sibling
+        # gate checks.
+        assert len(gh.commits) == 1, f"{len(gh.commits)} commits, expected 1"
+        cpath, cbody = gh.commits[0]
+        assert gh.login in cpath and "do-mpc/do-mpc" not in cpath, (
+            f"content was committed outside the fork: {cpath}")
+        sent = base64.b64decode(cbody["content"]).decode()
+        assert sent == fixed, "the committed bytes are not the template's output"
+        assert "np.alltrue" not in sent, "the removed alias was committed"
+        assert cbody.get("branch") == "ripple/field_renamed-alltrue"
+
+        # And the branch/PR shape still holds on this same run, so the end-to-end
+        # path cannot pass while the boundary properties regress.
+        assert gh.created_refs, "no branch was created"
+        _, ref_body = gh.created_refs[0]
+        assert ref_body["sha"] == "realupstreamsha99", (
+            "the branch was not cut from the upstream sha")
+        assert ref_body["sha"] != gh.fork_sha, (
+            "the branch was cut from the fork's own stale default branch")
+        assert gh.pr_payload["head"] == f"{gh.login}:ripple/field_renamed-alltrue"
+        assert gh.pr_payload["base"] == "main"
+
+        # Still no model, and none was reachable at any point.
+        assert not L.is_configured()
+    finally:
+        fg._generate_with_llm = real_llm
+        lc.run = real_run
+        for k, v in saved.items():
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
+        import app.llm_config as L
+        importlib.reload(L)
+
+
 def test_a_fork_branch_is_cut_from_the_upstream_sha_not_the_fork_default():
     """The bug that gets a bot blocked.
 
@@ -3356,15 +3509,30 @@ def test_a_fork_branch_is_cut_from_the_upstream_sha_not_the_fork_default():
     upstream commit -- hundreds of unrelated files. The branch must be cut from the
     UPSTREAM head sha, which is reachable inside the fork because a fork shares its
     object store with the parent.
+
+    THIS TEST WAS VACUOUS UNTIL 2026-09-13. `_FakeForkAPI` returned `upstream_sha` for
+    every /git/ref/heads/ path, so a branch cut from the fork's stale default was
+    byte-identical to one cut from the upstream head and this assertion passed either
+    way. Proven by mutation: rewriting open_fork_pr to read the fork's own ref left
+    this gate green. The fake now serves a DISTINCT `fork_sha`, and the wrong-source
+    assertion below is what makes the difference observable.
     """
     from app import fork_pr as F
 
-    gh = _FakeForkAPI(fork_exists=True, upstream_sha="deadbeefcafe")
+    gh = _FakeForkAPI(fork_exists=True, upstream_sha="deadbeefcafe",
+                      fork_sha="STALEforkhead0")
     res = F.open_fork_pr("acme/upstream", "ripple/drop-x", "fix: drop x", "body",
                          [("src/pay.py", "Y29udGVudA==")], "tok", api=gh,
                          sleep=lambda _s: None)
 
     assert res.opened, res.refusals
+    assert gh.created_refs, "no branch was created"
+    _, ref_body = gh.created_refs[0]
+    assert ref_body["sha"] == "deadbeefcafe", (
+        f"the branch was cut from {ref_body['sha']!r}, not the upstream head")
+    assert ref_body["sha"] != gh.fork_sha, (
+        "the branch was cut from the FORK's own default branch -- on a fork that is "
+        "behind, the pull request would carry every intervening upstream commit")
     assert gh.created_refs, "no branch was created"
     _path, payload = gh.created_refs[0]
     assert payload["sha"] == "deadbeefcafe", (
@@ -3998,6 +4166,554 @@ def test_the_local_3b_model_is_not_in_the_fix_chain():
             assert "MEASURED" in prov.note, (
                 f"{prov.name} is excluded from the fix chain with no measurement "
                 f"recorded in its note")
+
+
+def test_an_unconfigured_install_never_resolves_to_a_paid_backend():
+    """Free by default, paid by explicit opt-in. Added 2026-09-13.
+
+    The fallbacks were api.anthropic.com and claude-sonnet-4, so llm_config FAILED OPEN
+    to a metered third-party API. The empty case was safe -- nothing configured meant
+    nothing attempted -- so the exposure was the HALF-configured case, which is the one
+    that actually occurs:
+
+        key set, ANTHROPIC_MODEL unset      -> billed for a model nobody chose
+        OpenRouter key in ANTHROPIC_AUTH_TOKEN, BASE_URL forgotten
+                                            -> customer source POSTed to Anthropic
+                                               under a non-Anthropic credential. Auth
+                                               fails, but the SEND already happened.
+
+    Both are asserted below, because the empty case passing is what made the defect
+    invisible for as long as it existed.
+    """
+    import importlib
+    import os as _os
+
+    import app.llm_config as L
+
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN", L.PAID_OPT_IN_ENV)
+    saved = {k: _os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            _os.environ.pop(k, None)
+        importlib.reload(L)
+
+        # 1. Nothing configured -> free, self-hosted, and OFF.
+        assert not L.is_paid_backend()
+        assert not L.is_configured()
+
+        # 2. THE REAL DEFECT: a credential present, no model named. Under the old
+        #    defaults this silently resolved to paid Claude on api.anthropic.com.
+        _os.environ["ANTHROPIC_API_KEY"] = "sk-ant-not-a-real-key"
+        _os.environ["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+        assert L.is_paid_backend(), "paid endpoint not recognised as paid"
+        assert not L.is_configured(), (
+            "a paid third-party backend is usable without the operator opting in -- "
+            "customer source can be billed and sent off-network by default")
+        reason = L.refusal_reason()
+        assert L.PAID_OPT_IN_ENV in reason and "paid" in reason.lower(), (
+            f"the paid refusal does not say why or how to accept it: {reason!r}")
+
+        # 3. Opting in is NOT enough on its own: the model must be named, because the
+        #    free default names a local model a hosted API rejects as nonexistent.
+        _os.environ[L.PAID_OPT_IN_ENV] = "1"
+        assert L.paid_backend_lacks_explicit_model()
+        assert not L.is_configured(), (
+            "a paid backend is accepted with no ANTHROPIC_MODEL, so the request would "
+            "carry a local model name to a hosted API")
+        assert "ANTHROPIC_MODEL" in L.refusal_reason()
+
+        # 4. Fully specified paid backend -> allowed. The opt-in must actually work,
+        #    or this is a block rather than a gate.
+        _os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-5-20250929"
+        assert L.is_configured(), (
+            "a paying operator who set the key, the model and the opt-in is still "
+            "refused -- the opt-in does not open")
+
+        # 5. Only "1" counts. A check on truthiness would spend money on a typo.
+        for refusal in ("0", "false", "no", "", "true", "yes"):
+            _os.environ[L.PAID_OPT_IN_ENV] = refusal
+            assert not L.is_configured(), (
+                f"{L.PAID_OPT_IN_ENV}={refusal!r} was read as consent to pay")
+        _os.environ[L.PAID_OPT_IN_ENV] = "1"
+
+        # 6. THE SELF-HOSTED PATH MUST BE UNAFFECTED. If this regresses, the free
+        #    default is worthless: the deployment it exists to serve stops working.
+        _os.environ.pop(L.PAID_OPT_IN_ENV, None)
+        _os.environ.pop("ANTHROPIC_API_KEY", None)
+        _os.environ.pop("ANTHROPIC_MODEL", None)
+        _os.environ["ANTHROPIC_BASE_URL"] = "http://ripple-llm.railway.internal:11434"
+        assert not L.is_paid_backend()
+        assert L.is_self_hosted() and L.is_configured(), (
+            "a keyless self-hosted backend is no longer configured -- the paid opt-in "
+            "has caught the free path it was supposed to protect")
+    finally:
+        for k, v in saved.items():
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
+        importlib.reload(L)
+
+
+def test_every_model_declares_a_commercially_usable_licence():
+    """Weights licences are read from the publisher, not inferred from the family.
+
+    Qwen's own release notes: "All our open-source models, except for the 3B and 72B
+    variants, are licensed under Apache 2.0." So qwen2.5-coder:3b is NON-COMMERCIAL
+    while its 7B and 14B siblings are Apache-2.0 -- same family, same generation, same
+    naming scheme, opposite answer on the only axis that can make the product
+    undeliverable. A per-model licence string copied from a sibling would be wrong, and
+    nothing downstream would ever notice.
+
+    `commercial_ok` is therefore never guessed: an unmeasured model is False, the same
+    rule model_is_fix_capable applies. Guessing yes is a licence breach rather than a
+    degraded result.
+    """
+    from app.llm_providers import (DEFAULT_SELF_HOSTED_MODEL, LICENCES,
+                                   MODEL_MEASUREMENTS, RECOMMENDED_FIX_MODEL,
+                                   RECOMMENDED_PROSE_MODEL, licence_for,
+                                   model_is_commercially_licensed)
+
+    assert LICENCES, "no licences declared -- every assertion here is vacuous"
+
+    for name, lic in LICENCES.items():
+        assert lic.source.startswith("http"), (
+            f"licence {name} cites no readable source; a licence claim nobody can "
+            f"re-check is the same as no claim")
+        if not lic.commercial_ok or not lic.osi_approved:
+            assert lic.note.strip(), (
+                f"licence {name} restricts use but does not say how")
+
+    # Every measured model must reference a DECLARED licence, so adding a model forces
+    # its terms to be looked up rather than assumed.
+    for name, facts in MODEL_MEASUREMENTS.items():
+        assert licence_for(facts.licence) is not None, (
+            f"{name} declares licence {facts.licence!r}, which is not in LICENCES")
+
+    # An unknown model gets no benefit of the doubt.
+    assert not model_is_commercially_licensed("some-model-nobody-checked")
+    assert not model_is_commercially_licensed("")
+
+    # The three names Ripple puts its own weight behind must all be shippable.
+    for role, chosen in (("fix", RECOMMENDED_FIX_MODEL),
+                         ("prose", RECOMMENDED_PROSE_MODEL),
+                         ("default", DEFAULT_SELF_HOSTED_MODEL)):
+        assert model_is_commercially_licensed(chosen), (
+            f"the {role} model is {chosen}, whose licence forbids commercial use -- "
+            f"Ripple is a paid product, so this is a licence breach and not a "
+            f"performance tradeoff")
+
+    # And the known non-commercial entry must stay non-recommended. This pins the
+    # specific trap: the 3B is the FASTEST model here at context ingestion (220 tok/s),
+    # so it is exactly the one a future speed-driven change would reach for.
+    assert not model_is_commercially_licensed("qwen2.5-coder:3b"), (
+        "qwen2.5-coder:3b is recorded as commercially usable; Qwen carves the 3B "
+        "variant out of its Apache-2.0 release")
+    assert "qwen2.5-coder:3b" not in (RECOMMENDED_FIX_MODEL, RECOMMENDED_PROSE_MODEL,
+                                      DEFAULT_SELF_HOSTED_MODEL)
+
+
+def test_a_mechanical_rename_is_fixed_with_no_model_and_never_skipped_silently():
+    """The locked target's edit must need zero inference, and a skip must say why.
+
+    Stage 3 locked `np.alltrue` -> `np.all` in do-mpc precisely because it is a pure
+    token rename. This pins the two properties the fork PR depends on:
+
+    1. THE EDIT NEEDS NO MODEL. Asserted with every model env var cleared and
+       is_configured() False, so a pass cannot be a model quietly answering. Railway
+       has no reachable model at all, so if this needed one the deployed service
+       would produce nothing.
+
+    2. A SKIP IS NEVER SILENT. `_generate_fix_with_rag_fallback` ended with three
+       `return content, ""` sites -- identical content, EMPTY explanation -- and the
+       follow-on caller then recorded the fixed literal "no change generated",
+       discarding even that. So a target was skipped with no record of whether the
+       shape had no handler, the model was unavailable, or the model declined. Those
+       are three different problems needing opposite responses.
+    """
+    import ast
+    import importlib
+    import inspect
+    import os as _os
+
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN", "RIPPLE_ALLOW_PAID_MODEL",
+            "RIPPLE_ALLOW_HOSTED_MODEL", "RIPPLE_SELF_HOSTED")
+    saved = {k: _os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            _os.environ.pop(k, None)
+
+        import app.llm_config as L
+        importlib.reload(L)
+        assert not L.is_configured(), (
+            "a model is configured, so this test cannot prove the edit is model-free")
+
+        from app.change_types import canonical_op, category
+        from app.fix_templates import apply_fix_template
+
+        assert canonical_op("field_renamed") == "rename_field"
+        assert category("field_renamed") == "mechanical"
+
+        # The real shape, on code shaped like the locked target: a removed numpy
+        # alias reached as an attribute and called.
+        code = (
+            "import numpy as np\n"
+            "\n"
+            "def check(kwargs, keys, names):\n"
+            "    a = np.alltrue([isinstance(v, list) for v in kwargs.values()])\n"
+            "    b = np.alltrue([v in names for v in keys])\n"
+            "    return a and b\n"
+        )
+        fixed, explanation = apply_fix_template(
+            code=code, language="python", change_type="field_renamed",
+            field_name="alltrue", new_name="all")
+
+        assert fixed != code, (
+            "the deterministic template produced NO change for a mechanical rename "
+            "in Python -- the locked target would be skipped and the fork PR would "
+            "never open")
+        assert "np.alltrue" not in fixed, f"the removed alias survives:\n{fixed}"
+        assert fixed.count("np.all(") == 2, f"expected 2 renamed calls:\n{fixed}"
+
+        # Minimal: only the two reference lines move, and the result still parses.
+        before, after = code.splitlines(), fixed.splitlines()
+        assert len(before) == len(after)
+        moved = [i for i, (o, f) in enumerate(zip(before, after)) if o != f]
+        assert len(moved) == 2, f"{len(moved)} lines changed, expected 2"
+        ast.parse(fixed)
+
+        # The reported count must match the real edit. name_variants() yields the
+        # SAME string for snake and camel on an all-lowercase name, and summing per
+        # variant KEY double-counted -- reporting "4 replacements made" for a
+        # two-line edit, in text that goes into a pull request body on a repository
+        # we do not own.
+        assert "2 replacements made" in explanation, (
+            f"the explanation miscounts the edit: {explanation!r}")
+
+        # 2. NO SILENT SKIP. Every give-up path must carry a reason.
+        import app.webhook as w
+        src = inspect.getsource(w._generate_fix_with_rag_fallback)
+        assert 'return content, ""' not in src, (
+            "a give-up path returns an EMPTY explanation, so the caller cannot say "
+            "why the file was skipped")
+        assert "refusal_reason" in src, (
+            "the no-model give-up does not report WHY no model was available; "
+            "'no handler for this shape' and 'model misconfigured' need opposite "
+            "responses")
+
+        follow_src = inspect.getsource(w._execute_follow_on_prs)
+        assert '"explanation": "no change generated"' not in follow_src, (
+            "the follow-on caller replaces the generator's reason with a fixed "
+            "string, discarding the only explanation of the skip")
+        # Scoped to the skip RECORD, not the whole function: `why` also appears in
+        # the activity log next to it, so a bare substring check passed while the
+        # record itself had been stripped -- caught by mutation.
+        marker = 'skipped.append({"repo": target_repo, "reason": "no fixes generated"'
+        assert marker in follow_src, "the no-fixes skip record was restructured"
+        record = follow_src.split(marker, 1)[1].split("})", 1)[0]
+        assert "why" in record, (
+            "a repo skipped for 'no fixes generated' records no per-file reasons, so "
+            f"the caller cannot tell which problem occurred: {record.strip()[:120]!r}")
+
+        # And prove the reason actually arrives, by running the real function on
+        # content no template can fix, with no model available.
+        from app.diff_engine import BreakingChange
+
+        class _C:
+            file_path = "x.py"
+            language = "python"
+            line_number = 1
+            code_snippet = ""
+            confidence = "high"
+            match_reason = "t"
+
+        judgement = BreakingChange(
+            change_type="operation_removed", path="/x", method="GET",
+            field_name="doThing", field_type="", location="body",
+            severity="breaking", description="rpc removed")
+        out, why = w._generate_fix_with_rag_fallback("x = 1\n", _C(), judgement, "")
+        assert out == "x = 1\n", "content changed on a shape nothing can fix"
+        assert why, (
+            "the real function gave up with an empty reason -- exactly the silent "
+            "skip this gate exists to prevent")
+        assert "no fix" in why.lower(), f"the reason does not read as a refusal: {why!r}"
+    finally:
+        for k, v in saved.items():
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
+        import app.llm_config as L
+        importlib.reload(L)
+
+
+def test_execute_follow_ons_routes_to_the_fork_path_and_writes_nothing_without_it():
+    """The CLI flag was parsed and then never read. Wired 2026-09-13.
+
+    `cmd_run` did:
+
+        execute_follow_ons = "--execute-follow-ons" in sys.argv   # never read again
+        ...
+        prs = create_prs(all_fixes, ...)                          # always this
+
+    so the flag silently did nothing and every run went through `create_prs`, which
+    opens a branch with `POST /repos/{repo}/git/refs`. That needs push permission, so
+    it 403s on every repository the token cannot push to -- i.e. every open-source
+    target, which is the only kind this flag exists for. A dead flag is worse than a
+    missing one: it reads as supported.
+
+    Four properties are pinned here, and the third is the one that matters most.
+    """
+    import inspect
+
+    from app import cli
+    from app import fork_pr
+
+    src = inspect.getsource(cli.cmd_run)
+
+    # 1. The flag must REACH the fork path, not just be parsed.
+    assert "execute_follow_ons" in src
+    assert "_run_fork_follow_ons" in src, (
+        "cmd_run parses --execute-follow-ons but never routes on it -- the flag is "
+        "dead again")
+    branch_src = src.split("elif execute_follow_ons:", 1)
+    assert len(branch_src) == 2, (
+        "there is no branch on execute_follow_ons, so both paths cannot differ")
+
+    # 2. The same-repo path must SURVIVE. It is correct wherever the token really can
+    #    push, which is where Ripple started; replacing it would be a regression.
+    assert "create_prs(" in src, (
+        "the same-repo push path was removed; it is still correct for a repo the "
+        "installer owns")
+
+    # 3. WITHOUT THE FLAG, THE FORK PATH IS NEVER REACHED, and a dry run issues NO
+    #    request. Asserted by executing the real function against a fake `api`, not by
+    #    reading source: a source check passes while the wiring is inverted, and
+    #    "issues requests and discards the result" would still create a fork.
+    fork_src = inspect.getsource(cli._run_fork_follow_ons)
+    assert "open_fork_prs" in fork_src
+
+    api_calls = []
+    run = fork_pr.open_fork_prs(
+        {"acme/upstream": [("a.py", "Y29kZQ==")]},
+        branch="ripple/x", title="t", body="b", token="tok",
+        api=lambda *a, **k: api_calls.append(a) or {}, dry_run=True)
+    assert api_calls == [], (
+        "a dry run issued platform requests; ensure_fork CREATES a fork, so this "
+        "would leave a real repository on the operator's account")
+    assert not run.opened and run.refused, (
+        "a dry run must report what it WOULD do as a stated refusal, not silently "
+        "produce nothing")
+    assert "dry run" in run.refused[0][1]
+
+    # And with dry_run off, the SAME inputs do reach the platform -- otherwise the
+    # check above would pass on a function that never works at all.
+    api_calls.clear()
+    fork_pr.open_fork_prs(
+        {"acme/upstream": [("a.py", "Y29kZQ==")]},
+        branch="ripple/x", title="t", body="b", token="tok",
+        api=lambda *a, **k: api_calls.append(a) or {}, dry_run=False)
+    assert api_calls, "with dry_run=False no request was made either -- dead code"
+
+    # 4. Repository coordinates come from the CLONE, never from a guess. A wrong
+    #    answer here does not fail loudly -- it opens a pull request against somebody
+    #    else's repository.
+    slug, why = fork_pr.upstream_from_git_remote("/definitely/not/a/clone")
+    assert slug == "" and why, "a non-clone resolved to a repository anyway"
+
+    for url, expected in (
+        ("https://github.com/do-mpc/do-mpc.git", "do-mpc/do-mpc"),
+        ("git@github.com:do-mpc/do-mpc.git", "do-mpc/do-mpc"),
+        ("ssh://git@github.com/o/r", "o/r"),
+        ("https://gitlab.com/o/r.git", ""),
+        ("https://github.com/toomany/parts/here", ""),
+    ):
+        got = _slug_from_url(fork_pr, url)
+        assert got == expected, f"{url} -> {got!r}, expected {expected!r}"
+
+    # 5. The repo-relative path must survive a SYMLINKED path. Found by running the
+    #    resolver against a real clone: this host has /home symlinked to /local/home,
+    #    so git's --show-toplevel and the caller's path are two spellings of the same
+    #    directory. With abspath the containment check rejected a file plainly inside
+    #    the clone; realpath on both sides is the fix. A fake `git` cannot catch this,
+    #    because a fake returns whatever spelling the test already used.
+    import os
+    import subprocess
+    import tempfile
+
+    root = tempfile.mkdtemp()
+    try:
+        real = os.path.join(root, "real")
+        os.makedirs(os.path.join(real, "pkg", "sub"))
+        target = os.path.join(real, "pkg", "sub", "mod.py")
+        with open(target, "w") as fh:
+            fh.write("x = 1\n")
+        init = subprocess.run(["git", "init", "-q", real],
+                              capture_output=True, text=True)
+        if init.returncode == 0:
+            link = os.path.join(root, "link")
+            os.symlink(real, link)
+            via_link = os.path.join(link, "pkg", "sub", "mod.py")
+            rel, why = fork_pr.repo_relative_path(via_link)
+            assert rel == "pkg/sub/mod.py", (
+                f"a file reached through a symlinked clone root resolved to {rel!r} "
+                f"({why}) -- the containment check is comparing unresolved paths")
+            # And the basename-guessing predecessor must not be what we rely on.
+            from app.pr_engine import _relative_file_path
+            assert _relative_file_path(target, "o/r") != rel, (
+                "pr_engine._relative_file_path now agrees, so this contrast is stale")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _slug_from_url(fork_pr, url: str) -> str:
+    """Resolve a remote URL through the real parser by faking only `git`.
+
+    Patching fork_pr._git rather than reimplementing the parsing keeps this test
+    honest: a reimplementation would pass while the shipped parser was wrong.
+    """
+    saved = fork_pr._git
+    fork_pr._git = lambda args, cwd: url if args[:2] == ["config", "--get"] else ""
+    try:
+        slug, _ = fork_pr.upstream_from_git_remote("/anywhere")
+        return slug
+    finally:
+        fork_pr._git = saved
+
+
+def test_a_hosted_provider_cannot_silently_receive_repository_content():
+    """Free is not private. Added 2026-09-13.
+
+    A free HOSTED tier costs nothing AND receives the prompt, and free tiers commonly
+    reserve the right to log or train on what they are sent. Ripple's prompts carry the
+    customer's source, so "we only use free models" is a COST claim and not a
+    data-handling one. Stage 1 made the default free; that did nothing about privacy,
+    because openrouter is free.
+
+    Two payload classes are gated, not one. fix_generator sends whole file bodies;
+    impact.rank and pr_prose send repository names, file paths and internal symbol
+    names. The second set is not file contents but it identifies the company and
+    discloses a private API surface, so it is still repository content.
+
+    THE CHECK LIVES IN run() BECAUSE THAT IS THE ONLY CHOKE POINT. fix_generator tries
+    the Configured custom-gateway entry FIRST, with chain=[configured], bypassing
+    fix_chain() completely -- so a filter applied only to the registry chain would guard
+    the path that is not taken. That specific bypass is asserted below.
+    """
+    import os as _os
+
+    from app import llm_chain as C
+    from app import llm_config as L
+    from app import llm_providers as P
+
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN", L.PAID_OPT_IN_ENV, L.HOSTED_OPT_IN_ENV,
+            L.SELF_HOSTED_ASSERT_ENV)
+    saved = {k: _os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            _os.environ.pop(k, None)
+
+        local = P.PROVIDERS["ollama"]
+        hosted = P.PROVIDERS["openrouter"]
+
+        # 1. The classification must follow the HOST, so it cannot be made wrong by
+        #    editing a field. A keyless public provider would otherwise read as local.
+        assert local.data_boundary == P.WEIGHTS_LOCAL
+        assert hosted.data_boundary == P.HOSTED_FREE
+        assert P.PROVIDERS["anthropic"].data_boundary == P.HOSTED_PAID
+        assert not local.sees_customer_data
+        assert hosted.sees_customer_data, (
+            "a free hosted tier is not treated as seeing customer data -- free was "
+            "confused with private, which is the whole point of this gate")
+
+        # Private addresses in every form Ripple's own deployments use.
+        for url in ("http://localhost:11434", "http://127.0.0.1:11434",
+                    "http://ripple-llm.railway.internal:11434",
+                    "http://10.0.0.7:11434", "http://172.16.4.4:11434",
+                    "http://192.168.1.9:11434", "http://ollama:11434"):
+            assert P.data_boundary_for_base_url(url) == P.WEIGHTS_LOCAL, url
+
+        # An unidentifiable PUBLIC host is NOT assumed local. This is the opposite
+        # asymmetry from is_paid_base_url, deliberately: guessing "free" costs nothing,
+        # guessing "local" discloses source.
+        assert P.data_boundary_for_base_url("https://llm.example.com") == \
+            P.HOSTED_UNKNOWN
+
+        # 2. With no opt-in, BOTH gated payload classes are refused to a hosted
+        #    provider, and a non-repository payload is not.
+        for payload in (C.PAYLOAD_SOURCE, C.PAYLOAD_METADATA):
+            ok, why = C.may_receive(hosted, payload)
+            assert not ok, f"{payload} may reach a third party with no opt-in"
+            assert L.HOSTED_OPT_IN_ENV in why, f"refusal does not say how: {why!r}"
+            assert C.may_receive(local, payload)[0], (
+                f"a LOCAL provider is refused {payload}; the gate has caught the "
+                f"private path it exists to protect")
+        assert C.may_receive(hosted, C.PAYLOAD_PUBLIC)[0]
+
+        # 3. THE DISCLOSURE MUST NOT HAPPEN. A refusal that still issues the request
+        #    and discards the reply has already sent the source.
+        fired = []
+        result = C.run(lambda p: fired.append(p.name) or "text",
+                       chain=[hosted], payload=C.PAYLOAD_SOURCE)
+        assert fired == [], (
+            "the provider was CALLED despite being refused -- the prompt left the "
+            "network and only the response was dropped")
+        assert not result.ok
+
+        # 4. And it must be STATED, not silent. Same requirement that made an
+        #    exhausted chain report itself instead of print()ing to stdout.
+        stated = result.stated_outcome()
+        assert "refused" in stated and L.HOSTED_OPT_IN_ENV in stated, (
+            f"the refusal is invisible to the PR body and activity log: {stated!r}")
+
+        # 5. FAIL CLOSED. A caller that forgets `payload` must be treated as sending
+        #    source, because the wrong default in the other direction is silent.
+        fired.clear()
+        assert not C.run(lambda p: fired.append(p.name) or "text",
+                         chain=[hosted]).ok
+        assert fired == [], "run()'s default payload class permits a disclosure"
+
+        # 6. THE BYPASS PATH. fix_generator runs the Configured entry with its own
+        #    one-element chain, so it must be covered by the same check.
+        assert not C.may_receive(
+            C.Configured(name="x", base_url="https://openrouter.ai/api"),
+            C.PAYLOAD_SOURCE)[0], (
+            "a custom gateway pointed at a third party bypasses the boundary check -- "
+            "this is the path fix_generator tries FIRST")
+        assert C.may_receive(
+            C.Configured(name="x", base_url="http://localhost:11434"),
+            C.PAYLOAD_SOURCE)[0]
+
+        # 7. The opt-in must actually open, or this is a block and not a gate.
+        _os.environ[L.HOSTED_OPT_IN_ENV] = "1"
+        assert C.may_receive(hosted, C.PAYLOAD_SOURCE)[0]
+        for refusal in ("0", "false", "no", "", "yes", "true"):
+            _os.environ[L.HOSTED_OPT_IN_ENV] = refusal
+            assert not C.may_receive(hosted, C.PAYLOAD_SOURCE)[0], (
+                f"{L.HOSTED_OPT_IN_ENV}={refusal!r} read as consent to disclose")
+        _os.environ.pop(L.HOSTED_OPT_IN_ENV, None)
+
+        # 8. RIPPLE_SELF_HOSTED may reclassify an UNIDENTIFIABLE host, because the
+        #    operator knows something inspection cannot. It must NOT launder a
+        #    catalogued third party -- that would turn a config mistake into a silent
+        #    disclosure.
+        _os.environ[L.SELF_HOSTED_ASSERT_ENV] = "1"
+        assert C.may_receive(
+            C.Configured(name="x", base_url="https://llm.example.com"),
+            C.PAYLOAD_SOURCE)[0], (
+            "an operator cannot declare their own public-address model self-hosted, so "
+            "a legitimate deployment shape is unusable")
+        for third_party in ("https://openrouter.ai/api", "https://api.anthropic.com"):
+            assert not C.may_receive(
+                C.Configured(name="x", base_url=third_party),
+                C.PAYLOAD_SOURCE)[0], (
+                f"{L.SELF_HOSTED_ASSERT_ENV} launders {third_party} as self-hosted")
+    finally:
+        for k, v in saved.items():
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
 
 
 def test_the_llm_budget_is_reset_once_per_push():

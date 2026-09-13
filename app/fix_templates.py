@@ -1109,10 +1109,16 @@ def apply_fix_template(
         old_variants = name_variants(field_name)
         new_variants = name_variants(new_name)
         result = _rename_field(code, old_variants, new_variants)
-        replacements = sum(
-            code.count(old_variants[s]) - result.count(old_variants[s])
-            for s in ('snake', 'camel', 'pascal', 'upper_snake')
-        )
+        # DISTINCT variant STRINGS, not the four variant KEYS. For an all-lowercase
+        # name snake and camel are the same string ("alltrue" == "alltrue"), so
+        # summing per key counted every replacement twice and reported "4
+        # replacements made" for a two-line edit. That number goes into a pull
+        # request body on a repository we do not own, where a maintainer can count
+        # the diff and see it disagree -- the same class of defect as a fix labelled
+        # with a backend that never answered.
+        counted = sorted({old_variants[s] for s in
+                          ('snake', 'camel', 'pascal', 'upper_snake')})
+        replacements = sum(code.count(v) - result.count(v) for v in counted)
         explanation = (
             f"Renamed '{field_name}' -> '{new_name}' across all case variants "
             f"(snake_case, camelCase, PascalCase, UPPER_SNAKE). "

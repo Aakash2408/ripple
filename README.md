@@ -716,7 +716,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 250 tests
+python tests/test_regression.py            # 256 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes
@@ -756,6 +756,43 @@ Its own docstring records two known gaps it does NOT fail on — `remove_field` 
 whole reference lines in the six languages with no handler, and a partial rename in
 shell — because inventing a failure for a weakness that is not a lie would only
 pressure someone into loosening the checks.
+
+## Models and where your code goes
+
+Ripple's default backend is **free, self-hosted, and Apache-2.0 licensed**. An
+unconfigured install resolves to a local model and never to a paid API:
+
+```
+ANTHROPIC_BASE_URL   default  http://localhost:11434     (your machine)
+ANTHROPIC_MODEL      default  qwen2.5-coder:7b           (Apache-2.0)
+```
+
+**Free is not the same question as private**, and the distinction is the one that
+matters for your source. A free hosted tier costs nothing *and* receives the prompt,
+and such tiers commonly reserve the right to log or train on what they are sent. So
+backends are classified by where the prompt ends up, not by what it costs:
+
+| Boundary | Example | Sees your code |
+|---|---|---|
+| `weights_local` | `localhost`, a private address, `*.internal` | no |
+| `hosted_free` | OpenRouter, Groq, Cerebras free tiers | **yes** |
+| `hosted_paid` | `api.anthropic.com` | **yes** |
+| `hosted_unknown` | any public host we cannot identify | **assumed yes** |
+
+Anything other than `weights_local` **refuses to receive repository content** — file
+bodies, repo names, paths, internal symbol names — unless you opt in explicitly. When
+it refuses, the run says so in the PR body and the activity log; it does not fall back
+silently.
+
+```bash
+RIPPLE_ALLOW_HOSTED_MODEL=1   # a third party may receive repository content
+RIPPLE_ALLOW_PAID_MODEL=1     # a metered API may be billed (also needs ANTHROPIC_MODEL)
+RIPPLE_SELF_HOSTED=1          # your own model lives at a public address
+```
+
+Deterministic codemods need no model at all, so `field_removed`, `field_renamed` and
+`type_changed` are fixed, and every patch is validated by `tsc --noEmit` in a pinned
+container, with no model involved in either step.
 
 ## License
 

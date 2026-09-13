@@ -234,6 +234,62 @@ def _fix_capable(provider) -> bool:
     return provider.fix_capable
 
 
+#: WHAT A PROMPT CARRIES, worst-first. The payload class decides which boundaries may
+#: receive it, so a caller naming the wrong one is the whole risk -- hence `run()`
+#: defaults to the strictest and a caller must opt DOWN, never up.
+#:
+#:   SOURCE    entire file contents. fix_generator sends the consumer file verbatim.
+#:   METADATA  repository names, file paths, internal symbol names. impact.rank and
+#:             pr_prose send these. Not file bodies, but they identify the company and
+#:             disclose a private internal API surface, so they are still repository
+#:             content and still gated.
+#:   PUBLIC    nothing derived from the customer's repositories.
+PAYLOAD_SOURCE = "source"
+PAYLOAD_METADATA = "metadata"
+PAYLOAD_PUBLIC = "public"
+
+#: Payload classes that must not cross a boundary out of the operator's control
+#: without an explicit opt-in.
+_GATED_PAYLOADS = (PAYLOAD_SOURCE, PAYLOAD_METADATA)
+
+
+def boundary_of(entry) -> str:
+    """Where a chain entry sends its prompt.
+
+    Works for both a registry Provider and a Configured custom gateway, because both
+    carry `base_url` and the boundary is a property of the endpoint rather than of the
+    type. That is what lets ONE check cover both paths -- and covering both is the
+    point: fix_generator tries the Configured entry FIRST, bypassing fix_chain()
+    entirely, so a filter applied only to the registry chain would guard the path that
+    is not taken.
+
+    Delegates to llm_config.boundary_for so the operator's SELF_HOSTED assertion is
+    applied in exactly one place. An earlier draft re-implemented that rule here, and a
+    mutation test showed the two copies could disagree -- /test-llm reporting
+    `weights_local` while the chain still refused.
+    """
+    from .llm_config import boundary_for
+    return boundary_for(getattr(entry, "base_url", ""))
+
+
+def may_receive(entry, payload: str) -> tuple:
+    """(allowed, reason). Reason is "" when allowed."""
+    from .llm_config import HOSTED_OPT_IN_ENV, hosted_opt_in
+    from .llm_providers import sees_customer_data
+
+    boundary = boundary_of(entry)
+    if not sees_customer_data(boundary):
+        return True, ""
+    if payload not in _GATED_PAYLOADS:
+        return True, ""
+    if hosted_opt_in():
+        return True, ""
+    return False, (
+        f"refused: {payload} would be sent to a third party ({boundary}) and "
+        f"{HOSTED_OPT_IN_ENV} is not set to 1"
+    )
+
+
 def fix_chain() -> list:
     """Providers trusted to WRITE CODE, in attempt order.
 
@@ -255,18 +311,37 @@ def prose_chain() -> list:
     return [p for p in usable() if _reachable(p)]
 
 
-def run(call, *, chain: list, budget: Budget = None) -> ChainResult:
+def run(call, *, chain: list, budget: Budget = None,
+        payload: str = PAYLOAD_SOURCE) -> ChainResult:
     """Try each provider until one answers. Never raises; always states what happened.
 
     `call(provider) -> str` performs one request and returns the model's text. It is
     injected rather than built here so this module holds the ORDERING and the
     CLASSIFICATION and knows nothing about the wire protocol -- the same separation
     that keeps llm_config the only place that decides how to reach a backend.
+
+    `payload` names what the prompt carries, and THIS IS THE DATA-BOUNDARY CHOKE POINT.
+    Every path to a model goes through here -- the registry chain and the Configured
+    custom gateway both -- so one check covers both, and enforcing it in fix_chain()
+    instead would have missed the Configured entry that fix_generator tries first.
+
+    It defaults to PAYLOAD_SOURCE, the strictest class, so a caller that forgets to say
+    is treated as sending the customer's source. Fail-closed is the only safe direction
+    for a disclosure check: a wrong default the other way is silent and unrecoverable,
+    whereas this one merely falls back to the deterministic path and says why.
     """
     budget = budget or Budget()
     attempts = []
 
     for provider in chain:
+        allowed, why = may_receive(provider, payload)
+        if not allowed:
+            # STATED, not silently dropped. This lands in stated_outcome(), so the PR
+            # body and the activity log both carry the reason -- the same requirement
+            # that made an exhausted chain report itself instead of print()ing.
+            attempts.append(Attempt(provider.name, "", "refused_data_boundary",
+                                    why, 0.0))
+            continue
         if not budget.allows(provider.name):
             attempts.append(Attempt(provider.name, "", "skipped",
                                     budget.why_skipped(provider.name), 0.0))
