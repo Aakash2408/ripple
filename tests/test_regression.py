@@ -3394,6 +3394,446 @@ class _FakeForkAPI:
         return {"error": f"unexpected {method} {path}"}
 
 
+def test_an_unconfigured_install_route_refuses_instead_of_reporting_health():
+    """No OAuth credentials must not answer 200. Added 2026-09-14.
+
+    /auth/gitlab returned `HTMLResponse(NO_CREDENTIALS_HTML, status_code=200)`
+    and /auth/bitbucket returned the same page on the default 200. So the install
+    ENTRY POINT reported success while being structurally incapable of
+    installing: with no GITLAB_APP_ID the redirect to GitLab cannot even be
+    built.
+
+    This got worse the moment /stats existed. A usage counter and any uptime
+    check read 200 on an install route as "the install path works", so the one
+    signal that would tell an operator the platform is misconfigured reports
+    health instead -- the same shape as experimental.py's reason for gating all
+    eleven routes rather than two: a surface that appears to work is worse than
+    one that plainly refuses.
+
+    The status endpoint carries the matching fix: `configured` separates
+    "nothing connected yet" from "this cannot work", which
+    {"connected_users": 0} alone could not express.
+    """
+    import asyncio
+    import importlib
+    import os as _os
+
+    saved_flag = _os.environ.get("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS")
+    saved_id = _os.environ.get("GITLAB_APP_ID")
+    saved_secret = _os.environ.get("GITLAB_APP_SECRET")
+    try:
+        # The platform must be ON, or the 501 refusal masks the case under test --
+        # which would make this gate vacuous.
+        _os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = "1"
+        _os.environ.pop("GITLAB_APP_ID", None)
+        _os.environ.pop("GITLAB_APP_SECRET", None)
+
+        from app import experimental, gitlab_oauth
+        importlib.reload(experimental)
+        importlib.reload(gitlab_oauth)
+        assert experimental.experimental_enabled(), (
+            "flag not on, so the 501 refusal would hide the unconfigured case")
+        assert gitlab_oauth.GITLAB_APP_ID == "", "credentials leaked into the test"
+
+        resp = asyncio.run(gitlab_oauth.gitlab_auth_start())
+        assert resp.status_code != 200, (
+            "an install route with NO OAuth credentials answered 200 -- every "
+            "monitor and the /stats counters read that as a working install path")
+        assert resp.status_code == 503, resp.status_code
+
+        # And status must SAY it cannot work, not just report zero connections.
+        st = asyncio.run(gitlab_oauth.gitlab_auth_status())
+        assert st["configured"] is False, (
+            "status does not distinguish 'not configured' from 'nobody has "
+            f"connected yet': {st}")
+
+        # With credentials present it must actually proceed -- otherwise this
+        # gate would pass on a route that refuses unconditionally.
+        _os.environ["GITLAB_APP_ID"] = "test-app-id"
+        _os.environ["GITLAB_APP_SECRET"] = "test-secret"
+        importlib.reload(gitlab_oauth)
+        ok = asyncio.run(gitlab_oauth.gitlab_auth_start())
+        assert ok.status_code in (302, 307), (
+            f"a configured install route did not redirect to GitLab: "
+            f"{ok.status_code}")
+        st2 = asyncio.run(gitlab_oauth.gitlab_auth_status())
+        assert st2["configured"] is True
+
+        # Bitbucket carries the same defect and the same fix.
+        from app import bitbucket_oauth
+        saved_bb = _os.environ.get("BITBUCKET_CLIENT_ID")
+        try:
+            _os.environ.pop("BITBUCKET_CLIENT_ID", None)
+            importlib.reload(bitbucket_oauth)
+            bb = asyncio.run(bitbucket_oauth.bitbucket_auth_start())
+            assert bb.status_code == 503, (
+                f"/auth/bitbucket answers {bb.status_code} with no credentials")
+        finally:
+            if saved_bb is not None:
+                _os.environ["BITBUCKET_CLIENT_ID"] = saved_bb
+            else:
+                _os.environ.pop("BITBUCKET_CLIENT_ID", None)
+            importlib.reload(bitbucket_oauth)
+    finally:
+        for k, v in (("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", saved_flag),
+                     ("GITLAB_APP_ID", saved_id),
+                     ("GITLAB_APP_SECRET", saved_secret)):
+            _os.environ.pop(k, None)
+            if v is not None:
+                _os.environ[k] = v
+        from app import experimental as _e, gitlab_oauth as _g
+        importlib.reload(_e)
+        importlib.reload(_g)
+
+
+def test_an_app_install_is_recorded_with_the_account_that_installed_it():
+    """An install must be visible, and must name WHO. Added 2026-09-14.
+
+    The store recorded 66 different action names and not one of them was an
+    install. An `installation` event did reach _log_activity as
+    `webhook_received`, but that handler reads `repository.full_name` -- a key
+    installation payloads DO NOT HAVE (they carry `installation.account` plus a
+    `repositories` list) -- so the installer was recorded as "?" and then
+    discarded by monitored_repos(), which requires an owner/name pair.
+
+    The cost was a wrong conclusion, not a missing metric: with installs
+    unrecorded, a dashboard showing only the operator's own repos looked exactly
+    the same whether zero strangers or a dozen had installed the App. That is
+    what made a burst of landing-page traffic readable as "people are trying it
+    and it falls short".
+    """
+    from app import activity, webhook
+
+    activity.reset()
+    try:
+        # A real GitHub installation payload shape: no `repository` key at all.
+        res = webhook._handle_installation_event({
+            "action": "created",
+            "installation": {"id": 4242,
+                             "account": {"login": "acme-corp", "type": "Organization"}},
+            "repositories": [{"full_name": "acme-corp/api"},
+                             {"full_name": "acme-corp/web"}],
+        }, "installation")
+        assert res["status"] == "install_recorded", res
+        assert res["account"] == "acme-corp"
+
+        events = activity.all_events()
+        installs = [e for e in events if e.get("action") == "app_installed"]
+        assert len(installs) == 1, f"install not recorded: {events}"
+        rec = installs[0]
+
+        # The identity is the whole point. "?" is the bug.
+        assert rec["account"] == "acme-corp", rec
+        assert rec["account"] != "?", (
+            "the installer is recorded as '?' -- this is the original defect: "
+            "reading repository.full_name from a payload that has no "
+            "`repository` key, only `installation.account`")
+        assert rec["installation_id"] == 4242
+        assert rec["repo_count"] == 2
+
+        # And the install must feed the derived views, not just sit in the log.
+        assert activity.counters()["installs"] == 1
+        assert activity.counters()["accounts_installed"] == 1
+        assert "acme-corp/api" in activity.monitored_repos(), (
+            "an install's repositories do not reach monitored_repos(), so a "
+            "stranger who installs but never pushes stays invisible")
+
+        # Removal must actually remove -- otherwise the count only ever climbs
+        # and 'accounts_installed' becomes 'accounts that ever installed'.
+        webhook._handle_installation_event({
+            "action": "deleted",
+            "installation": {"id": 4242, "account": {"login": "acme-corp"}},
+        }, "installation")
+        assert activity.counters()["uninstalls"] == 1
+        assert activity.installers() == [], (
+            "an uninstalled account is still counted as installed")
+
+        # Reinstall: order must win over tallying.
+        webhook._handle_installation_event({
+            "action": "created",
+            "installation": {"id": 77, "account": {"login": "acme-corp"}},
+            "repositories": [{"full_name": "acme-corp/api"}],
+        }, "installation")
+        assert activity.installers() == ["acme-corp"], (
+            "a reinstall after removal must count as installed")
+
+        # An unmodelled action must SAY so rather than vanish.
+        activity.reset()
+        res = webhook._handle_installation_event({
+            "action": "some_future_action",
+            "installation": {"account": {"login": "n"}},
+        }, "installation")
+        assert res["status"] == "ignored" and "some_future_action" in res["reason"]
+        assert any(e.get("action") == "install_event_unhandled"
+                   for e in activity.all_events()), (
+            "an unhandled installation action leaves no trace")
+
+        # AND -- the part that makes the rest of this gate mean anything --
+        # /webhook must actually DISPATCH to the handler. Everything above calls
+        # _handle_installation_event directly, so without this the whole gate
+        # would pass on a server that received an installation event and
+        # returned {"status": "ignored"} exactly as before. Assert at the real
+        # call site, through the route.
+        import asyncio
+
+        class _Req:
+            def __init__(self, body: bytes, headers: dict):
+                self._body, self.headers = body, headers
+
+            async def body(self):
+                return self._body
+
+        activity.reset()
+        payload = json.dumps({
+            "action": "created",
+            "installation": {"id": 9, "account": {"login": "stranger-inc"}},
+            "repositories": [{"full_name": "stranger-inc/svc"}],
+        }).encode()
+        routed = asyncio.run(webhook.github_webhook(
+            _Req(payload, {"X-GitHub-Event": "installation"})))
+        assert routed.get("status") == "install_recorded", (
+            f"/webhook does not route installation events to the install "
+            f"handler; it returned {routed}")
+        assert activity.counters()["installs"] == 1
+        assert activity.installers() == ["stranger-inc"]
+    finally:
+        activity.reset()
+
+
+def test_stats_reports_usage_without_leaking_repo_names():
+    """/stats answers 'is anyone using this?' but must not enumerate whose repos.
+
+    Two independent failures are gated here.
+
+    ONE -- the endpoint must exist at all. activity.counters() was computed and
+    then rendered ONLY into the /dashboard HTML, while /activity, /stats and
+    /metrics were 404. The numbers existed and could not be read.
+
+    TWO -- and this is the one that would be a NEW defect rather than an old
+    one: Ripple asks strangers to install it on their repositories. An endpoint
+    that let any visitor enumerate those repositories would be worse than the
+    blindness it replaces. So the public body carries counts only, and the token
+    check FAILS CLOSED -- an unset RIPPLE_ADMIN_TOKEN must refuse, never serve.
+    """
+    import asyncio
+    import os as _os
+
+    from fastapi import HTTPException
+
+    from app import activity, webhook
+
+    class _Req:
+        def __init__(self, headers=None):
+            self.headers = headers or {}
+
+    saved = _os.environ.get("RIPPLE_ADMIN_TOKEN")
+    activity.reset()
+    try:
+        webhook._handle_installation_event({
+            "action": "created",
+            "installation": {"id": 1, "account": {"login": "secret-org"}},
+            "repositories": [{"full_name": "secret-org/private-api"}],
+        }, "installation")
+
+        public = asyncio.run(
+            webhook.usage_stats(_Req(), detail=0))
+
+        assert public["installs"] == 1
+        assert public["accounts_installed"] == 1
+        assert public["repos_monitored"] == 1
+        # Timestamps, so a count cannot masquerade as fresh activity.
+        assert public["last_event"], "no last_event, so staleness is unknowable"
+        assert "stale_days" in public
+
+        # THE LEAK CHECK. Assert on the SERIALISED body, not on key names: a
+        # name nested inside `recent` or any future field would pass a
+        # key-by-key check while still being served to the public.
+        import json as _json
+        blob = _json.dumps(public)
+        assert "secret-org" not in blob, (
+            f"/stats leaks the installing account to unauthenticated callers: {blob}")
+        assert "private-api" not in blob, (
+            f"/stats leaks a repository name to unauthenticated callers: {blob}")
+
+        # FAIL CLOSED: no token configured -> refuse, do not serve.
+        _os.environ.pop("RIPPLE_ADMIN_TOKEN", None)
+        try:
+            asyncio.run(
+                webhook.usage_stats(_Req(), detail=1))
+            raise AssertionError(
+                "detail was served with no RIPPLE_ADMIN_TOKEN configured -- an "
+                "unset variable must never mean 'no auth required'")
+        except HTTPException as e:
+            assert e.status_code == 503, e.status_code
+
+        # Wrong token -> refuse.
+        _os.environ["RIPPLE_ADMIN_TOKEN"] = "correct-horse"
+        try:
+            asyncio.run(
+                webhook.usage_stats(_Req({"X-Ripple-Admin-Token": "wrong"}),
+                                    detail=1))
+            raise AssertionError("a wrong admin token was accepted")
+        except HTTPException as e:
+            assert e.status_code == 401, e.status_code
+
+        # Right token -> names appear.
+        detailed = asyncio.run(
+            webhook.usage_stats(_Req({"X-Ripple-Admin-Token": "correct-horse"}),
+                                detail=1))
+        assert detailed["accounts"] == ["secret-org"]
+        assert "secret-org/private-api" in detailed["repos"], (
+            "the authorised view does not actually show the detail, so this "
+            "gate would pass on an endpoint that returns nothing")
+    finally:
+        activity.reset()
+        _os.environ.pop("RIPPLE_ADMIN_TOKEN", None)
+        if saved is not None:
+            _os.environ["RIPPLE_ADMIN_TOKEN"] = saved
+
+
+def test_no_public_surface_advertises_a_switched_off_platform():
+    """A 501-by-design route must not be offered as an install link. Added 2026-09-14.
+
+    app/experimental.py switches GitLab and Bitbucket off and gates ALL ELEVEN routes
+    rather than only the webhooks, for a reason it states plainly: "a half-disabled
+    platform is worse than a live one, because the product appears to be working."
+
+    The server honoured that. The public surfaces did not -- README, the dashboard,
+    the dry-run result panel, the landing page hero and its footer all advertised
+    `Install on GitLab` pointing at `/auth/gitlab`, which returns 501. The worst of
+    those was the dry-run panel: the most likely path a stranger takes through the
+    product is run a dry run, see a real breaking change, and be offered a fix.
+
+    So this gate closes the loop one layer up: the flag decides what is advertised,
+    not just what answers.
+    """
+    import inspect
+    import os as _os
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+
+    from app.experimental import EXPERIMENTAL_PLATFORMS, experimental_enabled
+
+    saved = _os.environ.get("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS")
+    try:
+        _os.environ.pop("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", None)
+        assert not experimental_enabled(), "the flag is on; this gate assumes default-off"
+
+        # 1. STATIC TEXT must not link an install route for a gated platform.
+        #    Scoped to auth/setup routes: a link to a gitlab.com MERGE REQUEST is
+        #    evidence of past work and stays, while /auth/gitlab is a promise.
+        #
+        #    TWO THINGS THIS HAS TO HANDLE, both found by mutation:
+        #
+        #    (a) COMMENT SYNTAX IS PER-FILETYPE. An earlier version skipped any line
+        #        starting with "#" as a comment, which in Markdown is a HEADING --
+        #        so the README's own header link, the most prominent one in the repo,
+        #        was invisible to this gate.
+        #    (b) THE LINK IS USUALLY INDIRECT. The site writes href={LINKS.gitlab};
+        #        the literal /auth/gitlab lives only in ripple.ts's LINKS object. A
+        #        pattern matching the path alone therefore missed every component,
+        #        which is where the install buttons actually are. So the gated keys
+        #        are resolved from LINKS first, and REFERENCES to them are flagged.
+        gated = "|".join(EXPERIMENTAL_PLATFORMS)
+        data_file = root / "website" / "src" / "data" / "ripple.ts"
+
+        # Which LINKS keys point at a gated install route?
+        gated_keys = set()
+        if data_file.exists():
+            for line in data_file.read_text().splitlines():
+                m = re.match(
+                    r"""\s*(\w+)\s*:\s*["'][^"']*/(?:auth|setup)/(?:%s)\b""" % gated,
+                    line)
+                if m:
+                    gated_keys.add(m.group(1))
+        assert gated_keys, (
+            "no LINKS key resolves to a gated install route -- either the LINKS "
+            "object moved or this resolution broke, and the indirect-reference "
+            "check below would silently pass on everything")
+
+        direct = re.compile(
+            r"""(?:href=|\]\()\s*["'{]?[^"'\s)}]*?/(?:auth|setup)/(?:%s)\b""" % gated)
+        indirect = re.compile(r"\bLINKS\.(%s)\b" % "|".join(sorted(gated_keys)))
+
+        comment_prefixes = {
+            ".md": ("<!--",),
+            ".ts": ("//", "*", "/*"),
+            ".tsx": ("//", "*", "/*", "{/*"),
+            ".py": ("#",),
+        }
+
+        offenders = []
+        watched = [
+            root / "README.md",
+            data_file,
+            root / "website" / "src" / "routes" / "index.tsx",
+            root / "website" / "src" / "components" / "ripple" / "Footer.tsx",
+        ]
+        for path in watched:
+            if not path.exists():
+                continue
+            prefixes = comment_prefixes.get(path.suffix, ("#",))
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                stripped = line.strip()
+                # Comments explaining WHY a link was removed are not the link.
+                if stripped.startswith(prefixes):
+                    continue
+                # The LINKS object DEFINES these URLs, which is fine: experimental.py
+                # deliberately kept the adapters rather than deleting the wiring.
+                # What must not happen is a surface RENDERING one.
+                is_definition = path == data_file and re.match(
+                    r"\s*\w+\s*:\s*[\"']https?://", line)
+                if direct.search(line) and not is_definition:
+                    offenders.append(f"{path.relative_to(root)}:{n}: {stripped[:100]}")
+                elif indirect.search(line):
+                    offenders.append(f"{path.relative_to(root)}:{n}: {stripped[:100]}")
+        assert not offenders, (
+            "a public surface advertises an install route for a switched-off "
+            "platform; every one of these returns 501:\n  " + "\n  ".join(offenders))
+
+        # 2. The SERVER-RENDERED surfaces must gate on the flag, not hardcode it.
+        from app import dashboard, dry_run
+
+        assert "/auth/gitlab" not in dashboard._gitlab_links_html(), (
+            "the dashboard offers the GitLab install link with the platform "
+            "switched off")
+        assert "experimental_enabled" in inspect.getsource(dashboard._gitlab_links_html)
+
+        dry_src = inspect.getsource(dry_run.dry_run_ui)
+        assert "experimental_enabled" in dry_src, (
+            "the dry-run page does not consult the platform flag, so its 'Install "
+            "on GitLab' offer is unconditional")
+
+        # 3. And the placeholder must never reach a browser. A silently-failed
+        #    substitution would otherwise leave the 501 link live and look fine.
+        assert dry_run._GITLAB_OFFER_PLACEHOLDER in dry_run.DRY_RUN_HTML, (
+            "the dry-run template no longer carries the placeholder, so the "
+            "substitution below is a silent no-op")
+        rendered_off = dry_run.DRY_RUN_HTML.replace(
+            dry_run._GITLAB_OFFER_PLACEHOLDER, "")
+        assert dry_run._GITLAB_OFFER_PLACEHOLDER not in rendered_off
+        assert "/auth/gitlab" not in rendered_off, (
+            "the dry-run page still links /auth/gitlab with the platform off")
+
+        # 4. With the flag ON the offer comes BACK -- otherwise this is a deletion
+        #    masquerading as a gate, and flipping the flag would leave the product
+        #    silently un-advertised.
+        _os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = "1"
+        assert experimental_enabled()
+        assert "/auth/gitlab" in dashboard._gitlab_links_html(), (
+            "the dashboard does not restore the GitLab link when the platform is "
+            "switched back on")
+        rendered_on = dry_run.DRY_RUN_HTML.replace(
+            dry_run._GITLAB_OFFER_PLACEHOLDER, dry_run._GITLAB_OFFER_HTML)
+        assert "/auth/gitlab" in rendered_on
+    finally:
+        _os.environ.pop("RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS", None)
+        if saved is not None:
+            _os.environ["RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS"] = saved
+
+
 def test_a_raising_github_client_becomes_a_refusal_not_an_aborted_run():
     """fork_pr's failure contract is "return an error", but pr_engine's client RAISES.
 

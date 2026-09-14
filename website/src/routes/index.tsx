@@ -104,22 +104,14 @@ function Index() {
                   >
                     Install on GitHub
                   </a>
-                  <a
-                    href={LINKS.gitlab}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="rounded-md border border-border px-5 py-3 text-sm font-medium transition-colors hover:border-primary/60"
-                  >
-                    GitLab
-                  </a>
-                  <a
-                    href={LINKS.bitbucket}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="rounded-md border border-border px-5 py-3 text-sm font-medium transition-colors hover:border-primary/60"
-                  >
-                    Bitbucket
-                  </a>
+                  {/*
+                    The GitLab and Bitbucket install buttons were removed: both
+                    pointed at /auth/<platform>, which app/experimental.py answers
+                    with 501 by design. A primary CTA that returns 501 is the worst
+                    place for that promise -- see PLATFORMS_SWITCHED_OFF in
+                    src/data/ripple.ts. Restore them together with the server flag,
+                    not before.
+                  */}
                 </div>
 
                 <div className="mt-6 flex flex-wrap items-center gap-x-6 gap-y-2 font-mono text-xs text-muted-foreground">

@@ -337,6 +337,80 @@ async def recent_logs():
     return {"count": len(_activity_log), "logs": _activity_log[-30:]}
 
 
+@app.get("/stats")
+async def usage_stats(request: FastAPIRequest, detail: int = 0):
+    """Is anyone actually using Ripple? One endpoint that answers it.
+
+    Until this existed, the counters were computed by activity.counters() and
+    then rendered ONLY into the /dashboard HTML, so the sole way to read them
+    was to scrape a web page -- and /activity, /stats and /metrics all 404'd.
+    That is how a burst of landing-page traffic came to be read as "people are
+    trying Ripple and it is not good enough" when the truth was that nobody had
+    installed it at all. The numbers could not be checked, so they were guessed.
+
+    `stale` is here for the same reason: a count with no timestamp cannot
+    distinguish a live product from one whose last real event was weeks ago.
+
+    PRIVACY -- WHY THE DEFAULT IS AGGREGATE-ONLY
+    -------------------------------------------
+    The public body carries COUNTS, never names. Ripple is asking strangers to
+    install it on their repositories; an endpoint that let any visitor enumerate
+    which private-ish repos other people had connected would be a worse problem
+    than the blindness it fixes. Names require RIPPLE_ADMIN_TOKEN.
+
+    The token check FAILS CLOSED: with no token configured, detail is refused
+    rather than served to everyone. An unset variable must never mean "no
+    authentication required" -- that is the same fail-open shape as defaulting
+    to a paid model when no provider is set.
+    """
+    stats = _activity.counters()
+    first, last = _activity.first_and_last_seen()
+
+    stale_days = None
+    if last:
+        try:
+            stale_days = round(
+                (_time.time() - _time.mktime(
+                    _time.strptime(last, "%Y-%m-%d %H:%M:%S"))) / 86400.0, 1)
+        except (ValueError, OverflowError):
+            stale_days = None
+
+    body = {
+        "installs": stats.get("installs", 0),
+        "uninstalls": stats.get("uninstalls", 0),
+        "accounts_installed": stats.get("accounts_installed", 0),
+        "repos_monitored": stats.get("repos_monitored", 0),
+        "breaks_detected": stats.get("breaks_detected", 0),
+        "prs_created": stats.get("prs_created", 0),
+        "fixes_generated": stats.get("fixes_generated", 0),
+        "partial_fixes": stats.get("partial_fixes", 0),
+        "rejected_deliveries": stats.get("rejected_deliveries", 0),
+        "events_recorded": len(_activity.all_events()),
+        "first_event": first,
+        "last_event": last,
+        "stale_days": stale_days,
+        "build": build_info(),
+    }
+
+    if not detail:
+        return body
+
+    expected = os.environ.get("RIPPLE_ADMIN_TOKEN", "")
+    supplied = request.headers.get("X-Ripple-Admin-Token", "")
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="detail requires RIPPLE_ADMIN_TOKEN to be configured; "
+                   "refusing to serve repository names unauthenticated")
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="bad or missing admin token")
+
+    body["accounts"] = _activity.installers()
+    body["repos"] = _activity.monitored_repos()
+    body["recent"] = _activity.recent(50)
+    return body
+
+
 @app.get("/test-llm")
 async def test_llm():
     """Does the CONFIGURED backend answer? Minimal prompt, honest labelling.
@@ -587,6 +661,72 @@ async def org_status(org: str):
 
 # === GitHub Webhook ===
 
+def _handle_installation_event(payload: dict, event_type: str) -> dict:
+    """Record an App install / removal / repository-scope change.
+
+    Returns a dispatch summary rather than {"status": "ignored"}, which is what
+    these events used to fall through to.
+
+    The account is read from `installation.account.login` because that is the
+    only place it exists on these payloads. `repositories` is a LIST of objects
+    with `full_name`, and on `installation_repositories` the lists are
+    `repositories_added` / `repositories_removed` instead -- three different
+    shapes for one question, which is why reading `repository.full_name` (the
+    shape every OTHER event uses) produced "?".
+    """
+    install = payload.get("installation", {}) or {}
+    account = (install.get("account", {}) or {}).get("login") or "unknown"
+    action = payload.get("action", "")
+
+    def _names(key: str) -> list:
+        out = []
+        for r in (payload.get(key) or []):
+            if isinstance(r, dict) and r.get("full_name"):
+                out.append(r["full_name"])
+            elif isinstance(r, str) and "/" in r:
+                out.append(r)
+        return out
+
+    if event_type == "installation" and action in ("created", "new_permissions_accepted"):
+        repos = _names("repositories")
+        _log_activity("app_installed", {
+            "account": account,
+            "installation_id": install.get("id"),
+            "repos": repos,
+            "repo_count": len(repos),
+            "account_type": (install.get("account", {}) or {}).get("type", ""),
+        })
+        return {"status": "install_recorded", "account": account,
+                "repos": len(repos)}
+
+    if event_type == "installation" and action in ("deleted", "suspend"):
+        _log_activity("app_uninstalled", {
+            "account": account,
+            "installation_id": install.get("id"),
+            "reason": action,
+        })
+        return {"status": "uninstall_recorded", "account": account}
+
+    if event_type == "installation_repositories":
+        added, removed = _names("repositories_added"), _names("repositories_removed")
+        _log_activity("install_repos_changed", {
+            "account": account,
+            "repos": added,
+            "added": len(added),
+            "removed": len(removed),
+        })
+        return {"status": "install_scope_recorded", "account": account,
+                "added": len(added), "removed": len(removed)}
+
+    # An installation event we do not model yet. Say so with the action name
+    # rather than discarding it -- an unrecognised action is a gap to close, and
+    # silently ignoring it is how the original hole stayed open.
+    _log_activity("install_event_unhandled", {
+        "account": account, "event": event_type, "install_action": action})
+    return {"status": "ignored", "reason": f"unhandled {event_type}/{action}",
+            "account": account}
+
+
 @app.post("/webhook")
 async def github_webhook(request: FastAPIRequest):
     """
@@ -599,11 +739,40 @@ async def github_webhook(request: FastAPIRequest):
     """
     # Verify webhook signature (if secret is configured)
     body = await request.body()
-    _verify_signature(request, body)
-    
+    try:
+        _verify_signature(request, body)
+    except HTTPException:
+        # A REFUSED delivery is still someone trying to use Ripple, and it used
+        # to be the one outcome that left no trace at all: _verify_signature
+        # raises before any recording, so a stranger whose secret did not match
+        # was indistinguishable from no traffic. Record, then re-raise -- the
+        # refusal itself must not change.
+        _log_activity("webhook_signature_rejected", {
+            "event": request.headers.get("X-GitHub-Event", "?"),
+            # Deliberately NOT the body or the signature: one is repository
+            # content and the other is a credential.
+            "delivery": request.headers.get("X-GitHub-Delivery", "?"),
+        })
+        raise
+
     payload = json.loads(body)
     event_type = request.headers.get("X-GitHub-Event", "")
-    
+
+    # Handle the App being INSTALLED or REMOVED.
+    #
+    # This is the single most important event for answering "is anyone using
+    # this?", and it was invisible. It did reach _log_activity below as
+    # `webhook_received`, but an installation payload has NO `repository` key --
+    # it carries `installation.account` plus a `repositories` LIST -- so the one
+    # field identifying WHO installed was recorded as "?" and then dropped by
+    # monitored_repos(), which requires an owner/name pair.
+    #
+    # The consequence was not a missing metric, it was a wrong conclusion: with
+    # installs unrecorded, a dashboard showing only the operator's own repos
+    # looked identical whether zero strangers or a dozen had installed the App.
+    if event_type in ("installation", "installation_repositories"):
+        return _handle_installation_event(payload, event_type)
+
     # Handle PR merge events → continuous learning
     if event_type == "pull_request" and payload.get("action") == "closed":
         pr = payload.get("pull_request", {})

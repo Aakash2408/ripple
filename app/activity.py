@@ -141,6 +141,16 @@ _COUNTERS = {
     "prs_created": ("pr_result", "pr_updated_existing"),
     "partial_fixes": ("residual_refs_flagged",),
     "fixes_generated": ("fix_generated",),
+    # An INSTALL is the first thing a stranger does and, until now, the one
+    # thing nothing recorded. Every counter above measures work Ripple did
+    # AFTER someone was already using it, so the store could only ever describe
+    # the operator's own repos -- and an outsider who installed the App and
+    # never pushed a contract file was indistinguishable from no one at all.
+    "installs": ("app_installed",),
+    "uninstalls": ("app_uninstalled",),
+    # A delivery we REFUSED is still someone trying. Counted separately so a
+    # misconfigured secret cannot look like silence.
+    "rejected_deliveries": ("webhook_signature_rejected",),
 }
 
 
@@ -176,8 +186,53 @@ def counters() -> dict:
         1 for e in events
         if e.get("action") in _COUNTERS["fixes_generated"] and e.get("changed")
     )
+    for key in ("installs", "uninstalls", "rejected_deliveries"):
+        out[key] = sum(
+            1 for e in events if e.get("action") in _COUNTERS[key])
     out["repos_monitored"] = len(monitored_repos())
+    out["accounts_installed"] = len(installers())
     return out
+
+
+def installers() -> list:
+    """Accounts that installed the App and have not since removed it.
+
+    Derived from the event stream rather than a separate registry, for the same
+    reason monitored_repos() is: a registry has to be written to, and the one
+    this module replaced never was.
+
+    Order matters -- an account that installed, removed, and reinstalled is
+    currently installed -- so the events are replayed in time order rather than
+    counted.
+    """
+    with _lock:
+        _load()
+        events = list(_events)
+
+    live = {}
+    for e in events:
+        account = e.get("account")
+        if not account:
+            continue
+        if e.get("action") == "app_installed":
+            live[account] = True
+        elif e.get("action") == "app_uninstalled":
+            live[account] = False
+    return sorted(a for a, installed in live.items() if installed)
+
+
+def first_and_last_seen() -> tuple:
+    """Timestamps of the oldest and newest recorded events, or (None, None).
+
+    Answers the question a bare count cannot: is this store describing activity
+    from this week, or is every number in it months old? The stale-data case is
+    what made 63 events look like a working product.
+    """
+    with _lock:
+        _load()
+        if not _events:
+            return (None, None)
+        return (_events[0].get("ts"), _events[-1].get("ts"))
 
 
 def monitored_repos() -> list:

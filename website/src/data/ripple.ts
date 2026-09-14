@@ -57,10 +57,21 @@ export const DASHBOARD_LINKS = [
   { label: "Open dashboard", href: LINKS.dashboard, note: "live control plane" },
   { label: "API docs (Swagger UI)", href: LINKS.docs, note: "/docs" },
   { label: "Health check", href: LINKS.health, note: "/health" },
-  { label: "GitLab manual setup", href: LINKS.gitlabSetup, note: "/setup/gitlab" },
   { label: "Rate limit status", href: LINKS.rateLimit, note: "/rate-limit" },
   { label: "Install on more repos", href: LINKS.github, note: "GitHub App" },
 ];
+
+// Adapters that EXIST but whose install/OAuth/setup routes are switched off
+// server-side by app/experimental.py (default off; RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS=1
+// brings them back). Mirrors EXPERIMENTAL_PLATFORMS there.
+//
+// Nothing in this list may be rendered as an install link. Every such route
+// returns 501, and experimental.py's own rationale is why that matters: it gated
+// all eleven routes rather than only the webhooks precisely because "a
+// half-disabled platform is worse than a live one, because the product appears to
+// be working". A landing page still offering the install button reintroduces that
+// failure one layer up -- the server refuses honestly while the UI keeps promising.
+export const PLATFORMS_SWITCHED_OFF = ["gitlab", "bitbucket"] as const;
 
 export const NAV = [
   { label: "Contracts", href: "#contracts" },
@@ -76,8 +87,13 @@ export const NAV = [
 export const STATS = [
   { value: "10", label: "contract types" },
   { value: "50+", label: "detections" },
-  { value: "7", label: "platforms" },
-  { value: "82", label: "tests" },
+  // "platform adapters built" rather than "platforms": seven adapters exist, but
+  // GitHub is the only one serving production traffic. GitLab and Bitbucket are
+  // switched off by app/experimental.py (RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS),
+  // and the remaining four are self-hosted-agent targets. Saying "7 platforms"
+  // promised a stranger six install paths that return 501.
+  { value: "7", label: "platform adapters built" },
+  { value: "257", label: "tests" },
 ];
 
 export const CONTRACTS = [
@@ -148,7 +164,7 @@ export const STEPS = [
   {
     n: "01",
     title: "Install",
-    body: "One click. GitHub, GitLab, Bitbucket + self-hosted (Phabricator, Gerrit, CRUX, generic Git).",
+    body: "One click on GitHub. GitLab and Bitbucket adapters are built but currently switched off; on-prem Git, Phabricator, Gerrit and CRUX run through the self-hosted agent.",
   },
   { n: "02", title: "Push", body: "Change your spec. Push to main." },
   {
@@ -205,14 +221,14 @@ export const PRICING = [
     name: "Open Source",
     price: "Free",
     note: "Forever",
-    features: ["All 10 contract types", "12 fix languages + LLM", "7 platforms", "Self-hosted agent", "Community support"],
+    features: ["All 10 contract types", "12 fix languages + LLM", "GitHub App + self-hosted agent", "Community support"],
     cta: { label: "Install on GitHub", href: LINKS.github },
     featured: true,
   },
   {
     name: "Team",
-    price: "$49",
-    note: "per month (coming soon)",
+    price: "$12",
+    note: "per seat / month (coming soon)",
     features: ["Private repos", "Org-wide scanning", "Slack notifications", "Priority support"],
     cta: { label: "Join waitlist", href: "#" },
     featured: false,

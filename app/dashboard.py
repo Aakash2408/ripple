@@ -28,6 +28,27 @@ router = APIRouter()
 from . import activity as _activity
 
 
+def _gitlab_links_html() -> str:
+    """GitLab links ONLY when the platform is actually switched on.
+
+    These two `<li>`s were unconditional, so the dashboard offered "Install on
+    GitLab" and "GitLab Manual Setup" while app/experimental.py answered both routes
+    with 501. That is the exact failure experimental.py gated all eleven routes to
+    avoid -- its own words: "a half-disabled platform is worse than a live one,
+    because the product appears to be working". The server refused honestly; the UI
+    kept promising.
+
+    Reads the flag per render rather than at import, matching
+    experimental_enabled()'s own reasoning: an operator who flips the env var and
+    restarts should not have to reason about which module captured the old value.
+    """
+    from .experimental import experimental_enabled
+    if not experimental_enabled():
+        return ""
+    return ('<li><a href="/auth/gitlab">Install on GitLab</a></li>\n'
+            '                <li><a href="/setup/gitlab">GitLab Manual Setup</a></li>')
+
+
 def log_activity(action: str, details: dict):
     """Deprecated: record via the shared store."""
     _activity.record(action, details)
@@ -231,8 +252,7 @@ async def dashboard():
                 <li><a href="https://ripple-cnn.pages.dev/" target="_blank">Landing Page</a></li>
                 <li><a href="/docs">API Documentation (Swagger UI)</a></li>
                 <li><a href="/health">Health Check</a></li>
-                <li><a href="/auth/gitlab">Install on GitLab</a></li>
-                <li><a href="/setup/gitlab">GitLab Manual Setup</a></li>
+                {_gitlab_links_html()}
                 <li><a href="/rate-limit/unknown">Rate Limit Status</a></li>
                 <li><a href="https://github.com/Aakash2408/ripple" target="_blank">Source Code</a></li>
                 <li><a href="https://github.com/apps/ripple-api" target="_blank">Install GitHub App</a></li>

@@ -121,10 +121,30 @@ async def dry_run_analysis(request: Request):
     })
 
 
+#: Substituted into DRY_RUN_HTML at render time. The template carries the
+#: placeholder rather than the anchor so that a leak is DETECTABLE: if the
+#: substitution is ever removed, `__GITLAB_OFFER__` appears in the page and a gate
+#: catches it, whereas a silently-failed str.replace() on a literal anchor would
+#: leave the 501 link in place and look fine.
+_GITLAB_OFFER_PLACEHOLDER = "__GITLAB_OFFER__"
+_GITLAB_OFFER_HTML = '<a href="/auth/gitlab">Install on GitLab</a> or '
+
+
 @router.get("/dry-run")
 async def dry_run_ui():
-    """Interactive UI for dry-run analysis."""
-    return HTMLResponse(content=DRY_RUN_HTML)
+    """Interactive UI for dry-run analysis.
+
+    The GitLab install offer is rendered ONLY when the platform is switched on.
+    It used to be unconditional, so the most likely stranger-facing path in the
+    product -- run a dry run, see a real breaking change, be offered a fix -- ended
+    on a 501. app/experimental.py gated all eleven GitLab routes precisely to avoid
+    a half-disabled platform that "appears to be working"; an unconditional offer
+    here reintroduced that at the UI layer.
+    """
+    from .experimental import experimental_enabled
+    offer = _GITLAB_OFFER_HTML if experimental_enabled() else ""
+    return HTMLResponse(
+        content=DRY_RUN_HTML.replace(_GITLAB_OFFER_PLACEHOLDER, offer))
 
 
 def _detect_changes(before: str, after: str, contract_type: str,
@@ -394,7 +414,7 @@ async function analyze() {
         if (data.breaking_changes && data.breaking_changes.length > 0) {
             title.innerHTML = '<span class="breaking">⚠️ ' + data.breaking_changes.length + ' Breaking Change(s) Detected</span>';
             body.textContent = JSON.stringify(data.breaking_changes, null, 2);
-            info.innerHTML = data.summary + '<br><br>Want Ripple to auto-fix these? <a href="/auth/gitlab">Install on GitLab</a> or <a href="https://github.com/apps/ripple-api">Install on GitHub</a>';
+            info.innerHTML = data.summary + '<br><br>Want Ripple to auto-fix these? __GITLAB_OFFER__<a href="https://github.com/apps/ripple-api">Install on GitHub</a>';
         } else {
             title.innerHTML = '<span class="safe">✅ No Breaking Changes</span>';
             body.textContent = 'Safe to push. No consumers would break.';

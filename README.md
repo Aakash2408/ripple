@@ -2,7 +2,15 @@
 
 > When you change an API, Ripple finds every consumer and opens PRs to fix them. Automatically.
 
-### 🌐 [**Live Landing Page**](https://ripple-cnn.pages.dev/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Install GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab) · [**Try Dry-Run**](https://ripple-production-be7f.up.railway.app/dry-run) · [**CI/CD Gate**](#cicd-gate-ripple-check) · [**Self-Hosted Agent**](#self-hosted-agent)
+### 🌐 [**Live Landing Page**](https://ripple-cnn.pages.dev/) · [**Install GitHub App**](https://github.com/apps/ripple-api) · [**Try Dry-Run**](https://ripple-production-be7f.up.railway.app/dry-run) · [**CI/CD Gate**](#cicd-gate-ripple-check) · [**Self-Hosted Agent**](#self-hosted-agent)
+
+<!-- The "Install GitLab" link was removed on 2026-09-14. It pointed at
+     /auth/gitlab, which app/experimental.py answers with 501 by design: GitLab and
+     Bitbucket adapters are built and working but switched off for the current push
+     (RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS=1 restores them). Advertising an install
+     path that returns 501 is the failure experimental.py gated all eleven routes to
+     prevent -- "a half-disabled platform is worse than a live one, because the
+     product appears to be working". Restore this link together with the flag. -->
 
 [![Install GitHub App](https://img.shields.io/badge/Install-GitHub%20App-blue)](https://github.com/apps/ripple-api)
 [![Demo: Python](https://img.shields.io/badge/demo-Python%20PR-green)](https://github.com/Aakash2408/ripple-sdk-python/pull/1)
@@ -572,13 +580,21 @@ The agent uses the same 5 diff engines and 30 breaking change detections as the 
 
 ## GitLab Support
 
-Ripple works with GitLab with **one-click OAuth install**:
+> **Currently switched off.** The GitLab adapter is built and working — OAuth,
+> webhooks, setup and merge-request creation — but all of its routes return **501**
+> by design while GitHub is the single production surface. See
+> `app/experimental.py`. Set `RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS=1` to bring it
+> back; the install link is deliberately not shown until then, because an install
+> path that 501s is worse than one that is absent.
+>
+> The one capability it still lacks when enabled: repository archives are fetched
+> from GitHub only, so a GitLab fix is `validated=None` and can reach REVIEW but
+> never AUTO.
 
-**Option 1: One-Click OAuth (recommended)**
+**Option 1: One-Click OAuth (available once enabled)**
 
-👉 [**Install on GitLab**](https://ripple-production-be7f.up.railway.app/auth/gitlab)
-
-Click Authorize → Ripple auto-installs webhooks on all your projects. Done.
+`GET /auth/gitlab` → Click Authorize → Ripple auto-installs webhooks on all your
+projects.
 
 **Option 2: Manual webhook setup**
 
@@ -603,11 +619,14 @@ Works with all 10 contract types on GitLab.
 
 Ripple works with Bitbucket Cloud with **one-click OAuth install**:
 
-**Option 1: One-Click OAuth (recommended)**
+> **Currently switched off**, on the same terms as GitLab above — the adapter is
+> built, its routes return **501** by design, and
+> `RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS=1` restores them. See `app/experimental.py`.
 
-👉 [**Install on Bitbucket**](https://ripple-production-be7f.up.railway.app/auth/bitbucket)
+**Option 1: One-Click OAuth (available once enabled)**
 
-Click Authorize → Ripple auto-installs webhooks on all your repos. Done.
+`GET /auth/bitbucket` → Click Authorize → Ripple auto-installs webhooks on all your
+repos.
 
 **Option 2: Manual webhook setup**
 
@@ -716,7 +735,7 @@ Before pushing (requires Python 3.12+ — `python3` on a dev desktop may be 3.7)
 
 ```bash
 python tools/check_names.py app/*.py       # NameError before deploy
-python tests/test_regression.py            # 257 tests
+python tests/test_regression.py            # 261 tests
 python tools/audit_diff_engines.py         # 0 false negatives / positives
 python tools/audit_change_types.py         # all 47 emitted types classified
 python tools/coverage_matrix.py            # 459 combos, 0 escapes

@@ -75,7 +75,10 @@ async def bitbucket_auth_start():
     if not experimental_enabled():
         return experimental_disabled("bitbucket", "oauth start")
     if not BITBUCKET_CLIENT_ID:
-        return HTMLResponse(content=NO_CREDENTIALS_HTML)
+        # 503, not the default 200 -- see the matching note in gitlab_oauth.py.
+        # An install route answering 200 while holding no credentials reports
+        # health to every uptime check and to /stats.
+        return HTMLResponse(content=NO_CREDENTIALS_HTML, status_code=503)
     
     state = secrets.token_urlsafe(32)
     _oauth_states[state] = {"created": True}

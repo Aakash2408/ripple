@@ -89,7 +89,18 @@ async def gitlab_auth_start():
     if not experimental_enabled():
         return experimental_disabled("gitlab", "oauth start")
     if not GITLAB_APP_ID:
-        return HTMLResponse(content=NO_CREDENTIALS_HTML, status_code=200)
+        # 503, NOT 200. This used to answer 200 with a "no credentials" page,
+        # so the install entry point reported SUCCESS while being structurally
+        # incapable of installing anything: no GITLAB_APP_ID means the redirect
+        # to GitLab cannot even be built.
+        #
+        # A 200 here is worse than it looks. Any uptime check, and the /stats
+        # usage counters, read a 200 on the install route as "the install path
+        # works" -- so the one signal that would tell an operator GitLab is
+        # misconfigured reports health instead. That is the same shape as
+        # experimental.py's reason for gating all eleven routes: a surface that
+        # appears to work is worse than one that plainly refuses.
+        return HTMLResponse(content=NO_CREDENTIALS_HTML, status_code=503)
     
     state = secrets.token_urlsafe(32)
     _oauth_states[state] = {"created": True}
@@ -167,6 +178,14 @@ async def gitlab_auth_status():
     users = token_store.get_gitlab_users()
     projects = token_store.get_gitlab_projects()
     return {
+        # `configured` distinguishes "nothing connected YET" from "this cannot
+        # work". Without it, a missing GITLAB_APP_ID produced
+        # {"connected_users": 0, "monitored_projects": 0} -- indistinguishable
+        # from a healthy install nobody had used, which is the inverse of the
+        # failure app/experimental.py gated all eleven routes to prevent: there,
+        # status reported a connection that would never act; here it reports a
+        # working integration that cannot start.
+        "configured": bool(GITLAB_APP_ID and GITLAB_APP_SECRET),
         "connected_users": len(users),
         "monitored_projects": len(projects),
         "projects": [

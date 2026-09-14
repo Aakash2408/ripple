@@ -59,8 +59,6 @@ export function Footer() {
             title="Install"
             links={[
               { label: "GitHub App", href: LINKS.github, external: true },
-              { label: "GitLab", href: LINKS.gitlab, external: true },
-              { label: "Bitbucket", href: LINKS.bitbucket, external: true },
               { label: "Dashboard", href: LINKS.dashboard, external: true },
             ]}
           />
