@@ -75,6 +75,32 @@ PATTERNS = {
     r"(\d+)\s+tests?": "tests",
 }
 
+# THE SAME CLAIM WRITTEN AS A STRUCTURED PAIR, which the patterns above cannot see.
+#
+# website/src/data/ripple.ts states its stats as data, not prose:
+#
+#     { value: "261", label: "tests" },
+#
+# The prose patterns require the number and the word to be ADJACENT, so the
+# `", label: "` sitting between them made every claim in that file invisible --
+# while this tool scanned the file and reported "no numeric claim disagrees with
+# the registry".
+#
+# That blind spot let the landing page's test count be wrong TWICE: it read 82
+# against a real 257, and then -- after being corrected by hand -- drifted again
+# to a stale 257 as the suite grew to 261. A gate that reads the right file and
+# cannot parse the claim in it is indistinguishable from no gate, which is the
+# same "reports but does not govern" defect app/routing.py was built to remove.
+_STRUCTURED_LABELS = {
+    "tests": r"tests?",
+    "contract types": r"contract\s+types?",
+    "change types": r"change\s+types?",
+}
+STRUCTURED_PATTERNS = {
+    r'value:\s*["\'](\d+)["\']\s*,\s*label:\s*["\']%s["\']' % label: key
+    for key, label in _STRUCTURED_LABELS.items()
+}
+
 # "N languages" is NOT one fact, which is the whole point of the registry:
 #
 #     15  entries in the extension->language map          (detection)
@@ -110,7 +136,7 @@ def main(argv: list) -> int:
             continue
         for lineno, line in enumerate(
                 open(path, encoding="utf-8", errors="ignore"), start=1):
-            for pat, key in PATTERNS.items():
+            for pat, key in {**PATTERNS, **STRUCTURED_PATTERNS}.items():
                 for m in re.finditer(pat, line):
                     claimed = int(m.group(1))
                     want = derived[key]

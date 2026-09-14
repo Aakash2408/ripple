@@ -93,7 +93,7 @@ export const STATS = [
   // and the remaining four are self-hosted-agent targets. Saying "7 platforms"
   // promised a stranger six install paths that return 501.
   { value: "7", label: "platform adapters built" },
-  { value: "257", label: "tests" },
+  { value: "261", label: "tests" },
 ];
 
 export const CONTRACTS = [
