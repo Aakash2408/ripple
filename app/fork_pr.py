@@ -220,6 +220,31 @@ def open_fork_prs(groups, *, branch, title, body, token, api,
     return run
 
 
+def error_returning_api(raw_api):
+    """Adapt a RAISING GitHub client to the error-returning contract this module needs.
+
+    THE MISMATCH THIS EXISTS TO FIX, found by actually running the path rather than by
+    any gate. Every function here checks `result.get("error")` and converts it into a
+    stated refusal -- that is what makes "one archived repository does not stop a run
+    over twenty" true. But `pr_engine._github_request` RAISES on any non-2xx, so
+    handing it in directly turns the first refusal into an unhandled exception and
+    aborts the whole run. The CLI wiring did exactly that.
+
+    Wrapping at the boundary rather than changing `_github_request` is deliberate: that
+    function is the same-repo path's client and its callers there expect it to raise.
+    Two contracts, one adapter, instead of changing a contract two call sites already
+    depend on.
+    """
+    def _api(method, path, token, data=None, **kw):
+        try:
+            return raw_api(method, path, token, data, **kw)
+        except Exception as exc:                                    # noqa: BLE001
+            # The message carries the status and body, which is what the refusal text
+            # needs. Losing the type is fine; losing the status would not be.
+            return {"error": str(exc)[:300]}
+    return _api
+
+
 def _viewer_login(token, *, api):
     """The account the token belongs to. The fork lands under it."""
     me = api("GET", "/user", token)

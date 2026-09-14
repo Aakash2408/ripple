@@ -3394,6 +3394,68 @@ class _FakeForkAPI:
         return {"error": f"unexpected {method} {path}"}
 
 
+def test_a_raising_github_client_becomes_a_refusal_not_an_aborted_run():
+    """fork_pr's failure contract is "return an error", but pr_engine's client RAISES.
+
+    Found by RUNNING the firing path, not by any gate -- which is why this test exists.
+    Every function in fork_pr checks `result.get("error")` and turns it into a stated
+    refusal, and that is what makes its documented property true: "one archived
+    repository does not stop a run over twenty". But `pr_engine._github_request` raises
+    on any non-2xx, so passing it in directly turns the first refusal into an unhandled
+    exception that aborts the whole run. The Stage 4 CLI wiring did exactly that, and
+    the fake-api gates could not see it because a fake returns errors by construction.
+
+    `error_returning_api` adapts at the boundary rather than changing
+    `_github_request`, whose same-repo callers depend on it raising.
+    """
+    from app import fork_pr as F
+
+    calls = []
+
+    def raising(method, path, token, data=None, **kw):
+        calls.append((method, path))
+        raise Exception(f"GitHub API {method} {path}: 404 Not Found")
+
+    # 1. Unadapted, the run explodes -- this is the defect, pinned so it cannot return.
+    try:
+        F.open_fork_pr("acme/gone", "b", "t", "body", [("a.py", "eA==")], "tok",
+                       api=raising, sleep=lambda _s: None)
+        unadapted_raised = False
+    except Exception:                                              # noqa: BLE001
+        unadapted_raised = True
+    assert unadapted_raised, (
+        "the raising client no longer raises, so this test proves nothing -- if "
+        "_github_request was changed to return errors, delete the adapter instead")
+
+    # 2. Adapted, the same failure is a REFUSAL and the run completes.
+    calls.clear()
+    res = F.open_fork_pr("acme/gone", "b", "t", "body", [("a.py", "eA==")], "tok",
+                         api=F.error_returning_api(raising), sleep=lambda _s: None)
+    assert not res.opened, "a 404 upstream somehow produced an opened pull request"
+    assert res.refusals, "the failure produced no stated refusal"
+    assert "404" in " ".join(res.refusals), (
+        f"the refusal drops the status, so the cause is unrecoverable: {res.refusals}")
+    assert calls, "the adapter swallowed the call entirely"
+
+    # 3. And a multi-repo run must SURVIVE one bad repo -- the actual property.
+    run = F.open_fork_prs(
+        {"acme/gone": [("a.py", "eA==")], "acme/also-gone": [("b.py", "eA==")]},
+        branch="b", title="t", body="body", token="tok",
+        api=F.error_returning_api(raising), dry_run=False)
+    assert len(run.failed) == 2, (
+        f"a failing repo aborted the run instead of being recorded: {run.summary()}")
+    assert not run.opened
+
+    # 4. The CLI must USE the adapter -- an unadapted call site reintroduces the bug.
+    import inspect
+
+    from app import cli
+    src = inspect.getsource(cli._run_fork_follow_ons)
+    assert "error_returning_api" in src, (
+        "the CLI passes a raising client straight to open_fork_prs, so the first "
+        "unreachable repository aborts the whole run")
+
+
 def test_a_fork_pr_resolves_end_to_end_with_no_model_and_commits_the_template_fix():
     """The whole path, model-free: source in -> fork PR payload out. Added 2026-09-13.
 

@@ -215,7 +215,7 @@ def _run_fork_follow_ons(fixes, breaking_change, *, dry_run):
     import os
 
     from .change_types import fix_title
-    from .fork_pr import (open_fork_prs, repo_relative_path,
+    from .fork_pr import (error_returning_api, open_fork_prs, repo_relative_path,
                           upstream_from_git_remote)
     from .pr_engine import _github_request
 
@@ -261,7 +261,8 @@ def _run_fork_follow_ons(fixes, breaking_change, *, dry_run):
     body = _fork_pr_body(breaking_change)
 
     run = open_fork_prs(groups, branch=branch, title=title, body=body,
-                        token=token, api=_github_request, dry_run=dry_run)
+                        token=token, api=error_returning_api(_github_request),
+                        dry_run=dry_run)
 
     for upstream, number, url in run.opened:
         print(f"  ✅ {upstream}#{number}  {url}")
