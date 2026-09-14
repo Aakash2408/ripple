@@ -3447,11 +3447,15 @@ def test_a_raising_github_client_becomes_a_refusal_not_an_aborted_run():
     assert not run.opened
 
     # 4. The CLI must USE the adapter -- an unadapted call site reintroduces the bug.
+    #    Checked at the `api=` ARGUMENT, not anywhere in the function: the import line
+    #    also contains the name, so a bare substring check passed while the call site
+    #    had been reverted to the raising client. Caught by mutation, and the same
+    #    too-loose-substring shape as the skip-reason gate.
     import inspect
 
     from app import cli
     src = inspect.getsource(cli._run_fork_follow_ons)
-    assert "error_returning_api" in src, (
+    assert "api=error_returning_api(" in src, (
         "the CLI passes a raising client straight to open_fork_prs, so the first "
         "unreachable repository aborts the whole run")
 
