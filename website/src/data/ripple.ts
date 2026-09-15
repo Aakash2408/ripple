@@ -201,7 +201,13 @@ export const COMPARE_ROWS: { label: string; values: string[] }[] = [
   { label: "Contract types", values: ["10", "0", "1", "1"] },
   { label: "Learns from git history", values: ["⚠ built", "—", "—", "—"] },
   { label: "Change Impact Report", values: ["✓", "—", "—", "—"] },
-  { label: "Platforms", values: ["7", "1", "1", "1"] },
+  // "1 live, 7 built" rather than a flat "7". The STATS card and the pricing
+  // features were corrected to "platform adapters built", but this row was
+  // missed -- and it is the stronger claim of the three, because a competitive
+  // table reads "7" against "1" as seven WORKING integrations. GitLab and
+  // Bitbucket are switched off by app/experimental.py and the remaining four are
+  // self-hosted-agent targets, so only GitHub serves production traffic.
+  { label: "Platforms", values: ["1 live, 7 built", "1", "1", "1"] },
   { label: "Self-hosted option", values: ["✓", "—", "—", "—"] },
   { label: "CI/CD gate", values: ["✓", "—", "—", "✓"] },
   { label: "Monorepo support", values: ["✓", "—", "—", "—"] },
