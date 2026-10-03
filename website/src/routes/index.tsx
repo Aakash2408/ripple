@@ -19,8 +19,14 @@ import {
 } from "@/data/ripple";
 
 const TITLE = "Ripple — Self-maintaining APIs that fix breaking changes";
+// "7 platforms" was wrong here and is the most-read copy on the site: this is
+// the <meta name="description"> and og:description, so it is what Google and
+// every social preview show. Seven ADAPTERS exist, but two are switched off
+// server-side (PLATFORMS_SWITCHED_OFF) and four are self-hosted-agent targets,
+// so GitHub is the only platform a stranger can actually install on today.
+// "10 contract types" is derived and correct -- see tools/audit_public_claims.py.
 const DESCRIPTION =
-  "Push a breaking change and Ripple detects it, traces every consumer across your repos, writes the fix and opens the PRs in about 15 seconds. 10 contract types, 7 platforms.";
+  "Push a breaking change and Ripple detects it, traces every consumer across your repos, writes the fix and opens the PRs in about 15 seconds. 10 contract types, GitHub today.";
 
 export const Route = createFileRoute("/")({
   head: () => ({

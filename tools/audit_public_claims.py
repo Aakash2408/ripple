@@ -43,11 +43,17 @@ from app.languages import languages                      # noqa: E402
 
 # Files that make public claims. website/ is the served site; docs/ is the
 # Docsify site; README is the repo front page.
+#
+# routes/index.tsx was MISSING here until a "7 platforms" claim shipped live in
+# the <meta name="description"> -- the single most-read string on the site --
+# and this gate reported clean because it only scanned the data file. The page's
+# own prose makes claims too, so it is a surface.
 SURFACES = [
     "README.md",
     "docs/index.html", "docs/getting-started.md", "docs/how-it-works.md",
     "docs/platforms.md", "docs/ci-cd-gate.md",
     "website/src/data/ripple.ts",
+    "website/src/routes/index.tsx",
 ]
 
 
