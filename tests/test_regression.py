@@ -3419,8 +3419,25 @@ def test_an_oversized_consumer_file_is_refused_not_truncated():
     """
     import importlib
     import os as _os
+    import sys as _sys
+    import types as _types
 
     saved = _os.environ.get("RIPPLE_MAX_FIX_SOURCE_CHARS")
+    # _generate_with_llm's FIRST exit is `import anthropic` -> template. CI
+    # installs fastapi/pydantic/pyyaml/cryptography/certifi and NOT anthropic,
+    # so without this stub that exit fires for the oversized file AND for the
+    # small control file, the cap never executes, and the control assertion
+    # below fails -- which is exactly how this gate broke CI on its first push.
+    # The cap is what is under test, not the SDK's presence, so a placeholder
+    # module makes the branch reachable in both environments rather than
+    # skipping the gate wherever the SDK is absent.
+    _had_anthropic = "anthropic" in _sys.modules
+    _saved_anthropic = _sys.modules.get("anthropic")
+    if not _had_anthropic:
+        try:
+            import anthropic as _real_anthropic  # noqa: F401
+        except ImportError:
+            _sys.modules["anthropic"] = _types.ModuleType("anthropic")
     try:
         _os.environ["RIPPLE_MAX_FIX_SOURCE_CHARS"] = "1000"
         from app import fix_generator
@@ -3501,6 +3518,11 @@ def test_an_oversized_consumer_file_is_refused_not_truncated():
         _os.environ.pop("RIPPLE_MAX_FIX_SOURCE_CHARS", None)
         if saved is not None:
             _os.environ["RIPPLE_MAX_FIX_SOURCE_CHARS"] = saved
+        if not _had_anthropic:
+            if _saved_anthropic is not None:
+                _sys.modules["anthropic"] = _saved_anthropic
+            else:
+                _sys.modules.pop("anthropic", None)
         from app import fix_generator as _fg
         importlib.reload(_fg)
 
