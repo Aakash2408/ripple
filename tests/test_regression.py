@@ -3394,6 +3394,117 @@ class _FakeForkAPI:
         return {"error": f"unexpected {method} {path}"}
 
 
+def test_an_oversized_consumer_file_is_refused_not_truncated():
+    """A file too large to send must take the template path, never a partial send.
+
+    Added 2026-09-15. The prompt in _generate_with_llm interpolates the WHOLE
+    consumer file and nothing bounded it. Measured against this repo's own
+    sources: median 10.7K chars (~2.7K tokens), largest 211K chars (~69K tokens
+    on a current tokenizer).
+
+    Two failures followed, and the second is why this gate is a safety gate and
+    not a cost gate:
+
+      1. Input cost was unbounded in file size. Only OUTPUT was capped
+         (max_tokens=2000).
+      2. 69K tokens exceeds the context window of the default self-hosted model
+         (qwen2.5-coder:7b). A provider that silently drops the overflow returns
+         a fix generated from PART of the file -- a patch written against code
+         the model never saw, arriving indistinguishable from a good one.
+
+    Truncating to fit would manufacture (2) on purpose, so the oversized case
+    must reach _generate_with_template instead. That is the same answer this
+    function already gives when the anthropic package is missing or no
+    instructions exist for the change type.
+    """
+    import importlib
+    import os as _os
+
+    saved = _os.environ.get("RIPPLE_MAX_FIX_SOURCE_CHARS")
+    try:
+        _os.environ["RIPPLE_MAX_FIX_SOURCE_CHARS"] = "1000"
+        from app import fix_generator
+        importlib.reload(fix_generator)
+        assert fix_generator.MAX_FIX_SOURCE_CHARS == 1000, (
+            "the cap is not read from the environment, so an operator cannot "
+            "tune it without editing code")
+
+        calls = []
+        real_template = fix_generator._generate_with_template
+
+        def _spy(code, consumer, change):
+            calls.append(len(code))
+            return ("TEMPLATE_PATH", "template")
+
+        from app.consumer_finder import ConsumerMatch
+
+        # Build a consumer/change pair that WOULD otherwise reach the model:
+        # a change type that has LLM instructions.
+        change = None
+        for ct in ("remove_field", "rename_field", "change_field_type"):
+            c = type("C", (), {})()
+            c.change_type = ct
+            c.field_name = "phone"
+            c.field_type = "string"
+            c.new_name = "phone_number"
+            c.old_type = "string"
+            c.new_type = "int"
+            c.path = "/users"
+            c.method = "get"
+            c.description = "d"
+            if fix_generator._llm_instructions(c):
+                change = c
+                break
+        assert change is not None, (
+            "no change type has LLM instructions, so this gate cannot prove the "
+            "cap is what caused the refusal")
+
+        consumer = ConsumerMatch(
+            file_path="src/huge.ts", line_number=1, code_snippet="x",
+            confidence="high", match_reason="imports the changed symbol",
+            language="typescript")
+
+        fix_generator._generate_with_template = _spy
+        try:
+            oversized = "x" * 5000          # 5x the 1000-char cap
+            out = fix_generator._generate_with_llm(oversized, consumer, change)
+            assert out[0] == "TEMPLATE_PATH", (
+                f"an oversized file did not take the template path: {out[0][:60]!r}")
+            assert calls == [5000], (
+                f"the template got {calls} chars -- it must receive the WHOLE "
+                f"file, not a truncated copy")
+            # The function has TWO template exits and `calls` cannot tell them
+            # apart: the cap returns the template result bare, while a failed
+            # model chain appends "LLM NOT USED: <reason>". Asserting only on
+            # `calls` passed on a machine with no reachable model, where the
+            # oversized file was diverted downstream and the cap never ran.
+            assert "LLM NOT USED" not in out[1], (
+                f"the oversized file got PAST the cap and was diverted by a "
+                f"downstream model failure instead: {out[1][:120]!r}")
+
+            # Control: a file under the cap must not take the CAP exit. It may
+            # legitimately take either of the other two -- an answer from a
+            # reachable model, or the downstream template exit when none is
+            # reachable -- so the assertion names the cap exit precisely rather
+            # than requiring a working model in CI.
+            calls.clear()
+            small = "y" * 100
+            out_small = fix_generator._generate_with_llm(small, consumer, change)
+            took_cap_exit = (out_small[0] == "TEMPLATE_PATH"
+                             and "LLM NOT USED" not in out_small[1])
+            assert not took_cap_exit, (
+                "a file well under the cap took the cap's own exit, so the cap "
+                "is refusing everything and this gate proves nothing")
+        finally:
+            fix_generator._generate_with_template = real_template
+    finally:
+        _os.environ.pop("RIPPLE_MAX_FIX_SOURCE_CHARS", None)
+        if saved is not None:
+            _os.environ["RIPPLE_MAX_FIX_SOURCE_CHARS"] = saved
+        from app import fix_generator as _fg
+        importlib.reload(_fg)
+
+
 def test_an_unconfigured_install_route_refuses_instead_of_reporting_health():
     """No OAuth credentials must not answer 200. Added 2026-09-14.
 
@@ -12256,6 +12367,67 @@ def test_the_commit_authors_are_actually_fetched_not_read_from_the_payload():
                 raise AssertionError(
                     f"call to _pr_had_human_edits at line {node.lineno} does not "
                     f"match its signature: {exc}") from exc
+
+
+def test_the_confidence_band_reaches_the_pr_body():
+    """A computed confidence level must be RENDERED, not just calculated.
+
+    Added 2026-10-03. `format_pr_body` opened with
+    `level = classify_confidence(confidence)` and then never used it. The body
+    showed a bare `### 🧠 AI Confidence: 88%` while the thresholds that make 88%
+    mean something (0.75 / 0.50 / 0.30) existed only in code. So a reviewer had
+    no way to tell a strong match from a marginal one at a glance -- on a
+    product whose entire safety argument is that a human reads every PR.
+
+    Same shape as the dead `Status_LEGACY` matchers in ripple-invariants.md: a
+    value computed correctly and dropped before it reaches the output. The
+    percentage being present is what made it invisible -- the body looked
+    informative.
+
+    This lives in the GATED suite deliberately. tests/test_confidence.py
+    asserted the emoji and sat red for an unknown period because it is not in
+    the pre-commit gate list, which is how the regression survived.
+
+    level.action is asserted ABSENT: it reads "Auto-fix PR" for the high band
+    and nothing in Ripple auto-merges, so rendering it would put a claim in the
+    PR body that contradicts the review-only invariant.
+    """
+    from app.confidence import format_pr_body, classify_confidence
+
+    for score, emoji, label in (
+        (0.88, "🟢", "high"),
+        (0.55, "🟡", "medium"),
+        (0.35, "🟠", "low"),
+    ):
+        band = classify_confidence(score)
+        assert (band.emoji, band.label) == (emoji, label), (
+            f"classify_confidence({score}) is {band.label!r}/{band.emoji!r}, so "
+            f"this test's own expectation is stale")
+
+        body = format_pr_body(
+            change_description="Removed field `age`",
+            source_repo="org/spec",
+            confidence=score,
+            sources=["template"],
+            reasons=["Direct API endpoint reference found"],
+        )
+        assert f"{int(score * 100)}%" in body, (
+            f"the percentage is missing for {score}")
+        assert emoji in body, (
+            f"confidence {score} renders no {label} band marker {emoji!r} -- the "
+            f"computed level never reaches the body, so the percentage carries "
+            f"no interpretation")
+        assert label in body, (
+            f"the band word {label!r} is absent for confidence {score}")
+
+    # The high band must not advertise automatic merging.
+    high_body = format_pr_body(
+        change_description="Removed field `age`", source_repo="org/spec",
+        confidence=0.95, sources=["template"], reasons=["r"])
+    assert "Auto-fix PR" not in high_body, (
+        "the body is rendering level.action, which says 'Auto-fix PR' for the "
+        "high band -- nothing here auto-merges, so that contradicts the "
+        "review-only invariant")
 
 
 if __name__ == "__main__":

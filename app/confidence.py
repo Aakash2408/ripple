@@ -204,7 +204,23 @@ def format_pr_body(change_description: str, source_repo: str,
     
     body_parts.extend([
         "",
-        f"### 🧠 AI Confidence: {int(confidence * 100)}%",
+        f"### 🧠 AI Confidence: {int(confidence * 100)}% {level.emoji} {level.label}",
+        "",
+        # The BAND, not just the percentage. `level` was computed at the top of
+        # this function and never rendered -- the same "computed value never
+        # reaches the output" shape as the dead `Status_LEGACY` matchers in
+        # .kiro/steering/ripple-invariants.md. A reviewer saw a bare "88%" with
+        # the thresholds (0.75 / 0.50 / 0.30) existing only in code, so there
+        # was no way to tell a strong match from a marginal one at a glance --
+        # on a product whose entire safety argument is that a human reads every
+        # PR.
+        #
+        # level.action is deliberately NOT rendered: it reads "Auto-fix PR" for
+        # the high band, and nothing here auto-merges. Printing it would make
+        # the PR body contradict the review-only invariant.
+        f"Ripple classifies this as **{level.label}** confidence "
+        f"(≥{int(level.threshold * 100)}%). Every Ripple PR is reviewed by a "
+        f"human regardless of band.",
         "",
         "| Factor | Score | Reason |",
         "|---|---|---|",

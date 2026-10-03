@@ -304,6 +304,37 @@ def _llm_explanation(change: BreakingChange) -> str:
           f"Applied a fix for {change.change_type} on '{field}'{suffix}")
 
 
+#: Largest consumer file we will put in a model prompt, in characters.
+#:
+#: WHY A CAP EXISTS AT ALL
+#: The prompt below interpolates {original_code} -- the WHOLE consumer file -- and
+#: nothing bounded it. Measured against this repo's own sources, the median file is
+#: ~10.7K chars (~2.7K tokens) but the largest is 211K chars, which is ~69K tokens
+#: on a current tokenizer. Two distinct failures follow from that, and the second
+#: is the one that matters:
+#:
+#:   1. COST is unbounded in file size. Only the OUTPUT was capped
+#:      (max_tokens=2000); input had no limit, so one large file cost 5x a median
+#:      one on the same model.
+#:   2. CORRECTNESS. 69K tokens exceeds the context window of the default
+#:      self-hosted model (qwen2.5-coder:7b), and a provider that quietly drops
+#:      the overflow would hand back a fix generated from PART of the file. A
+#:      patch written against code the model never saw is not a worse fix, it is
+#:      an actively dangerous one -- and it would arrive looking exactly like a
+#:      good one.
+#:
+#: WHY REFUSE RATHER THAN TRUNCATE
+#: Truncating here would manufacture defect 2 deliberately. So an oversized file
+#: takes the deterministic template path instead, which is the same answer this
+#: function already gives when the anthropic package is missing or no instructions
+#: exist for the change type -- and it says why, out loud.
+#:
+#: 60K chars is ~15K tokens, leaving headroom for the 2K output inside a 32K
+#: window. It admits the p90 file (26K chars) and refuses only genuine outliers.
+MAX_FIX_SOURCE_CHARS = int(
+    os.environ.get("RIPPLE_MAX_FIX_SOURCE_CHARS", "60000") or "60000")
+
+
 def _generate_with_llm(
     original_code: str,
     consumer: ConsumerMatch,
@@ -322,6 +353,14 @@ def _generate_with_llm(
         # an operation we cannot brief the model on.
         print(f"  ⚠️  no LLM instructions for change_type="
               f"{breaking_change.change_type!r}; using the template instead")
+        return _generate_with_template(original_code, consumer, breaking_change)
+
+    if len(original_code) > MAX_FIX_SOURCE_CHARS:
+        # Refuse, do not truncate. See MAX_FIX_SOURCE_CHARS.
+        print(f"  ⚠️  {consumer.file_path} is {len(original_code):,} chars, over "
+              f"the {MAX_FIX_SOURCE_CHARS:,}-char prompt cap "
+              f"(~{len(original_code) // 4:,} tokens); using the template instead "
+              f"rather than sending a partial file")
         return _generate_with_template(original_code, consumer, breaking_change)
 
     from .llm_config import client_api_key as _llm_client_key, base_url as _llm_base, model as _llm_model

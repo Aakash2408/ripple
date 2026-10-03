@@ -15,6 +15,13 @@ dist/
 data/tokens.json
 data/activity.json
 data/*.json
+# Runtime SQLite stores. data/*.json already covered the JSON stores, so
+# poll_state.db was the one piece of runtime state `git add .` would have
+# committed. The -wal and -shm sidecars exist because poll_store.py opens the
+# database in WAL mode, and they appear and vanish around a live connection.
+data/*.db
+data/*.db-wal
+data/*.db-shm
 tests/.last_run.json
 tools/.durability_check.json
 tests/.e2e_evidence.json

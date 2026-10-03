@@ -59,9 +59,23 @@ if [ -z "$PY" ]; then
 fi
 
 # --- the gates, in the same order CI runs them -------------------------------
+#
+# Every test file under tests/ is gated, not just test_regression.py. Six of
+# them were not, and tests/test_confidence.py sat red at 25/28 for an unknown
+# period as a result -- one of its three failures was a REAL defect (the
+# computed confidence band never reached the PR body) and two were assertions
+# left stale by deliberate rewrites. An ungated test is a test that reports
+# nothing, so it decays into noise and then gets ignored on the one occasion it
+# is right. Total added cost measured at ~2.6s.
 GATES=(
     "tools/check_names.py app/*.py"
     "tests/test_regression.py"
+    "tests/test_confidence.py"
+    "tests/test_ensemble.py"
+    "tests/test_follow_on_execute.py"
+    "tests/test_graphql_diff.py"
+    "tests/test_poll.py"
+    "tests/test_proto_diff.py"
     "tools/audit_diff_engines.py"
     "tools/audit_change_types.py"
     "tools/coverage_matrix.py"
