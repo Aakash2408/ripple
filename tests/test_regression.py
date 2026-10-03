@@ -12452,5 +12452,196 @@ def test_the_confidence_band_reaches_the_pr_body():
         "review-only invariant")
 
 
+def test_no_unauthenticated_route_can_emit_a_repository_name():
+    """Enumerate the app's OWN routes; none may leak a name without a token.
+
+    Added 2026-10-03, after the third instance of one defect.
+
+    /stats?detail=1 guarded repository names behind RIPPLE_ADMIN_TOKEN and
+    explained why in its docstring -- "an endpoint that let any visitor
+    enumerate which private-ish repos other people had connected would be a
+    worse problem than the blindness it fixes". Three sibling routes then
+    served the same names with no check at all. Verified against production:
+    /logs/recent returned Aakash2408/auth-service, /billing-api and
+    /notifications-svc to an anonymous caller, and /dashboard rendered
+    monitored_repos() into HTML.
+
+    One route enforcing a rule its siblings ignore is WORSE than no rule,
+    because the enforced one reads as evidence the question was settled.
+
+    Patching the three known routes would leave the next route free to reopen
+    it, so this gate is written against the ROUTE TABLE rather than a list of
+    paths: every GET the app exposes is called with no token and the serialised
+    body is searched for a seeded name. A new leaky endpoint fails this without
+    anyone remembering it exists.
+
+    The control at the end is the point: with the token set, at least one route
+    MUST emit the name. Without that, the gate would pass just as happily on an
+    app whose every route returned nothing.
+    """
+    import inspect as _inspect
+    import json as _json
+    import os as _os
+
+    from fastapi import HTTPException
+
+    from app import activity
+
+    SEED_ORG = "zz-secret-org"
+    SEED_REPO = f"{SEED_ORG}/zz-private-api"
+
+    class _Req:
+        """Minimal stand-in for a FastAPI Request.
+
+        Deliberately NOT starlette's TestClient: that needs httpx, which CI
+        does not install (it installs fastapi/uvicorn/pydantic/pyyaml/
+        cryptography/certifi). A gate that ERRORS in CI is the same defect as
+        the fix-source cap assuming anthropic was importable -- one commit ago.
+        Calling the endpoints directly needs no HTTP client at all.
+        """
+
+        def __init__(self, headers=None, cookies=None, query=None):
+            self.headers = headers or {}
+            self.cookies = cookies or {}
+            self.query_params = query or {}
+
+    def _call(endpoint, req, **extra):
+        """Invoke a route handler and return its body as text."""
+        sig = _inspect.signature(endpoint)
+        kwargs = {}
+        for name, param in sig.parameters.items():
+            if name == "request":
+                kwargs[name] = req
+            elif name in extra:
+                kwargs[name] = extra[name]
+            elif param.default is not _inspect.Parameter.empty:
+                continue
+            else:
+                return None            # a parameter we cannot supply honestly
+        out = endpoint(**kwargs)
+        if _inspect.isawaitable(out):
+            import asyncio as _asyncio
+            out = _asyncio.run(out)
+        body = getattr(out, "body", None)
+        if body is not None:
+            return body.decode("utf-8", "replace")
+        return _json.dumps(out, default=str)
+
+    saved = _os.environ.get("RIPPLE_ADMIN_TOKEN")
+    _os.environ.pop("RIPPLE_ADMIN_TOKEN", None)
+    activity.reset()
+    try:
+        from app import webhook
+
+        # Put the name in the store by the same path production uses, so this
+        # cannot pass because the seeding was fake.
+        webhook._handle_installation_event({
+            "action": "created",
+            "installation": {"id": 77, "account": {"login": SEED_ORG}},
+            "repositories": [{"full_name": SEED_REPO}],
+        }, "installation")
+        assert SEED_REPO in activity.monitored_repos(), (
+            "the seed never reached the store, so every route below would be "
+            "searched for a name that is not there and all of them would pass")
+
+        # Every GET route the app exposes, from the route table itself.
+        gets = []
+        for route in webhook.app.routes:
+            if "GET" not in (getattr(route, "methods", set()) or set()):
+                continue
+            ep = getattr(route, "endpoint", None)
+            path = getattr(route, "path", "")
+            if ep is None or not path:
+                continue
+            gets.append((path, ep))
+
+        checked, leaked, skipped = [], [], []
+        for path, ep in gets:
+            try:
+                text = _call(ep, _Req(), org=SEED_ORG, job_id="j1", detail=1)
+            except HTTPException:
+                checked.append(path)       # refused -- the point of the guard
+                continue
+            except Exception:
+                skipped.append(path)       # a route that errors leaks nothing
+                continue
+            if text is None:
+                skipped.append(path)
+                continue
+            checked.append(path)
+            if SEED_ORG in text or SEED_REPO in text:
+                leaked.append(f"{path} -> {text[:130]!r}")
+
+        assert len(checked) >= 8, (
+            f"only {len(checked)} GET routes were reached, so the route table "
+            f"was not really enumerated (skipped {skipped})")
+        assert not leaked, (
+            "these routes emit a repository name to an UNAUTHENTICATED "
+            "caller:\n    " + "\n    ".join(leaked))
+
+        # The two refusals must stay DISTINGUISHABLE. 503 says the server has
+        # no token configured; 401 says the caller's was wrong. Collapsing them
+        # tells an operator who merely forgot the variable that their token is
+        # bad, and it is a silent downgrade the leak check above cannot see --
+        # both still refuse.
+        guarded = {
+            "/logs/recent": (webhook.recent_logs, {}),
+            "/status/{org}": (webhook.org_status, {"org": SEED_ORG}),
+            "/retry-queue/dead-letter": (webhook.retry_queue_dead_letter, {}),
+            "/stats": (webhook.usage_stats, {"detail": 1}),
+        }
+        for label, (ep, extra) in guarded.items():
+            try:
+                _call(ep, _Req(), **extra)
+                raise AssertionError(
+                    f"{label} served a body with RIPPLE_ADMIN_TOKEN unset")
+            except HTTPException as e:
+                assert e.status_code == 503, (
+                    f"{label} answers {e.status_code} with the token unset, so "
+                    f"'not configured' cannot be told from 'wrong token'")
+
+        _os.environ["RIPPLE_ADMIN_TOKEN"] = "correct-horse"
+        bad = _Req({"X-Ripple-Admin-Token": "wrong"})
+        for label, (ep, extra) in guarded.items():
+            try:
+                _call(ep, bad, **extra)
+                raise AssertionError(f"{label} accepted a wrong admin token")
+            except HTTPException as e:
+                assert e.status_code == 401, f"{label} -> {e.status_code}"
+
+        # The dashboard refuses in HTML, not JSON: a browser is the only thing
+        # that loads it, and it must leak nothing while refusing.
+        _os.environ.pop("RIPPLE_ADMIN_TOKEN", None)
+        from app import dashboard as _dash
+        page = _call(_dash.dashboard, _Req())
+        assert SEED_ORG not in page, "the dashboard refusal page leaks a name"
+        assert "RIPPLE_ADMIN_TOKEN" in page, (
+            "the refusal page does not say what is missing, so an operator "
+            "cannot act on it")
+
+        # CONTROL. With a token, a guarded route must actually serve the name.
+        _os.environ["RIPPLE_ADMIN_TOKEN"] = "correct-horse"
+        good = _Req({"X-Ripple-Admin-Token": "correct-horse"})
+        authed = _call(webhook.usage_stats, good, detail=1)
+        assert SEED_REPO in authed, (
+            "the authorised view does not show the name either, so this gate "
+            "would pass on an app that simply returns nothing")
+
+        # Each accepted channel must authenticate on its own, so admin_auth's
+        # getattr defaults cannot quietly mean "cookie auth never worked".
+        for label, req in (
+            ("header", _Req({"X-Ripple-Admin-Token": "correct-horse"})),
+            ("cookie", _Req(cookies={"ripple_admin": "correct-horse"})),
+            ("query", _Req(query={"token": "correct-horse"})),
+        ):
+            assert SEED_REPO in _call(webhook.usage_stats, req, detail=1), (
+                f"the {label} channel does not authenticate")
+    finally:
+        activity.reset()
+        _os.environ.pop("RIPPLE_ADMIN_TOKEN", None)
+        if saved is not None:
+            _os.environ["RIPPLE_ADMIN_TOKEN"] = saved
+
+
 if __name__ == "__main__":
     sys.exit(_main())

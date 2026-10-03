@@ -72,6 +72,7 @@ from .consumer_finder import ConsumerMatch
 from .fix_generator import generate_fix, GeneratedFix, _generate_with_template
 from . import follow_on as _follow_on
 from . import fork_pr as _fork_pr
+from . import admin_auth as _admin_auth
 from . import impact as _impact
 from . import review_comments as _review_comments
 from . import repo_index as _repo_index
@@ -332,8 +333,23 @@ async def health_capability():
 
 
 @app.get("/logs/recent")
-async def recent_logs():
-    """Return recent activity log for debugging (last 50 events)."""
+async def recent_logs(request: FastAPIRequest):
+    """Recent activity log. ADMIN ONLY -- the events carry repository names.
+
+    This route was unauthenticated and returned `_activity_log[-30:]` whole.
+    Verified against production: it served Aakash2408/auth-service,
+    /billing-api and /notifications-svc to an anonymous caller, while
+    /stats?detail=1 was refusing the same names without RIPPLE_ADMIN_TOKEN.
+
+    One route enforcing a rule its sibling ignores is worse than no rule: the
+    enforced one reads as proof the question was settled. /stats keeps its
+    aggregate-only public body -- counts, never names -- and the named view
+    lives behind the one check in app/admin_auth.py.
+    """
+    try:
+        _admin_auth.check(request)
+    except _admin_auth.AdminAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     return {"count": len(_activity_log), "logs": _activity_log[-30:]}
 
 
@@ -395,15 +411,13 @@ async def usage_stats(request: FastAPIRequest, detail: int = 0):
     if not detail:
         return body
 
-    expected = os.environ.get("RIPPLE_ADMIN_TOKEN", "")
-    supplied = request.headers.get("X-Ripple-Admin-Token", "")
-    if not expected:
-        raise HTTPException(
-            status_code=503,
-            detail="detail requires RIPPLE_ADMIN_TOKEN to be configured; "
-                   "refusing to serve repository names unauthenticated")
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        raise HTTPException(status_code=401, detail="bad or missing admin token")
+    # The same check /dashboard and /logs/recent use. This block used to be
+    # the only place the policy existed, which is how two sibling routes came
+    # to serve the very names it refuses -- see app/admin_auth.py.
+    try:
+        _admin_auth.check(request)
+    except _admin_auth.AdminAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
     body["accounts"] = _activity.installers()
     body["repos"] = _activity.monitored_repos()
@@ -646,11 +660,21 @@ async def learn_repo(request: FastAPIRequest):
 # === Status endpoint (show what's been learned) ===
 
 @app.get("/status/{org}")
-async def org_status(org: str):
-    """Show what Ripple has learned about an org."""
+async def org_status(org: str, request: FastAPIRequest):
+    """What Ripple has learned about an org. ADMIN ONLY.
+
+    `has_learned` is a clean install oracle: an anonymous caller could probe
+    org names one at a time and read back whether each uses Ripple. Unlike
+    /rate-limit, nothing public links here -- it is an operator debug view --
+    so it refuses outright rather than serving a reduced body.
+    """
+    try:
+        _admin_auth.check(request)
+    except _admin_auth.AdminAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     learner = get_learner(org) if org in _org_learners else None
     graph = get_graph(org) if org in _org_graphs else None
-    
+
     return {
         "org": org,
         "learner": learner.stats() if learner else "not initialized",
@@ -1398,10 +1422,35 @@ async def gitlab_webhook(request: FastAPIRequest):
 # === Rate Limit Status ===
 
 @app.get("/rate-limit/{org}")
-async def rate_limit_status(org: str):
-    """Check rate limit status for an org."""
+async def rate_limit_status(org: str, request: FastAPIRequest):
+    """Rate limits. Configured CEILINGS are public; live counters are not.
+
+    The site links this route as "Rate limit status" (LINKS.rateLimit, pointed
+    at /rate-limit/unknown), so its public purpose is to show WHAT THE LIMITS
+    ARE -- and that is kept.
+
+    What is removed is the oracle. `events_last_minute`, `prs_in_flight` and
+    `is_cooling_down` for a NAMED org tell an anonymous caller whether that org
+    uses Ripple and how busy it is, probeable one org at a time. The org field
+    is only echoed back from the path, so the disclosure was never the name --
+    it was the live activity reported beside it.
+
+    Same split as /stats: the public body carries configuration, the specifics
+    need RIPPLE_ADMIN_TOKEN.
+    """
     limiter = get_rate_limiter()
-    return limiter.stats(org)
+    full = limiter.stats(org)
+    if _admin_auth.configured() and _admin_auth.supplied_token(request):
+        try:
+            _admin_auth.check(request)
+            return full
+        except _admin_auth.AdminAuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    return {
+        "max_events_per_minute": full.get("max_events_per_minute"),
+        "max_concurrent_prs": full.get("max_concurrent_prs"),
+        "detail": "live counters require RIPPLE_ADMIN_TOKEN",
+    }
 
 
 @app.get("/retry-queue")
@@ -1412,15 +1461,35 @@ async def retry_queue_status():
 
 
 @app.get("/retry-queue/dead-letter")
-async def retry_queue_dead_letter():
-    """Inspect failed jobs that exhausted all retries."""
+async def retry_queue_dead_letter(request: FastAPIRequest):
+    """Inspect failed jobs that exhausted all retries. ADMIN ONLY.
+
+    A probe of this route shows `{"dead_letter_jobs": []}` and looks harmless,
+    which is exactly how it would be missed: RetryJob payloads carry
+    `{"repo": "org/repo", ...}` (see app/retry_queue.py), so the body holds
+    repository names the moment a job actually fails. An endpoint is classified
+    by what it CAN emit, not by what it happens to hold while empty.
+    """
+    try:
+        _admin_auth.check(request)
+    except _admin_auth.AdminAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     queue = get_retry_queue()
     return {"dead_letter_jobs": queue.dead_letter_jobs()}
 
 
 @app.post("/retry-queue/retry/{job_id}")
-async def retry_dead_letter_job(job_id: str):
-    """Move a dead-lettered job back to the queue for retry."""
+async def retry_dead_letter_job(job_id: str, request: FastAPIRequest):
+    """Move a dead-lettered job back to the queue. ADMIN ONLY.
+
+    This MUTATES the queue, so leaving it open was the worse half of the same
+    hole: an anonymous caller could requeue work against someone else's
+    repository, not merely read about it.
+    """
+    try:
+        _admin_auth.check(request)
+    except _admin_auth.AdminAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     queue = get_retry_queue()
     success = queue.retry_dead_letter(job_id)
     if success:

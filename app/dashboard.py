@@ -13,7 +13,7 @@ Serves a single HTML page at /dashboard with:
 No React. No framework. Just a clean HTML page served by FastAPI.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 router = APIRouter()
@@ -26,6 +26,43 @@ router = APIRouter()
 # render zeros while the pipeline was opening real PRs. The duplicated state
 # is gone; these wrappers remain only so any external caller keeps working.
 from . import activity as _activity
+from . import admin_auth as _admin_auth
+
+
+def _refusal_html(exc) -> str:
+    """The refusal page. Says which of the two problems it is, and the fix.
+
+    No repository names, no counts, nothing from the store -- a refusal that
+    leaked a number would defeat its own purpose.
+    """
+    if exc.status_code == 503:
+        heading = "Dashboard not configured"
+        body = (
+            "This page renders repository names, so it requires an admin "
+            "token. Set <code>RIPPLE_ADMIN_TOKEN</code> on the service and "
+            "reload."
+        )
+    else:
+        heading = "Not authorised"
+        body = (
+            "Wrong or missing admin token. Open "
+            "<code>/dashboard?token=&lt;your token&gt;</code> once and it is "
+            "exchanged for a cookie."
+        )
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<title>Ripple</title><style>"
+        "body{font:15px/1.6 system-ui,sans-serif;max-width:34rem;"
+        "margin:14vh auto;padding:0 1.5rem;color:#111;background:#fff}"
+        "h1{font-size:1.2rem;margin:0 0 .6rem}"
+        "code{background:#f2f2f2;padding:.1rem .3rem;border-radius:3px}"
+        "p{color:#444}"
+        "@media(prefers-color-scheme:dark){body{color:#eee;background:#111}"
+        "p{color:#aaa}code{background:#222}}"
+        "</style></head><body>"
+        f"<h1>{heading}</h1><p>{body}</p>"
+        "</body></html>"
+    )
 
 
 def _gitlab_links_html() -> str:
@@ -65,8 +102,32 @@ def register_repo(repo: str):
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    """Serve the dashboard HTML page."""
+async def dashboard(request: Request):
+    """Serve the dashboard HTML page. ADMIN ONLY -- it renders repository names.
+
+    This page was unauthenticated while /stats?detail=1 was refusing the same
+    `monitored_repos()` list without RIPPLE_ADMIN_TOKEN. Harmless while the
+    only names in the store were the operator's own; a leak the moment a third
+    party installs, which is the outcome the public launch is trying to cause.
+
+    Refusal is HTML, not a JSON error body: a browser is the only thing that
+    loads this route, and answering it with `{"detail": ...}` tells the person
+    reading nothing about what to do. It also distinguishes the two cases --
+    503 means the SERVER has no token configured, 401 means the CALLER's was
+    wrong -- because collapsing them would tell an operator who merely forgot
+    the variable that their token was bad.
+    """
+    try:
+        _admin_auth.check(request)
+    except _admin_auth.AdminAuthError as exc:
+        return HTMLResponse(_refusal_html(exc), status_code=exc.status_code)
+
+    # A token in the query string is exchanged for an HttpOnly cookie, so it
+    # stops travelling in URLs (and in any Referer this page sends) after the
+    # first load. The page still renders on THIS request -- redirecting instead
+    # would make the one URL a human can actually type feel broken.
+    _set_cookie_for = _admin_auth.first_party_token(request)
+
     events = _activity.all_events()
     stats = _activity.counters()
     repos = _activity.monitored_repos()
@@ -262,4 +323,7 @@ async def dashboard():
 </body>
 </html>"""
     
-    return HTMLResponse(content=html)
+    response = HTMLResponse(content=html)
+    if _set_cookie_for:
+        response.set_cookie(**_admin_auth.cookie_kwargs(_set_cookie_for))
+    return response
