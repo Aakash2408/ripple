@@ -46,6 +46,20 @@ jobs:
       - name: Regression suite
         run: python tests/test_regression.py
 
+      # The hook gates these six; CI gated only test_regression.py. That
+      # asymmetry is how tests/test_confidence.py sat at 25/28 -- with a real
+      # defect in it (a confidence band computed and never rendered) -- without
+      # any run reporting red. All six are CI-safe with anthropic absent and
+      # cost ~2.6s together, so CI and the hook now check the same set.
+      - name: Gated test files (the hook runs these too)
+        run: |
+          python tests/test_confidence.py
+          python tests/test_ensemble.py
+          python tests/test_follow_on_execute.py
+          python tests/test_graphql_diff.py
+          python tests/test_poll.py
+          python tests/test_proto_diff.py
+
       - name: Diff-engine audit
         # Fails if any engine regains a non-nesting block regex or loses
         # comment stripping.
