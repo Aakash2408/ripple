@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# Install the ripple-check skill for one or more coding agents, and put the
+# `ripple` command on PATH.
+#
+#   git clone --depth 1 https://github.com/Aakash2408/ripple.git ~/.ripple
+#   ~/.ripple/setup                 # Claude Code (default)
+#   ~/.ripple/setup --host auto     # every agent detected on this machine
+#   ~/.ripple/setup --host kiro     # one specific agent
+#   ~/.ripple/setup --status        # what is installed where
+#   ~/.ripple/setup --uninstall
+#
+# Everything is a SYMLINK into this checkout, so `git pull` updates the skill
+# and the command together. Nothing is overwritten: an existing non-symlink
+# directory or file at a target path is left alone and reported.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_SRC="$ROOT/skills/ripple-check"
+BIN_SRC="$ROOT/bin/ripple"
+BIN_DIR="${RIPPLE_BIN_DIR:-$HOME/.local/bin}"
+
+skill_dir_for() {
+    case "$1" in
+        claude)  echo "$HOME/.claude/skills" ;;
+        kiro)    echo "$HOME/.kiro/skills" ;;
+        codex)   echo "${CODEX_HOME:-$HOME/.codex}/skills" ;;
+        cursor)  echo "$HOME/.cursor/skills" ;;
+        copilot) echo "$HOME/.copilot/skills" ;;
+        factory) echo "$HOME/.factory/skills" ;;
+        *) return 1 ;;
+    esac
+}
+ALL_HOSTS="claude kiro codex cursor copilot factory"
+
+detect_hosts() {
+    local found=""
+    [ -d "$HOME/.claude" ]  && found="$found claude"
+    [ -d "$HOME/.kiro" ]    && found="$found kiro"
+    [ -d "${CODEX_HOME:-$HOME/.codex}" ] && found="$found codex"
+    [ -d "$HOME/.cursor" ]  && found="$found cursor"
+    [ -d "$HOME/.copilot" ] && found="$found copilot"
+    [ -d "$HOME/.factory" ] && found="$found factory"
+    echo "${found:-claude}"
+}
+
+link() {   # link <source> <target>
+    local src="$1" dst="$2"
+    if [ -L "$dst" ]; then
+        if [ "$(readlink "$dst")" = "$src" ]; then
+            echo "  ok        $dst"
+            return 0
+        fi
+        ln -sfn "$src" "$dst"
+        echo "  relinked  $dst"
+        return 0
+    fi
+    if [ -e "$dst" ]; then
+        echo "  SKIPPED   $dst exists and is not a Ripple symlink; left untouched"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dst")"
+    ln -s "$src" "$dst"
+    echo "  linked    $dst"
+}
+
+unlink_ours() {
+    local src="$1" dst="$2"
+    if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+        rm "$dst"
+        echo "  removed   $dst"
+    fi
+}
+
+HOSTS="claude"
+MODE="install"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host)      HOSTS="${2:?--host needs a value}"; shift 2 ;;
+        --host=*)    HOSTS="${1#--host=}"; shift ;;
+        --status)    MODE="status"; shift ;;
+        --uninstall) MODE="uninstall"; shift ;;
+        -h|--help)   sed -n '2,16p' "$0"; exit 0 ;;
+        *) echo "setup: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+[ "$HOSTS" = "auto" ] && HOSTS="$(detect_hosts)"
+[ "$HOSTS" = "all" ] && HOSTS="$ALL_HOSTS"
+HOSTS="${HOSTS//,/ }"
+
+if [ "$MODE" = "status" ]; then
+    for h in $ALL_HOSTS; do
+        d="$(skill_dir_for "$h")/ripple-check"
+        if [ -L "$d" ]; then echo "  $h: installed -> $(readlink "$d")"
+        else echo "  $h: not installed"; fi
+    done
+    if command -v ripple >/dev/null 2>&1; then echo "  ripple: $(command -v ripple)"
+    else echo "  ripple: NOT on PATH"; fi
+    exit 0
+fi
+
+for h in $HOSTS; do
+    dir="$(skill_dir_for "$h")" || { echo "setup: unknown host '$h' (known: $ALL_HOSTS)" >&2; exit 2; }
+    echo "$h:"
+    if [ "$MODE" = "uninstall" ]; then
+        unlink_ours "$SKILL_SRC" "$dir/ripple-check"
+    else
+        link "$SKILL_SRC" "$dir/ripple-check"
+    fi
+done
+
+echo "command:"
+if [ "$MODE" = "uninstall" ]; then
+    unlink_ours "$BIN_SRC" "$BIN_DIR/ripple"
+    exit 0
+fi
+chmod +x "$BIN_SRC"
+link "$BIN_SRC" "$BIN_DIR/ripple"
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) echo "  NOTE      $BIN_DIR is not on PATH; add it, or call $BIN_SRC directly" ;;
+esac
+
+if "$BIN_SRC" impact --help >/dev/null 2>&1; then
+    echo "ready: run \`ripple impact\` in any git repository."
+else
+    echo "setup: \`ripple impact --help\` failed -- needs Python >= 3.10" >&2
+    exit 1
+fi

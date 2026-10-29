@@ -59,6 +59,7 @@ jobs:
           python tests/test_graphql_diff.py
           python tests/test_poll.py
           python tests/test_proto_diff.py
+          python tests/test_local_impact.py
 
       - name: Diff-engine audit
         # Fails if any engine regains a non-nesting block regex or loses

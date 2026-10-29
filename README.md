@@ -49,6 +49,31 @@ Paste your old and new spec → see breaking changes instantly. No repo access n
 
 ---
 
+## Before You Commit: `ripple impact` (for coding agents)
+
+A diff-scoped review cannot see code the diff does not touch. `ripple impact` reads your uncommitted change and lists the **unchanged** code that may now be wrong:
+
+- lines that **branch on the same value** your change branches on,
+- **callers** of functions whose body you edited,
+- **user-facing text** near changed logic that may no longer describe it,
+- local consumers of **changed API contracts** (the same diff engines as below).
+
+It's deterministic (no model call) and needs nothing beyond the Python ≥ 3.10 standard library (PyYAML for contract specs). It writes `.ripple/impact.md` and `.ripple/impact.json`.
+
+```bash
+git clone --depth 1 https://github.com/Aakash2408/ripple.git ~/.ripple
+~/.ripple/setup --host auto      # skill for Claude Code / Kiro / Codex / Cursor, + `ripple` on PATH
+ripple impact                    # in any git repo; --fail-on high for CI
+```
+
+The `ripple-check` skill tells the agent to resolve every HIGH and MEDIUM candidate: fix it, or give a one-line reason it's unaffected.
+
+**Worked example: [gstack #2141](https://github.com/garrytan/gstack/pull/2141).** That PR records a real `/review` miss. A validator was loosened to accept typeless PDFs, and an *unchanged* submit helper still sent typeless files as `text/plain`. `demo/gstack-2141/run_demo.sh` rebuilds the scenario from the PR's description. Ripple ranks that helper first, at HIGH, and also flags the stale "Total file size" message the same PR describes. The fixture is a reconstruction, not the original project's code.
+
+What it does **not** do: search other repositories, follow a value through renamed variables or generated code, or prove anything is broken. Every item is a candidate, and an empty report means "no candidates in N files", not "safe".
+
+---
+
 ## CI/CD Gate (Ripple Check)
 
 Block PRs that introduce breaking changes with unfixed consumers — like `buf lint` but for change **propagation**, not just detection.

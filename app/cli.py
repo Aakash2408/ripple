@@ -27,6 +27,8 @@ def main():
         cmd_scan()
     elif command == "run":
         cmd_run()
+    elif command == "impact":
+        sys.exit(cmd_impact(sys.argv[2:]))
     else:
         print(f"Unknown command: {command}")
         _print_usage()
@@ -314,11 +316,66 @@ def _fork_pr_body(breaking_change) -> str:
     )
 
 
+def cmd_impact(argv) -> int:
+    """What does the uncommitted change break outside the diff?
+
+    Exit codes are the contract an agent or CI step reads:
+        0  ran; nothing at or above --fail-on
+        1  ran; candidates at or above --fail-on
+        2  could not run (not a git repo, base did not resolve, ...)
+    """
+    import argparse
+
+    from . import local_impact
+
+    p = argparse.ArgumentParser(
+        prog="ripple impact",
+        description="Find code outside the diff that this change may break.")
+    p.add_argument("--repo", default=".", help="repository path (default: .)")
+    p.add_argument("--base", default="",
+                   help="ref to compare against; the merge base with HEAD is "
+                        "used (default: origin/main, origin/master, main, "
+                        "master -- first that exists)")
+    p.add_argument("--format", choices=("md", "json"), default="md",
+                   help="what to print to stdout (both files are always "
+                        "written)")
+    p.add_argument("--out", default="",
+                   help="report directory (default: <repo>/.ripple)")
+    p.add_argument("--fail-on", choices=("high", "medium", "low", "never"),
+                   default="never",
+                   help="exit 1 when any candidate is at least this severe")
+    p.add_argument("--no-write", action="store_true",
+                   help="print only; do not write report files")
+    args = p.parse_args(argv)
+
+    try:
+        report = local_impact.analyse(args.repo, args.base)
+    except ValueError as e:
+        print(f"ripple impact: {e}", file=sys.stderr)
+        return 2
+
+    print(local_impact.to_json(report) if args.format == "json"
+          else local_impact.to_markdown(report))
+    if not args.no_write:
+        md, js = local_impact.write_reports(report, args.out)
+        print(f"\nwrote {md} and {js}", file=sys.stderr)
+
+    if args.fail_on == "never":
+        return 0
+    order = local_impact.SEVERITY_ORDER
+    worst = report.worst()
+    if worst != "none" and order[worst] <= order[args.fail_on]:
+        return 1
+    return 0
+
+
 def _print_usage():
     print("""
 Ripple — Self-Maintaining APIs
 
 Usage:
+  ripple impact [--base REF] [--fail-on high]    What does my uncommitted
+                                                 change break OUTSIDE the diff?
   ripple diff <old-spec> <new-spec>              Detect breaking changes
   ripple scan <old-spec> <new-spec> --repos ...  Find affected consumers
   ripple run  <old-spec> <new-spec> --repos ...  Full pipeline (diff → find → fix → PR)

@@ -228,6 +228,15 @@ TRIAGE: dict[tuple, tuple] = {
     ("fork_pr.py", "_git", "silent_empty_return", "", 0): (
         LEGITIMATE, SAME_AS("fork_pr.py", "_git")),
 
+    ("local_diff.py", "read_worktree", "swallowed_except", "OSError", 0): (
+        LEGITIMATE,
+        "Returns None, never '', so an unreadable file cannot pass for an empty "
+        "one. local_impact.analyse counts every None for a file that exists as "
+        "files_unreadable, and the report prints that count beside the number "
+        "of files searched -- the skip is visible in the result, not swallowed."),
+    ("local_diff.py", "read_worktree", "silent_empty_return", "", 0): (
+        LEGITIMATE, SAME_AS("local_diff.py", "read_worktree")),
+
     ("multi_step_reasoning.py", "resolve_fix_target", "swallowed_except",
      "ValueError", 0): (
         NEEDS_SIGNAL,

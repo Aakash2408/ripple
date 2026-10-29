@@ -76,6 +76,7 @@ GATES=(
     "tests/test_graphql_diff.py"
     "tests/test_poll.py"
     "tests/test_proto_diff.py"
+    "tests/test_local_impact.py"
     "tools/audit_diff_engines.py"
     "tools/audit_change_types.py"
     "tools/coverage_matrix.py"
