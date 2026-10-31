@@ -29,6 +29,9 @@ def main():
         cmd_run()
     elif command == "impact":
         sys.exit(cmd_impact(sys.argv[2:]))
+    elif command == "mcp":
+        from .mcp_server import main as mcp_main
+        sys.exit(mcp_main())
     else:
         print(f"Unknown command: {command}")
         _print_usage()
@@ -376,6 +379,8 @@ Ripple — Self-Maintaining APIs
 Usage:
   ripple impact [--base REF] [--fail-on high]    What does my uncommitted
                                                  change break OUTSIDE the diff?
+  ripple mcp                                     The same checks as an MCP
+                                                 server (stdio) for agents
   ripple diff <old-spec> <new-spec>              Detect breaking changes
   ripple scan <old-spec> <new-spec> --repos ...  Find affected consumers
   ripple run  <old-spec> <new-spec> --repos ...  Full pipeline (diff → find → fix → PR)

@@ -33,9 +33,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from . import poll_store
-from .diff_engine import diff_specs as _diff_specs, BreakingChange
-from .proto_diff import diff_proto as _diff_proto
-from .graphql_diff import diff_graphql as _diff_graphql
+from .diff_engine import BreakingChange
 
 router = APIRouter(tags=["poll"])
 
@@ -228,39 +226,30 @@ def _poll_one_repo(repo: str, token: str, dry_run: bool) -> RepoResult:
         contract_type = _detect_contract_type(spec_path)
 
         try:
-            if contract_type == "protobuf":
-                diff_result = _diff_proto(old_content, new_content)
-            elif contract_type == "graphql":
-                diff_result = _diff_graphql(old_content, new_content)
-            else:
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
-                                                 delete=False) as f_old:
-                    f_old.write(old_content)
-                    old_path = f_old.name
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
-                                                 delete=False) as f_new:
-                    f_new.write(new_content)
-                    new_path = f_new.name
-                try:
-                    diff_result = _diff_specs(old_path, new_path)
-                finally:
-                    os.unlink(old_path)
-                    os.unlink(new_path)
-
-            if diff_result and diff_result.has_breaking_changes:
-                for bc in diff_result.breaking_changes:
-                    all_breaking.append({
-                        "spec_file": spec_path,
-                        "contract_type": contract_type,
-                        "change_type": bc.change_type,
-                        "field_name": bc.field_name,
-                        "field_type": bc.field_type,
-                        "path": bc.path,
-                        "method": bc.method,
-                        "description": bc.description,
-                        "severity": bc.severity,
-                    })
+            # diff_proto / diff_graphql (and every engine except OpenAPI's)
+            # return a LIST of BreakingChange; only diff_specs returns a
+            # DiffResult. This used to call `.has_breaking_changes` on
+            # whatever came back, so every proto and GraphQL change in
+            # production surfaced as an AttributeError entry -- `/poll`
+            # reported "error" for exactly the contract types it advertises.
+            # Dispatch through the one shared engine table instead.
+            from .local_impact import diff_contract
+            changes = diff_contract(contract_type, old_content, new_content,
+                                    spec_path)
+            for bc in changes:
+                if bc.severity != "breaking":
+                    continue
+                all_breaking.append({
+                    "spec_file": spec_path,
+                    "contract_type": contract_type,
+                    "change_type": bc.change_type,
+                    "field_name": bc.field_name,
+                    "field_type": bc.field_type,
+                    "path": bc.path,
+                    "method": bc.method,
+                    "description": bc.description,
+                    "severity": bc.severity,
+                })
         except Exception as e:
             all_breaking.append({
                 "spec_file": spec_path,

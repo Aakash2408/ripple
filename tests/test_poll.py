@@ -195,6 +195,39 @@ class TestPollOneRepo:
         assert len(result.breaking_changes) > 0
         assert poll_store.get_last_sha("org/demo") == "new_sha"
 
+    def _poll_spec_change(self, path, old, new):
+        from unittest.mock import patch
+        from app.poll_endpoint import _poll_one_repo
+        poll_store.set_last_sha("org/demo", "old_sha")
+        with patch("app.poll_endpoint._get_head_sha", return_value="new_sha"), \
+             patch("app.poll_endpoint._get_changed_files", return_value=[path]), \
+             patch("app.poll_endpoint._fetch_file",
+                   side_effect=lambda repo, p, ref, token:
+                       old if ref == "old_sha" else new):
+            return _poll_one_repo("org/demo", "fake-token", dry_run=True)
+
+    def test_proto_removed_field_is_analysed_not_an_error(self):
+        """diff_proto returns a LIST, not a DiffResult. /poll called
+        `.has_breaking_changes` on it, so every proto change in production came
+        back as an AttributeError entry instead of a breaking change."""
+        old = 'syntax = "proto3";\nmessage User {\n  string id = 1;\n  string email = 2;\n}\n'
+        new = 'syntax = "proto3";\nmessage User {\n  string id = 1;\n}\n'
+        result = self._poll_spec_change("api/user.proto", old, new)
+        errors = [b for b in result.breaking_changes if "error" in b]
+        assert not errors, errors
+        assert result.status == "analysed", result.status
+        assert any(b["field_name"] == "email" and b["contract_type"] == "protobuf"
+                   for b in result.breaking_changes), result.breaking_changes
+
+    def test_graphql_removed_field_is_analysed_not_an_error(self):
+        old = "type User {\n  id: ID!\n  email: String\n}\n"
+        new = "type User {\n  id: ID!\n}\n"
+        result = self._poll_spec_change("schema/user.graphql", old, new)
+        errors = [b for b in result.breaking_changes if "error" in b]
+        assert not errors, errors
+        assert any(b["field_name"] == "email"
+                   for b in result.breaking_changes), result.breaking_changes
+
     def test_unreachable_repo(self):
         """Repo that can't be reached returns error."""
         from unittest.mock import patch
@@ -220,3 +253,8 @@ class TestPollOneRepo:
         assert result.current_sha == "first_sha"
         assert result.status == "no_specs"
         assert poll_store.get_last_sha("org/new") == "first_sha"
+
+
+if __name__ == "__main__":
+    from _runner import run
+    sys.exit(run(globals()))

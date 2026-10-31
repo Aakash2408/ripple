@@ -68,6 +68,16 @@ ripple impact                    # in any git repo; --fail-on high for CI
 
 The `ripple-check` skill tells the agent to resolve every HIGH and MEDIUM candidate: fix it, or give a one-line reason it's unaffected.
 
+**As an MCP server.** `ripple mcp` serves the same checks over stdio as three read-only tools: `ripple_impact`, `ripple_diff_contract` (the 9 contract engines, no repo needed) and `ripple_find_references` (a field in every naming convention). It opens no network socket.
+
+```bash
+claude mcp add ripple -- ripple mcp                  # Claude Code
+# Kiro / Cursor / others: add to the client's mcp.json
+#   "ripple": { "command": "ripple", "args": ["mcp"] }
+```
+
+**Measured noise.** 15 real commits from zod, httpx and cobra were replayed as uncommitted changes and every finding was graded by hand. 9 of the 25 MEDIUM findings point at a line a reviewer should look at (36%). Another 14 are true callers that add little, for example callers of a behaviour-preserving refactor, which leaves 2 that are pure noise. Before the precision rules in `app/outside_diff.py`, the same 15 commits produced 72 MEDIUM findings at 12.5%. LOW findings were about 8% relevant on a sample graded before those rules; they are listed for completeness, not to act on. Recall is not measured, because there is no ground truth.
+
 **Worked example: [gstack #2141](https://github.com/garrytan/gstack/pull/2141).** That PR records a real `/review` miss. A validator was loosened to accept typeless PDFs, and an *unchanged* submit helper still sent typeless files as `text/plain`. `demo/gstack-2141/run_demo.sh` rebuilds the scenario from the PR's description. Ripple ranks that helper first, at HIGH, and also flags the stale "Total file size" message the same PR describes. The fixture is a reconstruction, not the original project's code.
 
 What it does **not** do: search other repositories, follow a value through renamed variables or generated code, or prove anything is broken. Every item is a candidate, and an empty report means "no candidates in N files", not "safe".
@@ -189,6 +199,28 @@ describing the design as though it were live.
 | PropBench pattern pre-load | ✅ | ❌ | `propbench_data/` is not vendored here — the 882 entries live in the separate PropBench repo |
 | Consumer graph | ✅ | ⚠️ | rebuilt per run, not persisted (`/health/storage` reports `durable: false` until a volume is mounted) |
 | Multi-invoker detection | ✅ | ✅ | runs per-change, no stored state required |
+| Reviewer-edit learning | ✅ | ⏳ | wired into the GitHub `pull_request.closed` path and stored on the volume; nothing learned yet because no reviewer has edited and merged a Ripple PR |
+
+**Reviewer-edit learning** (`app/learned_edits.py`) is the one channel that
+changes the *code* Ripple writes rather than a confidence score:
+
+- When a Ripple PR merges after a reviewer edited it, each file is diffed from
+  the merge base to the merged head.
+- Every change the reviewer made **to a line referencing the field** becomes a
+  rule, with the field abstracted. A line they kept unchanged is a rule too:
+  "leave this alone".
+- The next fix for the same change type and language **in the same org** applies
+  those rules first and lets the template handle everything else. The PR says
+  which earlier PR it learned from.
+
+Limits:
+- Rules only match on exact text after normalisation, with no fuzzy matching.
+- They are scoped per org, so one tenant's code never reaches another.
+- `field_removed` rules apply to any field. Other change types only apply to the
+  same field.
+- A reviewer insertion with no field reference in the original isn't learned.
+- A rejected PR doesn't yet weaken the rules it used.
+- GitLab and Bitbucket outcomes don't feed it yet.
 
 What this means in practice: the RAG retriever executes on every fix and
 correctly reports `No RAG pattern or cluster match` because its store is empty.

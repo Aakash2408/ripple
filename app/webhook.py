@@ -3383,6 +3383,8 @@ def _record_pr_provenance(pr_url: str, *, platform: str, repo: str, change,
         source, pattern_id = "pattern", _pattern_id_from_explanation(expl)
     elif expl.startswith("[llm]"):
         source, pattern_id = "llm", ""
+    elif expl.startswith("[learned]"):
+        source, pattern_id = "learned", ""
     else:
         source, pattern_id = "template", ""
 
@@ -3889,33 +3891,44 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
     pattern_id = row.get("pattern_id") or ""
     credited = False
     derived = ""
+    learned_summary = None
 
     if contaminated:
         _log_activity("outcome_not_learnable", {
             "pr": pr.get("number"), "repo": repo, "outcome": outcome,
             "reason": contamination_reason,
         })
-    elif outcome == "merged_with_edits" and pattern_id:
-        # The reviewer's edit is the higher-value artefact, and capturing its
-        # CONTENT needs the PR diff, which this handler does not fetch. What it can
-        # do without guessing is raise the pattern's provenance so no later corpus
-        # guess overwrites a strategy a human has already been through.
+    elif outcome == "merged_with_edits":
+        # The reviewer's edit is the higher-value artefact: capture its CONTENT
+        # as rules the next fix in this org will follow (app/learned_edits.py).
+        # Contamination has already bounded the edit to the files Ripple
+        # proposed, which is what makes the merged state attributable.
         try:
-            from .rag_store import rag_store
-            for p in rag_store.patterns:
-                if p.pattern_id == pattern_id:
-                    p.provenance = "human_edit"
-                    rag_store.save()
-                    break
-            _log_activity("pattern_protected_by_human_edit", {
-                "pr": pr.get("number"), "pattern": pattern_id,
-                "note": "provenance raised to human_edit; the edit CONTENT was not "
-                        "captured (needs the PR diff)",
-            })
+            learned = _learn_from_reviewer_edits(pr, payload, row, repo)
+            _log_activity("reviewer_edits_learned", {
+                "pr": pr.get("number"), "repo": repo, **learned})
         except Exception as exc:                                # noqa: BLE001
+            learned = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
             _log_activity("learn_error", {
-                "pr": pr.get("number"), "pattern": pattern_id,
-                "err": f"{type(exc).__name__}: {str(exc)[:160]}"})
+                "pr": pr.get("number"), "repo": repo,
+                "step": "learn_from_reviewer_edits", **learned})
+        learned_summary = learned
+        if pattern_id:
+            # Also protect the pattern so no later corpus guess overwrites a
+            # strategy a human has already been through.
+            try:
+                from .rag_store import rag_store
+                for p in rag_store.patterns:
+                    if p.pattern_id == pattern_id:
+                        p.provenance = "human_edit"
+                        rag_store.save()
+                        break
+                _log_activity("pattern_protected_by_human_edit", {
+                    "pr": pr.get("number"), "pattern": pattern_id})
+            except Exception as exc:                            # noqa: BLE001
+                _log_activity("learn_error", {
+                    "pr": pr.get("number"), "pattern": pattern_id,
+                    "err": f"{type(exc).__name__}: {str(exc)[:160]}"})
     elif pattern_id and outcome in ("merged_clean", "rejected"):
         try:
             from .rag_retriever import learn_from_merged_pr, learn_from_rejected_pr
@@ -3933,6 +3946,22 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
                 "pattern": pattern_id,
                 "err": f"{type(exc).__name__}: {str(exc)[:160]}",
             })
+    elif outcome == "merged_clean" and row.get("source") == "learned":
+        # A fix built from reviewer-taught rules merged unchanged: each rule it
+        # used gets this PR's vote. It must NOT fall into the branch below, which
+        # would credit the result to a template that did not produce it.
+        try:
+            learned_summary = _learn_from_reviewer_edits(pr, payload, row, repo)
+            credited = bool(learned_summary.get("rules_reinforced")
+                            or learned_summary.get("rules_learned"))
+            _log_activity("reviewer_edits_learned", {
+                "pr": pr.get("number"), "repo": repo, "via": "clean_merge",
+                **learned_summary})
+        except Exception as exc:                                # noqa: BLE001
+            _log_activity("learn_error", {
+                "pr": pr.get("number"), "repo": repo,
+                "step": "reinforce_learned_edits",
+                "err": f"{type(exc).__name__}: {str(exc)[:160]}"})
     elif outcome == "merged_clean" and not pattern_id:
         # The common case: a template fix, merged unchanged. This is the evidence
         # that CREATES the pattern -- without it the store only ever learns about
@@ -3958,7 +3987,61 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
     return {"status": "recorded", "outcome": outcome, "pr": pr.get("number"),
             "repo": repo, "counters_updated": credited,
             "contaminated": contaminated,
-            "derived_pattern": derived or ""}
+            "derived_pattern": derived or "",
+            **({"learned_edits": learned_summary} if learned_summary else {})}
+
+
+def _learn_from_reviewer_edits(pr: dict, payload: dict, row: dict, repo: str) -> dict:
+    """Turn a reviewer's edits to a Ripple PR into learned rules.
+
+    For each file Ripple proposed, diff the file at the MERGE BASE (what Ripple
+    started from) against the PR head (what the reviewer approved). The merge
+    base, not `pr.base.sha`, because the base branch can move while the PR is
+    open; diffing against its tip would credit upstream changes to the reviewer.
+
+    Unreadable files are reported per file and skipped. They are never treated
+    as empty: an empty "after" would teach "delete every reference".
+    """
+    from . import learned_edits
+
+    token = _get_token(payload.get("installation", {}).get("id"))
+    head_sha = (pr.get("head") or {}).get("sha") or ""
+    base_sha = (pr.get("base") or {}).get("sha") or ""
+    if not head_sha or not base_sha:
+        return {"files": 0, "skipped_files": ["PR payload has no base/head sha"]}
+
+    merge_base = base_sha
+    compare = _github_api("GET", f"/repos/{repo}/compare/{base_sha}...{head_sha}", token)
+    if isinstance(compare, dict) and (compare.get("merge_base_commit") or {}).get("sha"):
+        merge_base = compare["merge_base_commit"]["sha"]
+
+    owner = repo.split("/")[0] if "/" in repo else repo
+    change_type = row.get("change_type") or ""
+    field_name = row.get("field_name") or ""
+    files = list(row.get("proposed_files") or [])
+    if not files and row.get("consumer_file"):
+        files = [row["consumer_file"]]
+
+    store = learned_edits.default_store()
+    totals = {"files": 0, "rules_learned": 0, "rules_reinforced": 0,
+              "already_counted": 0, "skipped": [], "skipped_files": []}
+    for path in files:
+        before = _fetch_file_at_sha(repo, path, merge_base, token)
+        after = _fetch_file_at_sha(repo, path, head_sha, token)
+        if before is None or after is None:
+            totals["skipped_files"].append(
+                f"{path}: could not read the {'base' if before is None else 'merged'} version")
+            continue
+        language = row.get("language") or _detect_lang(path)
+        result = store.learn(
+            scope=owner, change_type=change_type, language=language,
+            field_name=field_name, base=before, final=after,
+            source=pr.get("html_url") or pr.get("url") or "")
+        totals["files"] += 1
+        for k in ("rules_learned", "rules_reinforced", "already_counted"):
+            totals[k] += result[k]
+        totals["skipped"].extend(f"{path}: {s}" for s in result["skipped"])
+    return totals
 
 
 def _handle_pr_merged(payload: dict, pr: dict) -> dict:
@@ -4010,7 +4093,35 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     4. Claude LLM (ONLY if 1-3 all fail) → last resort
     
     Returns (fixed_code, explanation).
+
+    LAYER 0 runs before all of these: edits a reviewer made to an earlier Ripple
+    PR in this org (app/learned_edits.py). A learned result is returned EVEN WHEN
+    IT LEAVES THE CODE UNCHANGED -- "leave this alone" is what the reviewer
+    taught, and falling through would let the template redo the edit they
+    reverted.
     """
+    from . import learned_edits
+
+    learned_language = consumer.language or _detect_lang(consumer.file_path)
+    learned = learned_edits.apply(
+        content,
+        store=learned_edits.default_store(),
+        scope=org,
+        change_type=change.change_type,
+        language=learned_language,
+        field_name=change.field_name,
+        template_fn=lambda code: _generate_with_template(code, consumer, change),
+    )
+    if learned.applied:
+        _log_activity("learned_edit_applied", {
+            "file": consumer.file_path, "sites": learned.sites,
+            "sources": learned.sources[:5], "changed": learned.code != content})
+        return learned.code, learned.explanation
+    if learned.reason:
+        _log_activity("learned_edit_discarded", {
+            "file": consumer.file_path, "reason": learned.reason,
+            "falling_back_to": "rag/template"})
+
     # Try RAG first
     try:
         from .rag_engine import RagStore

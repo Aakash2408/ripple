@@ -240,3 +240,8 @@ class TestAlreadyOpen:
         proposal = _follow_on.FollowOn(
             repo="org/repo", symbol="x", files=(), branch="ripple/fix", title="", body="")
         assert _follow_on.already_open(proposal, "tok", api=api)
+
+
+if __name__ == "__main__":
+    from _runner import run
+    sys.exit(run(globals()))

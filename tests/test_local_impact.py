@@ -262,6 +262,146 @@ def test_unreadable_spec_is_an_error_not_a_mass_removal():
         shutil.rmtree(d)
 
 
+# ─── noise rules from the 15-commit OSS replay (zod, httpx, cobra) ──────────
+
+def test_comment_below_an_ended_function_is_not_an_edit_of_it():
+    """zod: a changed comment above record() was attributed to isRef(), which
+    had already closed, and every isRef() caller was reported."""
+    base = ("export function isRef(x: any) {\n  return !!x.ref;\n}\n\n"
+            "// keeps a record\nexport function record(a: any) {\n  return a;\n}\n")
+    d = _repo({"m.ts": base,
+               "use.ts": "import { isRef } from './m';\n\n\n\nisRef(1);\n"})
+    try:
+        _write(d, {"m.ts": base.replace("// keeps a record", "// keeps a record by ref")})
+        r = local_impact.analyse(d, "main")
+        assert not [f for f in r.findings if f.kind == "caller"], r.findings
+    finally:
+        shutil.rmtree(d)
+
+
+def test_code_line_below_an_ended_function_is_not_an_edit_of_it():
+    """zod 3a20805: a field added to an interface declared after a function was
+    attributed to that function. Here: a top-level const after isRef()."""
+    base = ("export function isRef(x: any) {\n  return !!x.ref;\n}\n\n"
+            "export const LIMIT = 1;\n")
+    d = _repo({"m.ts": base,
+               "use.ts": "import { isRef } from './m';\n\n\n\nisRef(1);\n"})
+    try:
+        _write(d, {"m.ts": base.replace("LIMIT = 1", "LIMIT = 2")})
+        r = local_impact.analyse(d, "main")
+        assert not [f for f in r.findings if f.kind == "caller"], r.findings
+    finally:
+        shutil.rmtree(d)
+
+
+def test_python_wrapped_signature_still_encloses_its_body():
+    """httpx: `def create_ssl_context(` wrapped, with `) -> ssl.SSLContext:` at
+    column 0. The first enclosure check took that line as the function's end
+    and lost the two RELEVANT callers."""
+    base = ("def create_ssl_context(\n    verify=True,\n) -> object:\n"
+            "    if verify:\n        return 1\n    return 2\n")
+    d = _repo({"cfg.py": base,
+               "t.py": "from cfg import create_ssl_context\n\n\n\n"
+                       "ctx = create_ssl_context(verify=False)\n"})
+    try:
+        _write(d, {"cfg.py": base.replace("return 2", "return 3")})
+        r = local_impact.analyse(d, "main")
+        assert _at(r, "t.py", 5, "caller"), r.findings
+    finally:
+        shutil.rmtree(d)
+
+
+def test_literal_the_change_kept_is_not_agreement():
+    """zod 7989d07: a condition rewritten with "backward" on both sides made
+    every `=== "backward"` in the codebase MEDIUM."""
+    d = _repo({
+        "a.ts": "export function f(ctx: any, n: number) {\n"
+                "  if (ctx.direction === 'backward' && n > 1) return 1;\n"
+                "  return 0;\n}\n",
+        "b.ts": "\n\n\n\nexport function g(c: any) {\n"
+                "  if (c.direction === 'backward') return 2;\n}\n",
+    })
+    try:
+        _write(d, {"a.ts": "export function f(ctx: any, n: number) {\n"
+                           "  if (ctx.direction === 'backward' && n > 2) return 1;\n"
+                           "  return 0;\n}\n"})
+        r = local_impact.analyse(d, "main")
+        hits = _at(r, "b.ts", 6, "same_predicate")
+        assert all(f.severity == "low" for f in hits), hits
+    finally:
+        shutil.rmtree(d)
+
+
+def test_module_attribute_is_not_a_predicate_key():
+    """httpx 2ea2286: an added `if typing.TYPE_CHECKING:` made every module's
+    own TYPE_CHECKING guard a MEDIUM. Uses a non-builtin module name, so only
+    the imported-module rule can pass it."""
+    d = _repo({"a.py": "import flags_lib\n\nX = 1\n",
+               "b.py": "import flags_lib\n\n\n\n\nif flags_lib.beta_mode:\n"
+                       "    import os\n"})
+    try:
+        _write(d, {"a.py": "import flags_lib\n\nif flags_lib.beta_mode:\n"
+                           "    import os\nX = 1\n"})
+        r = local_impact.analyse(d, "main")
+        assert not r.findings, r.findings
+    finally:
+        shutil.rmtree(d)
+
+
+def test_constant_on_an_object_is_still_a_predicate_key():
+    """`settings.DEBUG` in two files IS related logic. An ALL_CAPS skip list,
+    proposed alongside the module rule, would have hidden it."""
+    d = _repo({"a.py": "def f(settings):\n    if settings.DEBUG == 1:\n"
+                       "        return 1\n",
+               "b.py": "\n\n\n\n\ndef g(settings):\n    if settings.DEBUG == 1:\n"
+                       "        return 2\n"})
+    try:
+        _write(d, {"a.py": "def f(settings):\n    if settings.DEBUG == 2:\n"
+                           "        return 1\n"})
+        r = local_impact.analyse(d, "main")
+        assert _at(r, "b.py", 7, "same_predicate"), r.findings
+    finally:
+        shutil.rmtree(d)
+
+
+def test_test_files_neither_source_keys_nor_rank_above_low():
+    d = _repo({
+        "tests/test_a.py": "def check(job):\n    if job.phase == 'x':\n"
+                           "        pass\n",
+        "src.py": "\n\n\n\n\ndef run(job):\n    if job.phase == 'x':\n"
+                  "        return 1\n",
+        "tests/test_b.py": "\n\n\n\n\ndef t(job):\n    if job.phase == 'x':\n"
+                           "        pass\n",
+    })
+    try:
+        _write(d, {"tests/test_a.py": "def check(job):\n    if job.phase == 'y':\n"
+                                      "        pass\n"})
+        r = local_impact.analyse(d, "main")
+        assert not r.findings, ("a changed test sourced keys: "
+                                + repr([(f.path, f.line) for f in r.findings]))
+        _git(d, "checkout", "-q", "--", ".")
+        _write(d, {"src.py": "\n\n\n\n\ndef run(job):\n    if job.phase == 'y':\n"
+                             "        return 1\n"})
+        r = local_impact.analyse(d, "main")
+        in_tests = [f for f in r.findings if f.path.startswith("tests/")]
+        assert in_tests and all(f.severity == "low" for f in in_tests), in_tests
+    finally:
+        shutil.rmtree(d)
+
+
+def test_many_callers_of_one_function_collapse_to_one_finding():
+    calls = "".join(f"edit(1)\n" for _ in range(5))
+    d = _repo({"e.py": "def edit(x):\n    return x\n",
+               "u.py": "from e import edit\n\n\n\n" + calls})
+    try:
+        _write(d, {"e.py": "def edit(x):\n    return x + 1\n"})
+        r = local_impact.analyse(d, "main")
+        callers = [f for f in r.findings if f.kind == "caller"]
+        assert len(callers) == 1 and len(callers[0].also) == 4, callers
+    finally:
+        shutil.rmtree(d)
+
+
 # ─── command surface ────────────────────────────────────────────────────────
 
 def _cli(argv):

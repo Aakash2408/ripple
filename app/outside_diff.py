@@ -53,6 +53,13 @@ GENERIC_PROPS = frozenset({
 # a count, at low severity, rather than as a wall of findings nobody reads.
 AMBIGUOUS_AT = 25
 
+# A literal shared by more sites than this is an enum-like discriminator and
+# stops counting as agreement.
+DISCRIMINATOR_AT = 5
+
+# More callers of one edited function than this collapse into one finding.
+GROUP_CALLERS_AT = 3
+
 # Lines of context around a change searched for stale human-readable strings.
 MESSAGE_WINDOW = 12
 
@@ -73,6 +80,9 @@ MEANINGLESS_RECEIVERS = frozenset({
     "self", "this", "cls", "super", "result", "res", "resp", "response",
     "proc", "r", "e", "err", "ex", "data", "obj", "item", "x", "args",
     "opts", "options", "ctx", "req", "out", "ret", "val", "tmp", "m",
+    # language-global namespaces, never imported, so module_names misses them
+    "Math", "JSON", "Object", "Array", "Number", "String", "Promise",
+    "Symbol", "Reflect", "os", "sys", "typing",
 })
 _IMPORT_LINE = re.compile(r"^\s*(?:import|from|export\s+\{|.*\brequire\s*\(|"
                           r"use\s|using\s|#include)")
@@ -122,6 +132,7 @@ class Finding:
     because_of: str        # "path:line" of the change that triggered it
     key: str               # the property / symbol / words that matched
     ambiguous: bool = False
+    also: list = field(default_factory=list)   # further "path:line" sites
 
 
 @dataclass
@@ -216,16 +227,122 @@ def analyse_lines(text: str, language: str) -> list:
     return out
 
 
-def enclosing_definition(lines: list, line_no: int, max_up: int = 200):
-    """(name, def_line) of the nearest definition at or above `line_no`."""
+def is_test_path(path: str) -> bool:
+    """True for test code. Tests neither SOURCE keys nor RECEIVE ranked
+    findings: on 15 real OSS commits, test files produced the only HIGH (a
+    test fixture line as the trigger), callers-of-test-helpers, and assertion
+    messages flagged as stale prose. A test that depends on changed behaviour
+    is the test suite's job to surface, not this report's."""
+    p = "/" + path.replace("\\", "/").lower()
+    base = p.rsplit("/", 1)[-1]
+    return (any(seg in p for seg in ("/test/", "/tests/", "/__tests__/",
+                                     "/spec/", "/testdata/", "/fixtures/"))
+            or base.startswith("test_") or base == "conftest.py"
+            or base.endswith(("_test.go", "_test.py", "_spec.rb"))
+            or re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", base) is not None)
+
+
+_PY_IMPORT = re.compile(r"^\s*import\s+(.+)$")
+_GO_IMPORT = re.compile(r'^\s*(?:import\s+)?(?:([A-Za-z_]\w*|\.)\s+)?"([\w./-]+)"\s*$')
+_JS_NS_IMPORT = re.compile(
+    r"^\s*import\s+(?:\*\s+as\s+([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*))\s*"
+    r"(?:,\s*\{[\w$\s,]*\})?\s+from\b")
+_JS_REQUIRE = re.compile(
+    r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(")
+
+
+def module_names(lines: list, language: str) -> set:
+    """Names bound to whole MODULES in this file (`import typing`, Go `"os"`,
+    `import * as path`). `typing.TYPE_CHECKING` in two files is not "the same
+    receiver" in any sense that matters; it is the same module."""
+    found = set()
+    for ln in lines:
+        raw = ln.raw
+        if language == "python":
+            m = _PY_IMPORT.match(raw)
+            if m:
+                for part in m.group(1).split(","):
+                    bits = part.split()
+                    if not bits:
+                        continue
+                    found.add(bits[-1] if "as" in bits else bits[0].split(".")[0])
+        elif language == "go":
+            m = _GO_IMPORT.match(raw)
+            if m:
+                found.add(m.group(1) or m.group(2).rsplit("/", 1)[-1])
+        else:
+            m = _JS_NS_IMPORT.match(raw) or _JS_REQUIRE.match(raw)
+            if m:
+                found.add(next(g for g in m.groups() if g))
+    return found
+
+
+def enclosing_definition(lines: list, line_no: int, max_up: int = 200,
+                         language: str = ""):
+    """(name, def_line) of the definition whose BODY contains `line_no`.
+
+    Not merely the nearest definition above it: on real commits a changed
+    comment, doc block, interface field or new top-level `const` sat BELOW a
+    function that had already ended, and every caller of that untouched
+    function was reported. Enclosure is checked by indentation for Python and
+    by brace depth for brace languages; anything else keeps the old rule.
+    """
     for idx in range(min(line_no, len(lines)) - 1,
                      max(-1, line_no - 1 - max_up), -1):
-        raw = lines[idx].raw
-        for pat in _DEF_PATTERNS:
-            m = pat.match(raw)
-            if m:
-                return m.group(1), lines[idx].number
+        name = _defined_name(lines[idx].raw)
+        if not name:
+            continue
+        def_no = lines[idx].number
+        if _encloses(lines, idx, line_no, language):
+            return name, def_no
+        return None, 0
     return None, 0
+
+
+def _indent(s: str) -> int:
+    return len(s) - len(s.lstrip(" \t"))
+
+
+def _encloses(lines: list, def_idx: int, line_no: int, language: str) -> bool:
+    if line_no == lines[def_idx].number:
+        return True
+    target = line_no - 1
+    if language == "python":
+        base = _indent(lines[def_idx].raw)
+        # The body starts after the signature, which may wrap: a closing
+        # `) -> ssl.SSLContext:` at the def's own indent is still signature.
+        start, depth = def_idx, 0
+        for idx in range(def_idx, min(target, len(lines))):
+            code = lines[idx].code
+            depth += sum(code.count(c) for c in "([{")
+            depth -= sum(code.count(c) for c in ")]}")
+            start = idx
+            if depth <= 0 and code.rstrip().endswith(":"):
+                break
+        for idx in range(start + 1, min(target, len(lines) - 1) + 1):
+            ln = lines[idx]
+            if not ln.raw.strip():
+                continue
+            if _indent(ln.raw) <= base and ln.code.strip():
+                return False
+        return True
+    if language in ("ruby", "yaml", "shell", languages.UNKNOWN, ""):
+        return True
+    depth = 0
+    opened = False
+    for idx in range(def_idx, min(target, len(lines))):
+        for ch in lines[idx].code:
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                depth -= 1
+        if opened and depth <= 0:
+            return False          # the body closed before the target line
+    # A signature can wrap over a few lines before its `{`; a definition that
+    # never opened a body within that window is a one-line arrow or a
+    # declaration, and does not enclose a line further down.
+    return opened or (target - def_idx) <= 3
 
 
 def _defined_name(raw: str):
@@ -281,26 +398,49 @@ def _facts_from_change(changes, new_lines_by_path: dict, old_text_by_path: dict)
         # `proc.returncode` check became a "predicate the change altered".
         if fc.status == "added":
             continue
+        # A changed TEST does not change behaviour anything else depends on.
+        if is_test_path(fc.path):
+            continue
         new_lines = new_lines_by_path.get(fc.path) or []
         old_lines = analyse_lines(old_text_by_path.get(fc.path) or "", lang)
         by_no_new = {ln.number: ln for ln in new_lines}
         by_no_old = {ln.number: ln for ln in old_lines}
+        modules = module_names(new_lines, lang) | module_names(old_lines, lang)
 
-        sides = [(n, by_no_new.get(n), new_lines) for n in fc.added_lines]
-        sides += [(n, by_no_old.get(n), old_lines) for n in fc.removed_lines]
-        for number, ln, side_lines in sides:
-            if ln is None:
-                continue
+        added = [(n, by_no_new.get(n), new_lines) for n in fc.added_lines]
+        removed = [(n, by_no_old.get(n), old_lines) for n in fc.removed_lines]
+        added = [s for s in added if s[1] is not None and s[1].code.strip()]
+        removed = [s for s in removed if s[1] is not None and s[1].code.strip()]
+
+        # Only a literal the change actually ALTERED is evidence. zod 7989d07
+        # rewrote a condition that kept `"backward"` on both sides, and every
+        # `=== "backward"` in the codebase was promoted to MEDIUM.
+        def cond_lits(side):
+            return {l for _, ln, _ in side if ln.is_condition for l in ln.literals}
+        changed_lits = cond_lits(added) ^ cond_lits(removed)
+        # A condition that appears verbatim on both sides was moved or
+        # re-indented, not changed. Compared on the RAW text: the masked code
+        # blanks string literals, so `== 'x'` -> `== 'y'` would look unmoved.
+        removed_conds = {ln.raw.strip() for _, ln, _ in removed if ln.is_condition}
+        added_conds = {ln.raw.strip() for _, ln, _ in added if ln.is_condition}
+        moved = removed_conds & added_conds
+
+        for number, ln, side_lines in added + removed:
             where = f"{fc.path}:{number}"
-            if ln.is_condition:
+            if ln.is_condition and ln.raw.strip() not in moved:
                 for recv, prop in ln.props:
-                    if prop in GENERIC_PROPS:
+                    # A module attribute (`typing.TYPE_CHECKING`, `os.Args`)
+                    # is the same module everywhere, not related logic.
+                    if prop in GENERIC_PROPS or recv in modules:
                         continue
                     facts.predicate_keys.setdefault(prop, []).append(
-                        (recv, ln.literals, where))
-            name, def_line = enclosing_definition(side_lines, number)
-            if name and side_lines is new_lines:
-                facts.changed_symbols.setdefault(name, f"{fc.path}:{def_line}")
+                        (recv, tuple(l for l in ln.literals if l in changed_lits),
+                         where))
+            if side_lines is new_lines:
+                name, def_line = enclosing_definition(side_lines, number,
+                                                      language=lang)
+                if name:
+                    facts.changed_symbols.setdefault(name, f"{fc.path}:{def_line}")
             facts.changed_words.append((fc.path, number, words_of(ln.code)))
     return facts
 
@@ -336,6 +476,8 @@ def find_outside_diff(changes, files: dict) -> OutsideDiffResult:
         return not any(abs(number - c) <= DIFF_CONTEXT for c in changed)
 
     raw_findings = []
+    modules_in = {p: module_names(ls, languages.detect(p))
+                  for p, ls in analysed.items()}
 
     # 1. same_predicate
     for prop, origins in facts.predicate_keys.items():
@@ -349,9 +491,13 @@ def find_outside_diff(changes, files: dict) -> OutsideDiffResult:
                 hit = [r for r, p in ln.props if p == prop]
                 if not hit:
                     continue
-                shared_recv = bool(recvs & set(hit))
+                shared_recv = bool(recvs & (set(hit) - modules_in[path]))
                 shared_lit = bool(lits & set(ln.literals))
                 sites.append((path, ln, shared_recv, shared_lit))
+        # A literal shared by many sites is a discriminator (an enum value),
+        # so sharing it says little about any ONE of them.
+        if sum(1 for s in sites if s[3]) > DISCRIMINATOR_AT:
+            sites = [(p, ln, r, False) for p, ln, r, _ in sites]
         if len(sites) > AMBIGUOUS_AT:
             result.ambiguous_keys[f".{prop}"] = len(sites)
             sites = [s for s in sites if s[2] and s[3]][:5]
@@ -413,6 +559,20 @@ def find_outside_diff(changes, files: dict) -> OutsideDiffResult:
         if len(sites) > AMBIGUOUS_AT:
             result.ambiguous_keys[f"{name}()"] = len(sites)
             continue
+        if len(sites) > GROUP_CALLERS_AT:
+            # One finding per edited function, not one per call site: a
+            # refactor touched by 18 sync/async call pairs is ONE question
+            # ("does any caller rely on the old behaviour?"), and 18 lines of
+            # it buried everything else in the report.
+            first_path, first_ln = sites[0]
+            raw_findings.append(Finding(
+                kind="caller", severity="medium", path=first_path,
+                line=first_ln.number, snippet=first_ln.raw.strip()[:160],
+                reason=(f"calls `{name}()`, whose body this change edited "
+                        f"(+{len(sites) - 1} more call sites)"),
+                because_of=origin, key=f"{name}()",
+                also=[f"{p}:{ln.number}" for p, ln in sites[1:]]))
+            continue
         for path, ln in sites:
             raw_findings.append(Finding(
                 kind="caller", severity="medium", path=path, line=ln.number,
@@ -434,6 +594,8 @@ def find_outside_diff(changes, files: dict) -> OutsideDiffResult:
     all_change_words = set().union(
         *(w for _, _, w in facts.changed_words)) if facts.changed_words else set()
     for path in sorted(set(windows_by_path) | set(callers_by_path)):
+        if is_test_path(path):
+            continue        # test names and assertion messages are not UI copy
         for ln in analysed.get(path, ()):
             if not ln.literals or not outside(path, ln.number):
                 continue
@@ -463,6 +625,11 @@ def find_outside_diff(changes, files: dict) -> OutsideDiffResult:
                             because_of=f"{cpath}:{cline}",
                             key=" ".join(overlap)))
                         break
+
+    # Test files are listed for completeness, never ranked above LOW.
+    for f in raw_findings:
+        if is_test_path(f.path):
+            f.severity = "low"
 
     # One finding per (path, line, kind): keep the most severe.
     order = {"high": 0, "medium": 1, "low": 2}
