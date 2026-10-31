@@ -79,6 +79,7 @@ GATES=(
     "tests/test_local_impact.py"
     "tests/test_mcp_server.py"
     "tests/test_learned_edits.py"
+    "tests/test_dry_run.py"
     "tools/audit_diff_engines.py"
     "tools/audit_change_types.py"
     "tools/coverage_matrix.py"

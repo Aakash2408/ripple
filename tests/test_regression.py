@@ -12339,10 +12339,15 @@ def test_the_commit_authors_are_actually_fetched_not_read_from_the_payload():
 
     # The fetch must happen at the single convergence point, so no caller has to
     # remember it -- the shape that kept the diff contract from being bypassed.
+    # The convergence point asks the platform adapter, and GitHub's adapter must
+    # be the one that calls the commits endpoint.
     terminal = inspect.getsource(webhook._record_pr_terminal)
-    assert "_fetch_pr_commit_authors" in terminal, (
+    assert "platform.commit_authors()" in terminal, (
         "_record_pr_terminal does not fetch commit authors, so the author check "
         "still has nothing to check")
+    gh_authors = inspect.getsource(webhook._GitHubPRPlatform.commit_authors)
+    assert "_fetch_pr_commit_authors" in gh_authors, (
+        "the GitHub platform adapter does not fetch commit authors")
 
     # And commit_list must no longer be READ: a payload-supplied author list is a
     # key a test can set and production never will. Checked against the AST rather

@@ -62,6 +62,7 @@ jobs:
           python tests/test_local_impact.py
           python tests/test_mcp_server.py
           python tests/test_learned_edits.py
+          python tests/test_dry_run.py
 
       - name: Diff-engine audit
         # Fails if any engine regains a non-nesting block regex or loses

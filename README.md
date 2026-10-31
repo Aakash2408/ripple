@@ -199,7 +199,7 @@ describing the design as though it were live.
 | PropBench pattern pre-load | ✅ | ❌ | `propbench_data/` is not vendored here — the 882 entries live in the separate PropBench repo |
 | Consumer graph | ✅ | ⚠️ | rebuilt per run, not persisted (`/health/storage` reports `durable: false` until a volume is mounted) |
 | Multi-invoker detection | ✅ | ✅ | runs per-change, no stored state required |
-| Reviewer-edit learning | ✅ | ⏳ | wired into the GitHub `pull_request.closed` path and stored on the volume; nothing learned yet because no reviewer has edited and merged a Ripple PR |
+| Reviewer-edit learning | ✅ | ⏳ | wired into the GitHub, GitLab and Bitbucket PR-closed paths and stored on the volume; nothing learned yet because no reviewer has edited and merged a Ripple PR (GitLab and Bitbucket are also behind `RIPPLE_ENABLE_EXPERIMENTAL_PLATFORMS=1`) |
 
 **Reviewer-edit learning** (`app/learned_edits.py`) is the one channel that
 changes the *code* Ripple writes rather than a confidence score:
@@ -212,6 +212,10 @@ changes the *code* Ripple writes rather than a confidence score:
 - The next fix for the same change type and language **in the same org** applies
   those rules first and lets the template handle everything else. The PR says
   which earlier PR it learned from.
+- When a PR built from learned rules is **closed without merging**, each rule it
+  used loses a point. A rule rejected as often as it was taught stops being
+  applied, and the next most-voted outcome for that line (or the template)
+  takes over.
 
 Limits:
 - Rules only match on exact text after normalisation, with no fuzzy matching.
@@ -219,8 +223,11 @@ Limits:
 - `field_removed` rules apply to any field. Other change types only apply to the
   same field.
 - A reviewer insertion with no field reference in the original isn't learned.
-- A rejected PR doesn't yet weaken the rules it used.
-- GitLab and Bitbucket outcomes don't feed it yet.
+- A rejection penalises the rules that win on that file *when the PR closes*. If
+  a different rule started winning while the PR was open, that one is penalised.
+- On GitLab and Bitbucket, Ripple's commits are made with a user token, so
+  "Ripple's commit" means "authored by that token's user". If the same person
+  also edits the PR by hand, the merge reads as clean.
 
 What this means in practice: the RAG retriever executes on every fix and
 correctly reports `No RAG pattern or cluster match` because its store is empty.

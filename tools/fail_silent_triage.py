@@ -407,6 +407,49 @@ TRIAGE: dict[tuple, tuple] = {
         "exception about bookkeeping, losing the answer we just paid a compile for. "
         "The restore exists so consumers do not accumulate each other's patches, not "
         "as a correctness guarantee about the tree."),
+    # app/pr_platforms.py: GitLab (#0) and Bitbucket (#1) adapters for the
+    # outcome handler. Every None they return reads downstream as the
+    # conservative answer -- contaminated, human-edited, or file skipped --
+    # so a failed read degrades to learning nothing, never to learning wrongly.
+    ("pr_platforms.py", "_get", "swallowed_except", "Exception", 0): (
+        LEGITIMATE,
+        "A failed GitLab API read returns None. Every caller maps None to the "
+        "fail-closed answer: an unknown commit count is contaminated, unknown "
+        "authors are human edits, an unread file is skipped. Raising would lose "
+        "the whole terminal-state record for a PR whose outcome we do know."),
+    ("pr_platforms.py", "_get", "silent_empty_return", "", 0): (
+        LEGITIMATE,
+        "GitLab error bodies ({'error': ...}) become None for the same reason "
+        "as the except: an error must never be read as data, e.g. as a "
+        "zero-commit list that would make the merge look clean."),
+    ("pr_platforms.py", "_get", "swallowed_except", "Exception", 1): (
+        LEGITIMATE,
+        "Bitbucket twin of the GitLab _get above: None is the fail-closed "
+        "answer at every caller."),
+    ("pr_platforms.py", "_get", "silent_empty_return", "", 1): (
+        LEGITIMATE,
+        "Bitbucket error bodies become None, never data, for the same reason "
+        "as the GitLab _get."),
+    ("pr_platforms.py", "fetch", "swallowed_except", "Exception", 0): (
+        LEGITIMATE,
+        "An undecodable GitLab file is 'could not read', so it returns None and "
+        "the learner skips that file. Returning '' would teach 'delete every "
+        "reference'."),
+    ("pr_platforms.py", "fetch", "silent_empty_return", "", 0): (
+        LEGITIMATE,
+        "No 'content' in the GitLab response means the file could not be read "
+        "at that commit; None makes the learner skip it rather than diff "
+        "against an empty file."),
+    ("pr_platforms.py", "fetch", "swallowed_except", "Exception", 1): (
+        LEGITIMATE,
+        "BitbucketClient.get_file raises on anything but a 404 (auth, rate "
+        "limit, outage). For learning that is 'could not read', so None and "
+        "the file is skipped, never treated as empty."),
+    ("pr_platforms.py", "fetch", "silent_empty_return", "", 1): (
+        LEGITIMATE,
+        "get_file returns '' only for a 404. Mapping it to None keeps 'not "
+        "there' from being learned as 'empty file'."),
+
 
     ("webhook.py", "_fetch_pr_commit_authors", "swallowed_except", "Exception", 0): (
         LEGITIMATE,

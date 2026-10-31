@@ -905,8 +905,11 @@ async def bitbucket_webhook(request: FastAPIRequest):
     if not verify_bitbucket_signature(body, secret, sig_header):
         raise HTTPException(status_code=401, detail="Invalid Bitbucket signature")
     
-    # Only handle push events
     event_type = request.headers.get("X-Event-Key", "")
+    if event_type in ("pullrequest:fulfilled", "pullrequest:rejected"):
+        return _handle_bitbucket_pr_closed(
+            payload, merged=event_type == "pullrequest:fulfilled")
+    # Otherwise only handle push events
     if event_type != "repo:push":
         return {"status": "ignored", "reason": f"event_type={event_type}"}
     
@@ -1196,6 +1199,9 @@ async def gitlab_webhook(request: FastAPIRequest):
     # GitHub client. A second analysis path would be a second place to get the
     # base/head the wrong way round.
     if event_type == "Merge Request Hook":
+        action = (payload.get("object_attributes") or {}).get("action", "")
+        if action in ("merge", "close"):
+            return _handle_gitlab_mr_closed(payload)
         return await _handle_gitlab_merge_request(payload)
 
     if event_type != "Push Hook":
@@ -3817,7 +3823,54 @@ def _pr_had_human_edits(pr: dict, row, commit_authors) -> bool:
     return False
 
 
-def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
+class _GitHubPRPlatform:
+    """GitHub's answers to the questions `_record_pr_terminal` asks.
+
+    The GitLab and Bitbucket equivalents are in app/pr_platforms.py. Each call
+    goes through the same module-level helpers as before, so nothing about the
+    GitHub path changed except that it is now one implementation of three.
+    """
+
+    platform = "github"
+
+    def __init__(self, pr: dict, payload: dict):
+        self.pr = pr
+        self.payload = payload
+        self.repo = payload.get("repository", {}).get("full_name", "")
+
+    def _token(self) -> str:
+        return _get_token(self.payload.get("installation", {}).get("id"))
+
+    def pr_dict(self) -> dict:
+        return self.pr
+
+    def commit_authors(self):
+        return _fetch_pr_commit_authors(self.repo, self.pr.get("number"),
+                                        self._token())
+
+    def head_sha(self) -> str:
+        return (self.pr.get("head") or {}).get("sha") or ""
+
+    def merge_base(self) -> str:
+        # The merge base, not `pr.base.sha`: the base branch can move while the
+        # PR is open, and diffing against its tip would credit upstream changes
+        # to the reviewer.
+        head = self.head_sha()
+        base = (self.pr.get("base") or {}).get("sha") or ""
+        if not head or not base:
+            return ""
+        compare = _github_api("GET", f"/repos/{self.repo}/compare/{base}...{head}",
+                              self._token())
+        if isinstance(compare, dict) and (compare.get("merge_base_commit") or {}).get("sha"):
+            return compare["merge_base_commit"]["sha"]
+        return base
+
+    def fetch(self, path: str, sha: str):
+        return _fetch_file_at_sha(self.repo, path, sha, self._token())
+
+
+def _record_pr_terminal(pr: dict, payload: dict, merged: bool,
+                        platform=None) -> dict:
     """The four outcome classes, attributed through the provenance ledger.
 
     THE LEDGER IS THE IDENTITY CHECK. This used to be
@@ -3838,8 +3891,11 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
     """
     from . import pr_ledger
 
+    if platform is None:
+        platform = _GitHubPRPlatform(pr, payload)
+    pr = platform.pr_dict()
     pr_url = pr.get("html_url") or pr.get("url") or ""
-    repo = payload.get("repository", {}).get("full_name", "")
+    repo = platform.repo
     row = pr_ledger.lookup(pr_url)
 
     if row is None:
@@ -3862,9 +3918,7 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
         # pure predicate and no caller can forget to supply the authors, which is
         # how the previous version ended up reading a payload key that only tests
         # ever wrote.
-        commit_authors = _fetch_pr_commit_authors(
-            repo, pr.get("number"),
-            _get_token(payload.get("installation", {}).get("id")))
+        commit_authors = platform.commit_authors()
         if commit_authors is None:
             _log_activity("commit_authors_unavailable", {
                 "pr": pr.get("number"), "repo": repo,
@@ -3904,7 +3958,7 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
         # Contamination has already bounded the edit to the files Ripple
         # proposed, which is what makes the merged state attributable.
         try:
-            learned = _learn_from_reviewer_edits(pr, payload, row, repo)
+            learned = _learn_from_reviewer_edits(pr, payload, row, repo, platform)
             _log_activity("reviewer_edits_learned", {
                 "pr": pr.get("number"), "repo": repo, **learned})
         except Exception as exc:                                # noqa: BLE001
@@ -3951,7 +4005,8 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
         # used gets this PR's vote. It must NOT fall into the branch below, which
         # would credit the result to a template that did not produce it.
         try:
-            learned_summary = _learn_from_reviewer_edits(pr, payload, row, repo)
+            learned_summary = _learn_from_reviewer_edits(pr, payload, row, repo,
+                                                         platform)
             credited = bool(learned_summary.get("rules_reinforced")
                             or learned_summary.get("rules_learned"))
             _log_activity("reviewer_edits_learned", {
@@ -3961,6 +4016,21 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
             _log_activity("learn_error", {
                 "pr": pr.get("number"), "repo": repo,
                 "step": "reinforce_learned_edits",
+                "err": f"{type(exc).__name__}: {str(exc)[:160]}"})
+    elif outcome == "rejected" and row.get("source") == "learned":
+        # The mirror of the branch above: a fix built from reviewer-taught
+        # rules was closed without merging, so each rule it used loses a
+        # point. Without this a rule could only ever gain confidence, and
+        # one a team stopped wanting would be re-proposed forever.
+        try:
+            learned_summary = _weaken_learned_rules(pr, row, repo, platform)
+            credited = bool(learned_summary.get("rules_weakened"))
+            _log_activity("learned_edits_weakened", {
+                "pr": pr.get("number"), "repo": repo, **learned_summary})
+        except Exception as exc:                                # noqa: BLE001
+            _log_activity("learn_error", {
+                "pr": pr.get("number"), "repo": repo,
+                "step": "weaken_learned_edits",
                 "err": f"{type(exc).__name__}: {str(exc)[:160]}"})
     elif outcome == "merged_clean" and not pattern_id:
         # The common case: a template fix, merged unchanged. This is the evidence
@@ -3991,43 +4061,36 @@ def _record_pr_terminal(pr: dict, payload: dict, merged: bool) -> dict:
             **({"learned_edits": learned_summary} if learned_summary else {})}
 
 
-def _learn_from_reviewer_edits(pr: dict, payload: dict, row: dict, repo: str) -> dict:
+def _learn_from_reviewer_edits(pr: dict, payload: dict, row: dict, repo: str,
+                               platform=None) -> dict:
     """Turn a reviewer's edits to a Ripple PR into learned rules.
 
     For each file Ripple proposed, diff the file at the MERGE BASE (what Ripple
-    started from) against the PR head (what the reviewer approved). The merge
-    base, not `pr.base.sha`, because the base branch can move while the PR is
-    open; diffing against its tip would credit upstream changes to the reviewer.
+    started from) against the PR head (what the reviewer approved).
+    `platform` answers where those come from on GitHub, GitLab or Bitbucket.
 
     Unreadable files are reported per file and skipped. They are never treated
     as empty: an empty "after" would teach "delete every reference".
     """
     from . import learned_edits
 
-    token = _get_token(payload.get("installation", {}).get("id"))
-    head_sha = (pr.get("head") or {}).get("sha") or ""
-    base_sha = (pr.get("base") or {}).get("sha") or ""
-    if not head_sha or not base_sha:
+    if platform is None:
+        platform = _GitHubPRPlatform(pr, payload)
+    head_sha = platform.head_sha()
+    merge_base = platform.merge_base() if head_sha else ""
+    if not head_sha or not merge_base:
         return {"files": 0, "skipped_files": ["PR payload has no base/head sha"]}
-
-    merge_base = base_sha
-    compare = _github_api("GET", f"/repos/{repo}/compare/{base_sha}...{head_sha}", token)
-    if isinstance(compare, dict) and (compare.get("merge_base_commit") or {}).get("sha"):
-        merge_base = compare["merge_base_commit"]["sha"]
 
     owner = repo.split("/")[0] if "/" in repo else repo
     change_type = row.get("change_type") or ""
     field_name = row.get("field_name") or ""
-    files = list(row.get("proposed_files") or [])
-    if not files and row.get("consumer_file"):
-        files = [row["consumer_file"]]
 
     store = learned_edits.default_store()
     totals = {"files": 0, "rules_learned": 0, "rules_reinforced": 0,
               "already_counted": 0, "skipped": [], "skipped_files": []}
-    for path in files:
-        before = _fetch_file_at_sha(repo, path, merge_base, token)
-        after = _fetch_file_at_sha(repo, path, head_sha, token)
+    for path in _ledger_files(row):
+        before = platform.fetch(path, merge_base)
+        after = platform.fetch(path, head_sha)
         if before is None or after is None:
             totals["skipped_files"].append(
                 f"{path}: could not read the {'base' if before is None else 'merged'} version")
@@ -4044,6 +4107,49 @@ def _learn_from_reviewer_edits(pr: dict, payload: dict, row: dict, repo: str) ->
     return totals
 
 
+def _ledger_files(row: dict) -> list:
+    files = list(row.get("proposed_files") or [])
+    if not files and row.get("consumer_file"):
+        files = [row["consumer_file"]]
+    return files
+
+
+def _weaken_learned_rules(pr: dict, row: dict, repo: str, platform) -> dict:
+    """A learned fix was rejected: penalise the rules it used, per file.
+
+    The rules are re-derived from each proposed file at the merge base, the
+    input the learned fix was built from (LearnedEditStore.reject). A file that
+    cannot be read is skipped, so a fetch failure weakens nothing rather than
+    guessing.
+    """
+    from . import learned_edits
+
+    head_sha = platform.head_sha()
+    merge_base = platform.merge_base() if head_sha else ""
+    if not merge_base:
+        return {"files": 0, "rules_weakened": 0,
+                "skipped_files": ["PR payload has no base/head sha"]}
+
+    owner = repo.split("/")[0] if "/" in repo else repo
+    store = learned_edits.default_store()
+    totals = {"files": 0, "rules_weakened": 0, "rules_retired": 0,
+              "already_counted": 0, "skipped_files": []}
+    for path in _ledger_files(row):
+        base = platform.fetch(path, merge_base)
+        if base is None:
+            totals["skipped_files"].append(f"{path}: could not read the base version")
+            continue
+        result = store.reject(
+            scope=owner, change_type=row.get("change_type") or "",
+            language=row.get("language") or _detect_lang(path),
+            field_name=row.get("field_name") or "", base=base,
+            source=pr.get("html_url") or pr.get("url") or "")
+        totals["files"] += 1
+        for k in ("rules_weakened", "rules_retired", "already_counted"):
+            totals[k] += result[k]
+    return totals
+
+
 def _handle_pr_merged(payload: dict, pr: dict) -> dict:
     """A closed-and-merged PR. See _record_pr_terminal for the outcome classes."""
     return _record_pr_terminal(pr, payload, merged=True)
@@ -4052,6 +4158,27 @@ def _handle_pr_merged(payload: dict, pr: dict) -> dict:
 def _handle_pr_rejected(payload: dict, pr: dict) -> dict:
     """A closed-without-merge PR: a negative signal, if it is attributable."""
     return _record_pr_terminal(pr, payload, merged=False)
+
+
+def _handle_gitlab_mr_closed(payload: dict) -> dict:
+    """A GitLab MR was merged or closed: same outcome handling as GitHub."""
+    from .pr_platforms import GitLabMR
+    from .gitlab_oauth import get_token_for_project
+
+    attrs = payload.get("object_attributes") or {}
+    project_id = attrs.get("target_project_id") or (payload.get("project") or {}).get("id")
+    token = (get_token_for_project(project_id) if project_id else "") \
+        or os.environ.get("GITLAB_TOKEN", "")
+    mr = GitLabMR(payload, GitLabClient(token=token))
+    return _record_pr_terminal({}, payload, merged=mr.merged, platform=mr)
+
+
+def _handle_bitbucket_pr_closed(payload: dict, merged: bool) -> dict:
+    """A Bitbucket PR was merged (fulfilled) or declined (rejected)."""
+    from .pr_platforms import BitbucketPR
+
+    pr = BitbucketPR(payload, BitbucketClient(), merged=merged)
+    return _record_pr_terminal({}, payload, merged=merged, platform=pr)
 
 
 

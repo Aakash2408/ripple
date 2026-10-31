@@ -192,8 +192,18 @@ def _detect_changes(before: str, after: str, contract_type: str,
         elif contract_type == "smithy":
             from .smithy_diff import diff_smithy
             return diff_smithy(before, after, file_path=path), meta
+        elif contract_type in ("openapi", "database", "sql"):
+            # These used to fall through to _basic_diff, which only compares
+            # inline request/response schemas -- a field removed from a
+            # $ref'd components schema (the usual OpenAPI layout) and every
+            # dropped SQL column came back as "no breaking changes". Route
+            # through the shared engine table that `ripple impact`, /poll and
+            # the MCP server use, so the public page sees what they see.
+            from .local_impact import diff_contract
+            engine = "sql" if contract_type == "database" else contract_type
+            meta["engine"] = engine
+            return diff_contract(engine, before, after, path), meta
         else:
-            # OpenAPI / database / default
             meta["engine"] = f"{contract_type} (basic)"
             return _basic_diff(before, after, contract_type), meta
     except Exception as e:

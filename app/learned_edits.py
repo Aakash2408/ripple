@@ -326,7 +326,21 @@ class LearnedEditStore:
 
     def rules_for(self, *, scope: str, change_type: str, language: str,
                   field_name: str) -> list:
-        """[(site, outcome, sources)] for the winning outcome of each site."""
+        """[(site, outcome, sources)] for the winning outcome of each site.
+
+        A site whose every outcome has been rejected at least as often as it
+        was voted for is left out entirely, so the template handles it again.
+        """
+        return [(site, best["outcome"], list(best["sources"]))
+                for site, _key, _okey, best in self._winners(
+                    scope=scope, change_type=change_type, language=language,
+                    field_name=field_name)]
+
+    @staticmethod
+    def _score(slot: dict) -> int:
+        return slot["votes"] - slot.get("rejects", 0)
+
+    def _winners(self, *, scope, change_type, language, field_name) -> list:
         ct = canonical_change_type(change_type)
         field_key = "*" if ct in _FIELD_GENERIC else field_name
         out = []
@@ -336,13 +350,59 @@ class LearnedEditStore:
                 k_scope, k_ct, k_lang, k_field, site = json.loads(key)
                 if (k_scope, k_ct, k_lang, k_field) != (scope, ct, language, field_key):
                     continue
-                best = max(entry["outcomes"].values(),
-                           key=lambda s: (s["votes"], s["last"]))
-                out.append((site, best["outcome"], list(best["sources"])))
+                live = [(okey, s) for okey, s in entry["outcomes"].items()
+                        if self._score(s) > 0]
+                if not live:
+                    continue
+                okey, best = max(live, key=lambda kv: (self._score(kv[1]), kv[1]["last"]))
+                out.append((site, key, okey, best))
         # Longest site first, so a multi-line rule wins over a one-line rule
         # that matches its first line.
         out.sort(key=lambda r: -len(r[0]))
         return out
+
+    def reject(self, *, scope: str, change_type: str, language: str,
+               field_name: str, base: str, source: str) -> dict:
+        """A Ripple PR built from learned rules was closed without merging.
+
+        The rules it used are re-derived by running the same site matching
+        `apply` runs on `base` (the file as Ripple found it), and the outcome
+        that won at each matched site loses one point. One rejection per PR
+        per rule, however often the webhook is redelivered. An outcome whose
+        rejections catch up with its votes stops being applied.
+
+        Known approximation: if a different outcome started winning at a site
+        between the PR opening and closing, the current winner is the one
+        penalised. Recording the exact rule ids at open time would need them
+        threaded through every PR-opening call site.
+        """
+        table = _variant_table(field_name)
+        lines, _nl = _split(base)
+        norm = [_abstract(ln.strip(), table) for ln in lines]
+        winners = self._winners(scope=scope, change_type=change_type,
+                                language=language, field_name=field_name)
+        used = [(key, okey) for _start, _k, (key, okey) in _match_sites(
+            norm, [(site, (key, okey)) for site, key, okey, _b in winners])]
+        weakened = duplicate = retired = 0
+        with self._lock:
+            self._load()
+            for key, okey in dict.fromkeys(used):
+                slot = self._rules[key]["outcomes"][okey]
+                rejected_by = slot.setdefault("rejected_by", [])
+                if source in rejected_by:
+                    duplicate += 1
+                    continue
+                slot["rejects"] = slot.get("rejects", 0) + 1
+                slot["rejected_by"] = (rejected_by + [source])[-10:]
+                weakened += 1
+                if self._score(slot) <= 0:
+                    retired += 1
+            if weakened:
+                self._save()
+        return {"rules_weakened": weakened, "rules_retired": retired,
+                "already_counted": duplicate, "scope": scope,
+                "change_type": canonical_change_type(change_type),
+                "language": language}
 
     def stats(self) -> dict:
         with self._lock:
@@ -367,6 +427,27 @@ class LearnedResult:
     reason: str = ""
 
 
+def _match_sites(norm: list, rules: list) -> list:
+    """[(start, length, payload)] for each non-overlapping rule site in `norm`.
+
+    `rules` is [(site, payload)], longest site first. ONE matcher for `apply`
+    and `LearnedEditStore.reject`, so a rejection penalises exactly the rules
+    an application would have used.
+    """
+    out = []
+    i = 0
+    while i < len(norm):
+        for site, payload in rules:
+            k = len(site)
+            if k and norm[i:i + k] == site and _has_ph(site):
+                out.append((i, k, payload))
+                i += k
+                break
+        else:
+            i += 1
+    return out
+
+
 def apply(code: str, *, store: LearnedEditStore, scope: str, change_type: str,
           language: str, field_name: str,
           template_fn: Callable[[str], tuple]) -> LearnedResult:
@@ -384,17 +465,9 @@ def apply(code: str, *, store: LearnedEditStore, scope: str, change_type: str,
     lines, nl = _split(code)
     norm = [_abstract(ln.strip(), table) for ln in lines]
 
-    matches = []          # (start, length, outcome, sources)
-    i = 0
-    while i < len(lines):
-        for site, outcome, sources in rules:
-            k = len(site)
-            if k and norm[i:i + k] == site and _has_ph(site):
-                matches.append((i, k, outcome, sources))
-                i += k
-                break
-        else:
-            i += 1
+    matches = [(start, k, outcome, sources) for start, k, (outcome, sources)
+               in _match_sites(norm, [(site, (outcome, sources))
+                                      for site, outcome, sources in rules])]
     if not matches:
         return LearnedResult(applied=False)
 

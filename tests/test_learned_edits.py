@@ -415,6 +415,392 @@ def test_a_clean_merge_of_a_learned_fix_reinforces_its_rules():
         learned_edits._default_store = saved
 
 
+# ------------------------------------------------------------ rejections
+def _apply_client(store, scope="acme", field="fax_number", code=None):
+    code = code or CLIENT.replace("phoneNumber", "faxNumber")
+    return apply(code, store=store, scope=scope, change_type="removed_field",
+                 language="typescript", field_name=field,
+                 template_fn=_ts_template(field))
+
+
+def _reject_client(store, source, scope="acme", base=CLIENT):
+    return store.reject(scope=scope, change_type="removed_field", language="typescript",
+                        field_name="phone_number", base=base, source=source)
+
+
+def test_a_rejection_retires_a_one_vote_rule():
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    assert _apply_client(store).applied
+    summary = _reject_client(store, "pr-rejected")
+    assert summary["rules_weakened"] >= 2 and summary["rules_retired"] == summary["rules_weakened"], summary
+    after = _apply_client(store)
+    assert not after.applied, "a rule rejected as often as it was taught still applied"
+
+
+def test_a_redelivered_rejection_counts_once_and_votes_outweigh_it():
+    store = _store()
+    _learn_client(store, source="pr-a")
+    _learn_client(store, source="pr-b")                  # 2 votes per rule
+    _reject_client(store, "pr-x")
+    again = _reject_client(store, "pr-x")
+    assert again["rules_weakened"] == 0 and again["already_counted"] >= 2, again
+    assert _apply_client(store).applied, "2 votes vs 1 rejection should still apply"
+    _reject_client(store, "pr-y")
+    assert not _apply_client(store).applied
+
+
+def test_a_rejection_hands_the_site_to_the_runner_up():
+    store = _store()
+    alt = CLIENT.replace("{ name, email, phoneNumber }",
+                         "{ name, email, phoneNumber: undefined }")
+    _learn_client(store, source="pr-a")
+    _learn_client(store, source="pr-b")
+    store.learn(scope="acme", change_type="removed_field", language="typescript",
+                field_name="phone_number", base=CLIENT, final=alt, source="pr-c")
+    before = _apply_client(store)
+    assert "{ name, email }" in before.code, before.code
+    _reject_client(store, "pr-x")       # 2-1 ties 1-0; a tie goes to the newer
+    after = _apply_client(store)
+    assert after.applied and "faxNumber: undefined" in after.code, after.code
+    # The next rejection lands on what was actually applied: the runner-up.
+    _reject_client(store, "pr-y")
+    assert "{ name, email }" in _apply_client(store).code
+
+
+def test_a_rejection_only_weakens_rules_whose_sites_are_in_the_file():
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    summary = _reject_client(store, "pr-rejected", base="export const x = 1;\n")
+    assert summary["rules_weakened"] == 0, summary
+    assert _apply_client(store).applied
+
+
+def test_a_rejection_does_not_cross_orgs():
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    _reject_client(store, "pr-rejected", scope="globex")
+    assert _apply_client(store).applied
+
+
+def _record(url, source, repo="acme/billing"):
+    from app import pr_ledger
+    pr_ledger.record_open(url, pattern_id="", source=source,
+                          change_type="field_removed", language="typescript",
+                          field_name="phone_number", consumer_file="src/client.ts",
+                          repo=repo, validated=None, level="review")
+
+
+def _fax_fix(scope="acme"):
+    from app import webhook as w
+    from app.consumer_finder import ConsumerMatch
+    from app.diff_engine import BreakingChange
+    consumer = ConsumerMatch(file_path="src/other.ts", line_number=0, code_snippet="",
+                             confidence="high", match_reason="t", language="typescript")
+    change = BreakingChange(change_type="field_removed", field_name="fax_number",
+                            field_type="string", path="/u", method="post",
+                            location="request_body", severity="breaking", description="")
+    return w._generate_fix_with_rag_fallback(CLIENT.replace("phoneNumber", "faxNumber"),
+                                             consumer, change, scope)
+
+
+class _UseStore:
+    def __init__(self, store):
+        self.store = store
+
+    def __enter__(self):
+        self.saved = learned_edits._default_store
+        learned_edits._default_store = self.store
+        return self.store
+
+    def __exit__(self, *exc):
+        learned_edits._default_store = self.saved
+
+
+def _closed_pr(url, commits=1):
+    pr = _merged_pr(url, commits=commits)
+    pr["merged"] = False
+    return pr
+
+
+def test_a_rejected_learned_pr_weakens_its_rules_end_to_end():
+    from app import webhook as w
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    url = "https://github.com/acme/billing/pull/80"
+    _record(url, "learned")
+    with _UseStore(store):
+        assert _fax_fix()[1].startswith("[learned]")
+        with _PatchedGitHub({("src/client.ts", "MB"): CLIENT}, authors=("ripple-api[bot]",)):
+            result = w._handle_pr_rejected({"repository": {"full_name": "acme/billing"},
+                                            "installation": {"id": 1}}, _closed_pr(url))
+        assert result["outcome"] == "rejected", result
+        assert result["counters_updated"], result
+        assert result["learned_edits"]["rules_weakened"] >= 2, result
+        assert not _fax_fix()[1].startswith("[learned]")
+
+
+def test_a_rejected_template_pr_leaves_learned_rules_alone():
+    from app import webhook as w
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    url = "https://github.com/acme/billing/pull/81"
+    _record(url, "template")
+    with _UseStore(store):
+        with _PatchedGitHub({("src/client.ts", "MB"): CLIENT}, authors=("ripple-api[bot]",)):
+            result = w._handle_pr_rejected({"repository": {"full_name": "acme/billing"},
+                                            "installation": {"id": 1}}, _closed_pr(url))
+        assert "learned_edits" not in result, result
+        assert _fax_fix()[1].startswith("[learned]")
+
+
+# ------------------------------------------------------- GitLab / Bitbucket
+import base64 as _b64  # noqa: E402
+
+
+class _FakeGitLab:
+    """Answers GitLabClient._request by path. `me` None = /user fails."""
+
+    def __init__(self, files, commits, me, changes_count="1"):
+        self.files, self.commits, self.me = files, commits, me
+        self.changes_count = changes_count
+
+    def _request(self, method, path, data=None):
+        from urllib.parse import unquote
+        if path == "/user":
+            return self.me if self.me else {"error": 401, "message": ""}
+        if "/repository/files/" in path:
+            enc, _, ref = path.split("/repository/files/")[1].partition("?ref=")
+            text = self.files.get((unquote(enc), ref))
+            if text is None:
+                return {"error": 404, "message": ""}
+            return {"content": _b64.b64encode(text.encode()).decode()}
+        if path.endswith("/commits?per_page=100"):
+            return self.commits
+        if "/merge_requests/" in path:
+            return {"diff_refs": {"base_sha": "MB", "head_sha": "HEAD", "start_sha": "MB"},
+                    "changes_count": self.changes_count}
+        return {"error": 404, "message": ""}
+
+
+_ME = {"name": "Ripple Bot User", "username": "ripplebot", "email": "bot@acme.dev"}
+_RIPPLE_COMMIT = {"author_name": "Ripple Bot User", "author_email": "bot@acme.dev"}
+_HUMAN_COMMIT = {"author_name": "Dana Reviewer", "author_email": "dana@acme.dev"}
+
+
+def _gitlab_payload(url, action="merge"):
+    return {"object_kind": "merge_request",
+            "project": {"id": 7, "path_with_namespace": "acme/billing"},
+            "object_attributes": {"iid": int(url.rsplit("/", 1)[1]), "url": url,
+                                  "action": action, "target_project_id": 7}}
+
+
+def _run_gitlab(payload, fake):
+    from app import webhook as w, gitlab_oauth
+    saved = (w.GitLabClient, gitlab_oauth.get_token_for_project)
+    w.GitLabClient = lambda token="", **k: fake
+    gitlab_oauth.get_token_for_project = lambda pid: "t"
+    try:
+        return w._handle_gitlab_mr_closed(payload)
+    finally:
+        w.GitLabClient, gitlab_oauth.get_token_for_project = saved
+
+
+def test_a_gitlab_mr_merged_with_edits_teaches_the_next_fix():
+    store = _store()
+    url = "https://gitlab.com/acme/billing/-/merge_requests/12"
+    _record(url, "template")
+    fake = _FakeGitLab({("src/client.ts", "MB"): CLIENT,
+                        ("src/client.ts", "HEAD"): CLIENT_REVIEWED},
+                       [_RIPPLE_COMMIT, _HUMAN_COMMIT], _ME)
+    with _UseStore(store):
+        assert not _fax_fix()[1].startswith("[learned]")
+        result = _run_gitlab(_gitlab_payload(url), fake)
+        assert result["outcome"] == "merged_with_edits", result
+        assert result["learned_edits"]["rules_learned"] >= 2, result
+        fixed, expl = _fax_fix()
+        assert expl.startswith("[learned]") and url in expl, expl
+        assert "{ name, email }" in fixed, fixed
+
+
+def test_a_gitlab_mr_by_the_token_user_alone_is_a_clean_merge():
+    url = "https://gitlab.com/acme/billing/-/merge_requests/13"
+    _record(url, "template")
+    fake = _FakeGitLab({}, [_RIPPLE_COMMIT], _ME)
+    with _UseStore(_store()):
+        result = _run_gitlab(_gitlab_payload(url), fake)
+    assert result["outcome"] == "merged_clean", result
+
+
+def test_a_gitlab_mr_with_unknown_identity_reads_as_human_edited():
+    url = "https://gitlab.com/acme/billing/-/merge_requests/14"
+    _record(url, "template")
+    fake = _FakeGitLab({}, [_RIPPLE_COMMIT], None)
+    with _UseStore(_store()):
+        result = _run_gitlab(_gitlab_payload(url), fake)
+    assert result["outcome"] == "merged_with_edits", result
+
+
+def test_a_gitlab_token_user_with_no_name_or_email_reads_as_human_edited():
+    url = "https://gitlab.com/acme/billing/-/merge_requests/17"
+    _record(url, "template")
+    fake = _FakeGitLab({}, [_RIPPLE_COMMIT], {"id": 42})
+    with _UseStore(_store()):
+        result = _run_gitlab(_gitlab_payload(url), fake)
+    assert result["outcome"] == "merged_with_edits", result
+
+
+def test_a_gitlab_commit_amended_by_a_human_keeps_the_count_but_is_an_edit():
+    # Same commit count as Ripple pushed, so only the author check can see it.
+    url = "https://gitlab.com/acme/billing/-/merge_requests/18"
+    _record(url, "template")
+    fake = _FakeGitLab({}, [_HUMAN_COMMIT], _ME)
+    with _UseStore(_store()):
+        result = _run_gitlab(_gitlab_payload(url), fake)
+    assert result["outcome"] == "merged_with_edits", result
+
+
+def test_a_gitlab_capped_change_count_is_contaminated_not_learned():
+    store = _store()
+    url = "https://gitlab.com/acme/billing/-/merge_requests/15"
+    _record(url, "template")
+    fake = _FakeGitLab({("src/client.ts", "MB"): CLIENT,
+                        ("src/client.ts", "HEAD"): CLIENT_REVIEWED},
+                       [_RIPPLE_COMMIT, _HUMAN_COMMIT], _ME, changes_count="1000+")
+    with _UseStore(store):
+        result = _run_gitlab(_gitlab_payload(url), fake)
+    assert result["contaminated"] and store.stats()["rules"] == 0, result
+
+
+def test_a_closed_gitlab_learned_mr_weakens_its_rules():
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    url = "https://gitlab.com/acme/billing/-/merge_requests/16"
+    _record(url, "learned")
+    fake = _FakeGitLab({("src/client.ts", "MB"): CLIENT}, [_RIPPLE_COMMIT], _ME)
+    with _UseStore(store):
+        result = _run_gitlab(_gitlab_payload(url, action="close"), fake)
+        assert result["outcome"] == "rejected", result
+        assert result["learned_edits"]["rules_weakened"] >= 2, result
+        assert not _fax_fix()[1].startswith("[learned]")
+
+
+class _FakeBitbucket:
+    def __init__(self, files, commits, me_id="acc-ripple", n_files=1, paged=False):
+        self.files, self.commits, self.me_id = files, commits, me_id
+        self.n_files, self.paged = n_files, paged
+
+    def _request(self, method, path, data=None):
+        if path == "/user":
+            return {"account_id": self.me_id} if self.me_id else {"error": 401}
+        if "/merge-base/" in path:
+            return {"hash": "MB"}
+        if "/commits?" in path:
+            out = {"values": self.commits}
+            if self.paged:
+                out["next"] = "https://api.bitbucket.org/next"
+            return out
+        if "/diffstat?" in path:
+            return {"values": [{}] * self.n_files}
+        return {"error": 404}
+
+    def get_file_at_commit(self, ws, slug, path, sha):
+        return self.files.get((path, sha), "")
+
+
+def _bb_payload(url, pr_id):
+    return {"pullrequest": {
+        "id": pr_id, "links": {"html": {"href": url}},
+        "source": {"commit": {"hash": "HEAD"}},
+        "destination": {"commit": {"hash": "DEST_TIP"},
+                        "repository": {"full_name": "acme/billing"}}}}
+
+
+_BB_RIPPLE = {"author": {"user": {"account_id": "acc-ripple", "nickname": "ripple"}}}
+_BB_HUMAN = {"author": {"user": {"account_id": "acc-dana", "nickname": "dana"}}}
+
+
+def _run_bb(payload, fake, merged):
+    from app import webhook as w
+    saved = w.BitbucketClient
+    w.BitbucketClient = lambda *a, **k: fake
+    try:
+        return w._handle_bitbucket_pr_closed(payload, merged=merged)
+    finally:
+        w.BitbucketClient = saved
+
+
+def test_a_bitbucket_pr_merged_with_edits_teaches_the_next_fix():
+    store = _store()
+    url = "https://bitbucket.org/acme/billing/pull-requests/3"
+    _record(url, "template")
+    fake = _FakeBitbucket({("src/client.ts", "MB"): CLIENT,
+                           ("src/client.ts", "HEAD"): CLIENT_REVIEWED,
+                           ("src/client.ts", "DEST_TIP"): "// upstream moved\n"},
+                          [_BB_RIPPLE, _BB_HUMAN])
+    with _UseStore(store):
+        result = _run_bb(_bb_payload(url, 3), fake, merged=True)
+        assert result["outcome"] == "merged_with_edits", result
+        assert result["learned_edits"]["rules_learned"] >= 2, result
+        assert _fax_fix()[1].startswith("[learned]")
+
+
+def test_a_bitbucket_pr_with_more_than_a_page_of_commits_is_contaminated():
+    store = _store()
+    url = "https://bitbucket.org/acme/billing/pull-requests/4"
+    _record(url, "template")
+    fake = _FakeBitbucket({("src/client.ts", "MB"): CLIENT,
+                           ("src/client.ts", "HEAD"): CLIENT_REVIEWED},
+                          [_BB_RIPPLE, _BB_HUMAN], paged=True)
+    with _UseStore(store):
+        result = _run_bb(_bb_payload(url, 4), fake, merged=True)
+    assert result["contaminated"] and store.stats()["rules"] == 0, result
+
+
+def test_a_bitbucket_commit_amended_by_a_human_keeps_the_count_but_is_an_edit():
+    url = "https://bitbucket.org/acme/billing/pull-requests/7"
+    _record(url, "template")
+    fake = _FakeBitbucket({}, [_BB_HUMAN])
+    with _UseStore(_store()):
+        result = _run_bb(_bb_payload(url, 7), fake, merged=True)
+    assert result["outcome"] == "merged_with_edits", result
+
+
+def test_a_bitbucket_pr_by_the_token_user_alone_is_a_clean_merge():
+    url = "https://bitbucket.org/acme/billing/pull-requests/8"
+    _record(url, "template")
+    fake = _FakeBitbucket({}, [_BB_RIPPLE])
+    with _UseStore(_store()):
+        result = _run_bb(_bb_payload(url, 8), fake, merged=True)
+    assert result["outcome"] == "merged_clean", result
+
+
+def test_a_declined_bitbucket_learned_pr_weakens_its_rules():
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    url = "https://bitbucket.org/acme/billing/pull-requests/5"
+    _record(url, "learned")
+    fake = _FakeBitbucket({("src/client.ts", "MB"): CLIENT}, [_BB_RIPPLE])
+    with _UseStore(store):
+        result = _run_bb(_bb_payload(url, 5), fake, merged=False)
+        assert result["outcome"] == "rejected", result
+        assert result["learned_edits"]["rules_weakened"] >= 2, result
+        assert not _fax_fix()[1].startswith("[learned]")
+
+
+def test_an_unreadable_bitbucket_file_weakens_nothing():
+    store = _store()
+    _learn_client(store, source="pr-taught")
+    url = "https://bitbucket.org/acme/billing/pull-requests/6"
+    _record(url, "learned")
+    fake = _FakeBitbucket({}, [_BB_RIPPLE])               # base unreadable
+    with _UseStore(store):
+        result = _run_bb(_bb_payload(url, 6), fake, merged=False)
+        assert result["learned_edits"]["rules_weakened"] == 0, result
+        assert result["learned_edits"]["skipped_files"], result
+        assert _fax_fix()[1].startswith("[learned]")
+
+
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _runner import run
