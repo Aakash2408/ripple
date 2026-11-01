@@ -258,6 +258,25 @@ def _apply_cluster_fix(
     return fixed if fixed else consumer_code
 
 
+def _unverified_removal_dropped(fixed: str, original: str, change_type: str,
+                                field_name: str, language: str) -> str:
+    """The original back when `fixed` is a field removal nothing verified.
+
+    Every RAG path ends in apply_fix_template, so it carried the same unchecked
+    Go removal that turned `var s traceql.Static` into `var s traceql._, r :=
+    range rs {` on a real repo. The caller treats "unchanged" as "try the next
+    layer", which is _generate_with_template: the one place that decides
+    between a verified edit and markers.
+    """
+    from app.change_types import canonical_op
+    from app.fix_generator import _removal_is_verified
+    if (fixed and fixed != original and canonical_op(change_type) == "remove_field"
+            and not _removal_is_verified(original, fixed, field_name,
+                                         (language or "").lower())):
+        return original
+    return fixed
+
+
 def generate_fix_rag(
     change_type: str = "",
     language: str = "",
@@ -298,7 +317,9 @@ def generate_fix_rag(
                                       store=active_store)
     if rag_result:
         pattern, confidence = rag_result
-        fixed = _apply_pattern_fix(pattern, consumer_code, field_name)
+        fixed = _unverified_removal_dropped(
+            _apply_pattern_fix(pattern, consumer_code, field_name),
+            consumer_code, change_type, field_name, language)
         explanation = generate_explanation(pattern)
         return RagFixResult(
             fixed_code=fixed,
@@ -312,7 +333,9 @@ def generate_fix_rag(
     cluster_result = retrieve_cluster_archetype(change_type, language, store=active_store)
     if cluster_result:
         cluster, confidence = cluster_result
-        fixed = _apply_cluster_fix(cluster, consumer_code, field_name, language)
+        fixed = _unverified_removal_dropped(
+            _apply_cluster_fix(cluster, consumer_code, field_name, language),
+            consumer_code, change_type, field_name, language)
         explanation = (
             f"No exact match found. Using cluster archetype for "
             f"{change_type} in {language} "
@@ -336,6 +359,8 @@ def generate_fix_rag(
         change_type,
         field_name,
     )
+    fixed = _unverified_removal_dropped(fixed, consumer_code, change_type,
+                                        field_name, language)
     if fixed and fixed != consumer_code:
         return RagFixResult(
             fixed_code=fixed,

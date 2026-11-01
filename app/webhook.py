@@ -4292,7 +4292,13 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     
     # Fallback to template engine
     fixed_code, explanation = _generate_with_template(content, consumer, change)
-    if fixed_code != content:
+    # A marker-only result means the template could not make a verified edit.
+    # It is kept as the answer of last resort, AFTER the model gets its turn:
+    # returning it here would make every refused shape skip the LLM.
+    from .fix_generator import _is_marker_only
+    marked = (fixed_code, f"[template] {explanation}") \
+        if _is_marker_only(content, fixed_code) else None
+    if fixed_code != content and marked is None:
         # NOTE: deliberately NOT logged here. The caller logs fix_generated
         # with repo + changed context; logging in both places double-counted
         # every fix (handler.go x2, UserClient.ts x2, ...) and inflated the
@@ -4327,6 +4333,8 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
     # LLM fix can at most earn REVIEW on a platform with no validator.
     from .llm_config import is_configured as _llm_ready, refusal_reason as _llm_why
     if not _llm_ready():
+        if marked:
+            return marked
         # STATED, NOT SILENT. This returned ("", i.e. content unchanged with an EMPTY
         # explanation), and the caller then recorded the fixed literal string "no
         # change generated" -- so a target was skipped with no record of WHY, and
@@ -4347,13 +4355,17 @@ def _generate_fix_with_rag_fallback(content: str, consumer, change, org: str = "
         _log_activity("llm_unavailable", {
             "file": getattr(consumer, "file_path", ""),
             "err": f"{type(exc).__name__}: {str(exc)[:160]}",
-            "falling_back_to": "no fix",
+            "falling_back_to": "markers" if marked else "no fix",
         })
+        if marked:
+            return marked
         return content, (
             f"no fix: the deterministic templates produced no change and the model "
             f"call raised {type(exc).__name__}: {str(exc)[:120]}")
     if fix and fix.fixed_code and fix.fixed_code != content:
         return fix.fixed_code, f"[llm] {fix.explanation}"
+    if marked:
+        return marked
     return content, (
         f"no fix: neither the deterministic templates nor the model changed the "
         f"code for {change.change_type} on {getattr(consumer, 'language', '?')}")
@@ -4667,7 +4679,7 @@ def _find_consumer_repos(source_repo: str, token: str,
 #: GraphQL selection, passed argument) rather than as an identifier, so code
 #: search is given their plain search term and the match uses the vector.
 _PRECISE_VECTORS = ("endpoint", "argument", "channel", "table",
-                    "graphql_operation")
+                    "graphql_operation", "scoped_field")
 
 
 def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,

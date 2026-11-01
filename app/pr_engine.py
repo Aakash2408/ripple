@@ -91,7 +91,8 @@ def create_pr(
     body = _format_pr_body(fix, breaking_change, source_repo)
     
     if dry_run:
-        print(f"  📋 [DRY RUN] Would create PR in {repo}:")
+        where = repo or "(unknown repo -- the path maps to no GitHub repository)"
+        print(f"  📋 [DRY RUN] Would create PR in {where}:")
         print(f"     Branch: {branch_name}")
         print(f"     Title:  {title}")
         print(f"     File:   {fix.consumer.file_path}")

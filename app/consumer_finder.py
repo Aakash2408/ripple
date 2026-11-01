@@ -31,10 +31,41 @@ class ConsumerMatch:
     language: str         # detected language
 
 
+def load_sources(search_dirs: list[str], exclude_patterns: list[str] = None) -> list:
+    """[(path, content, language)] for every scannable file under search_dirs.
+
+    is_scannable() is the canonical decision, shared with the webhook: it also
+    rejects vendored and generated files, which the old extension-only check
+    did not.
+    """
+    from app.languages import detect as _detect, is_scannable
+    if exclude_patterns is None:
+        exclude_patterns = [
+            "node_modules", ".git", "dist", "build", "__pycache__",
+            "vendor", ".venv", "target", ".gradle",
+        ]
+    out = []
+    for search_dir in search_dirs:
+        for root, dirs, files in os.walk(search_dir):
+            dirs[:] = sorted(d for d in dirs if d not in exclude_patterns)
+            for filename in sorted(files):
+                filepath = os.path.join(root, filename)
+                if not is_scannable(filepath):
+                    continue
+                try:
+                    with open(filepath, "r", errors="ignore") as fh:
+                        content = fh.read()
+                except (IOError, OSError):
+                    continue
+                out.append((filepath, content, _detect(filepath)))
+    return out
+
+
 def find_consumers(
     search_dirs: list[str],
     breaking_change: BreakingChange,
     exclude_patterns: list[str] = None,
+    sources: list = None,
 ) -> list[ConsumerMatch]:
     """Find files that consume the thing a breaking change affected.
 
@@ -55,14 +86,13 @@ def find_consumers(
     walks a GitHub tree instead of a filesystem -- different traversal, same
     matching.
     """
-    from app.languages import detect as _detect, is_scannable
     from app.smart_consumer_finder import find_matches_in_file, consumer_query
 
-    if exclude_patterns is None:
-        exclude_patterns = [
-            "node_modules", ".git", "dist", "build", "__pycache__",
-            "vendor", ".venv", "target", ".gradle",
-        ]
+    # One read of the tree per RUN, not per change: `sources` is what
+    # load_sources returned. Re-walking per change took 10m50s for 53 changes
+    # on saleor-dashboard and timed out at 30 minutes for 67.
+    if sources is None:
+        sources = load_sources(search_dirs, exclude_patterns)
 
     # What production searches for, derived FROM the change by the same
     # function the webhook uses. For a newly required field that is the
@@ -70,36 +100,20 @@ def find_consumers(
     target, vector = consumer_query(breaking_change)
 
     matches: list[ConsumerMatch] = []
-
-    for search_dir in search_dirs:
-        for root, dirs, files in os.walk(search_dir):
-            dirs[:] = [d for d in dirs if d not in exclude_patterns]
-            for filename in files:
-                filepath = os.path.join(root, filename)
-                # is_scannable() is the canonical decision, shared with the
-                # webhook: it also rejects vendored and generated files, which
-                # the old extension-only check did not.
-                if not is_scannable(filepath):
-                    continue
-                try:
-                    with open(filepath, "r", errors="ignore") as fh:
-                        content = fh.read()
-                except (IOError, OSError):
-                    continue
-                language = _detect(filepath)
-                for m in find_matches_in_file(content, filepath, target,
-                                              language, vector=vector):
-                    matches.append(ConsumerMatch(
-                        file_path=m.file_path,
-                        line_number=m.line_number,
-                        code_snippet=m.line_content.strip(),
-                        # SmartMatch scores 0.0-1.0; ConsumerMatch is a band.
-                        confidence=("high" if m.confidence >= 0.85
-                                    else "medium" if m.confidence >= 0.6
-                                    else "low"),
-                        match_reason=m.match_type,
-                        language=language,
-                    ))
+    for filepath, content, language in sources:
+        for m in find_matches_in_file(content, filepath, target,
+                                      language, vector=vector):
+            matches.append(ConsumerMatch(
+                file_path=m.file_path,
+                line_number=m.line_number,
+                code_snippet=m.line_content.strip(),
+                # SmartMatch scores 0.0-1.0; ConsumerMatch is a band.
+                confidence=("high" if m.confidence >= 0.85
+                            else "medium" if m.confidence >= 0.6
+                            else "low"),
+                match_reason=m.match_type,
+                language=language,
+            ))
 
     confidence_order = {"high": 0, "medium": 1, "low": 2}
     matches.sort(key=lambda m: confidence_order.get(m.confidence, 3))

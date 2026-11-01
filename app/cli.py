@@ -15,6 +15,12 @@ from pathlib import Path
 
 
 def main():
+    # Line-buffered, so a run that is killed (a CI timeout) still shows how
+    # far it got. Block buffering lost the whole summary on a 30-minute run.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     if len(sys.argv) < 2:
         _print_usage()
         sys.exit(1)
@@ -130,10 +136,10 @@ def cmd_run():
         print("Usage: ripple run <old-spec> <new-spec> --repos <dir1> <dir2> ...")
         sys.exit(1)
     
-    from .consumer_finder import find_consumers, format_consumers
-    from .fix_generator import generate_fixes, format_fixes
+    from .consumer_finder import find_consumers, format_consumers, load_sources
+    from .fix_generator import generate_combined_fixes, format_fixes
     from .pr_engine import create_prs, format_prs
-    
+
     old_path = sys.argv[2]
     new_path = sys.argv[3]
     
@@ -168,21 +174,22 @@ def cmd_run():
     print("━" * 60)
     print()
     
-    all_fixes = []
-    
+    sources = load_sources(repos)
+    per_change = []
     for change in result.breaking_changes:
-        matches = find_consumers(repos, change)
+        matches = find_consumers(repos, change, sources=sources)
         print(format_consumers(matches))
-        
-        # Step 3: Generate fixes
-        print("━" * 60)
-        print("  🔧 GENERATING FIXES...")
-        print("━" * 60)
-        print()
-        
-        fixes = generate_fixes(matches, change, use_llm=use_llm)
-        print(format_fixes(fixes))
-        all_fixes.extend(fixes)
+        per_change.append((change, matches))
+
+    # Step 3: Generate fixes -- one per file, all changes folded in.
+    print("━" * 60)
+    print("  🔧 GENERATING FIXES...")
+    print("━" * 60)
+    print()
+    all_fixes = generate_combined_fixes(
+        per_change, use_llm=use_llm, sources={p: c for p, c, _l in sources})
+    print(format_fixes(all_fixes))
+    consumer_files = {m.file_path for _c, ms in per_change for m in ms}
     
     # Summary
     print("━" * 60)
@@ -213,7 +220,7 @@ def cmd_run():
     print("━" * 60)
     print(f"  RIPPLE COMPLETE")
     print(f"     Breaking changes:  {len(result.breaking_changes)}")
-    print(f"     Consumers found:   {sum(1 for _ in all_fixes)}")
+    print(f"     Consumer files:    {len(consumer_files)}")
     print(f"     Fixes generated:   {len(all_fixes)}")
     if fork_run is not None:
         print(f"     Fork PRs:          {fork_run.summary()}")

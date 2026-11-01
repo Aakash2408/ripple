@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .schema_parse import strip_comments, extract_blocks, _find_matching_brace
+from .schema_parse import extract_blocks, _find_matching_brace
 
 from .diff_engine import BreakingChange
 
@@ -49,6 +49,47 @@ class GraphQLType:
     union_members: list[str]  # for unions
 
 
+def _blank_strings_and_comments(content: str) -> str:
+    """`content` with every description, string and `#` comment replaced by
+    spaces (newlines kept, so offsets and line structure survive).
+
+    Descriptions were parsed as schema. On saleor's real schema, diffing the
+    file against ITSELF reported two breaking changes: the field pattern read
+    `Note: this API...` inside a `\"\"\"` block as a field called `Note`, and
+    `{rate: null}` in an argument's description as an argument `rate`. A `#`
+    inside a string is not a comment, and a quote inside a comment is not a
+    string, so the three are recognised in one left-to-right pass.
+    """
+    out, i, n = [], 0, len(content)
+
+    def blank(text: str) -> str:
+        return re.sub(r'[^\n]', ' ', text)
+
+    while i < n:
+        if content.startswith('"""', i):
+            j = i + 3
+            while j < n and not (content.startswith('"""', j)
+                                 and content[j - 1] != '\\'):
+                j += 1
+            j = min(n, j + 3)
+        elif content[i] == '"':
+            j = i + 1
+            while j < n and content[j] not in '"\n':
+                j += 2 if content[j] == '\\' else 1
+            j = min(n, j + 1)
+        elif content[i] == '#':
+            j = content.find('\n', i)
+            j = n if j == -1 else j
+        else:
+            j = i + 1
+            out.append(content[i])
+            i = j
+            continue
+        out.append(blank(content[i:j]))
+        i = j
+    return ''.join(out)
+
+
 def parse_graphql(content: str) -> dict[str, GraphQLType]:
     """Parse a .graphql schema file into type definitions.
 
@@ -58,9 +99,7 @@ def parse_graphql(content: str) -> dict[str, GraphQLType]:
     every field after it. Comments were also parsed as live fields, so
     deleting a `# commented: String` line looked like a breaking change.
     """
-    # GraphQL uses '#' line comments; '"""' descriptions are left alone
-    # because they cannot contain a bare '}' that would unbalance a block.
-    clean = strip_comments(content, hash_comments=True)
+    clean = _blank_strings_and_comments(content)
 
     types = {}
 
@@ -106,9 +145,12 @@ def parse_graphql(content: str) -> dict[str, GraphQLType]:
                 enum_values=[], union_members=[],
             )
 
-    # Parse enums
+    # Parse enums. A value is its NAME: `DIGITAL @deprecated(reason: "x")` is
+    # still DIGITAL. Read per line it became a different value, so deprecating
+    # one was reported as removing it.
     for name, body in extract_blocks(clean, "enum"):
-        values = [v.strip() for v in body.strip().split('\n') if v.strip()]
+        body = re.sub(r'@\w+(?:\s*\([^)]*\))?', ' ', body)
+        values = re.findall(r'[_A-Za-z]\w*', body)
         types[name] = GraphQLType(
             name=name, kind="enum", fields={},
             enum_values=values, union_members=[],
@@ -175,7 +217,7 @@ def _root_types(content: str) -> set:
     """Names of the operation root types: a `schema { query: X ... }` block's
     entries when one is declared, else the default Query/Mutation/Subscription
     (which GraphQL uses only when no schema block exists)."""
-    clean = strip_comments(content, hash_comments=True)
+    clean = _blank_strings_and_comments(content)
     m = re.search(r'\bschema\s*(?:@\w+(?:\([^)]*\))?\s*)*\{', clean)
     if m:
         end = _find_matching_brace(clean, m.end())

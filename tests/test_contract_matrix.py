@@ -261,7 +261,13 @@ def test_template_fix_routes_every_dialect_by_operation():
                             field_name="email", field_type="string",
                             location="", severity="breaking", description="")
         fixed, why = _generate_with_template(_TS, _consumer(), bc)
-        assert fixed != _TS and "email" not in fixed, (ct, why, fixed)
+        # Routed to the remove-field handler. The template refuses
+        # `u.email` in an arrow body, so the answer is markers on both
+        # references -- never the old line fallback, which deleted the whole
+        # `export const show` line to make "email" disappear.
+        assert "Unsupported" not in why, (ct, why)
+        assert fixed.count("RIPPLE-ACTION-REQUIRED") == 2, (ct, why, fixed)
+        assert "export const show = (u: User) => u.email;" in fixed, fixed
 
 
 def test_one_fix_per_file():

@@ -481,11 +481,26 @@ TRIAGE: dict[tuple, tuple] = {
         "UnicodeDecodeError on a binary blob skips that file. is_scannable() "
         "already excludes most, and a binary file is not a consumer."),
 
-    ("consumer_finder.py", "find_consumers", "swallowed_except",
+    ("consumer_finder.py", "load_sources", "swallowed_except",
      "(IOError, OSError)", 0): (
         LEGITIMATE,
         "An unreadable file during the directory walk is skipped. Same rationale "
-        "as the webhook's tree scan."),
+        "as the webhook's tree scan. (The walk moved here from find_consumers so "
+        "a run reads the tree once instead of once per breaking change.)"),
+    ("fix_generator.py", "generate_combined_fixes", "swallowed_except",
+     "IOError", 0): (
+        LEGITIMATE,
+        "A consumer file that vanished or became unreadable between the walk and "
+        "fix generation gets no fix. The CLI passes the walk's contents in "
+        "`sources`, so this read is only reached by a caller that did not; the "
+        "consumer is still listed in the run's consumer report, so it is not "
+        "hidden -- only left unfixed, which is the safe direction."),
+    ("cli.py", "main", "swallowed_except", "(AttributeError, ValueError)", 0): (
+        LEGITIMATE,
+        "sys.stdout.reconfigure is absent on a replaced stdout (a test harness's "
+        "StringIO) or refused on a closed one. Line buffering only preserves "
+        "partial output when a run is killed; without it the run is otherwise "
+        "identical."),
 
     ("token_store.py", "_find_store_dir", "swallowed_except",
      "(IOError, OSError)", 0): (

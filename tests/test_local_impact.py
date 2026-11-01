@@ -236,6 +236,23 @@ def test_contract_removed_field_finds_local_consumer():
         shutil.rmtree(d)
 
 
+def test_contract_one_word_field_is_scoped_to_its_owner():
+    proto1 = 'syntax = "proto3";\nmessage User {\n  string id = 1;\n  string status = 2;\n}\n'
+    proto2 = 'syntax = "proto3";\nmessage User {\n  string id = 1;\n}\n'
+    d = _repo({"api/user.proto": proto1,
+               "web/user.ts": "export const s = (u: User) => u.status;\n",
+               "web/job.ts": "export const s = (j: Job) => j.status;\n"})
+    try:
+        _write(d, {"api/user.proto": proto2})
+        r = local_impact.analyse(d, "main")
+        removed = [c for c in r.contract_changes if c.field_name == "status"]
+        assert removed, (r.contract_changes, r.contract_errors)
+        assert {c["path"] for c in removed[0].consumers} == {"web/user.ts"}, (
+            removed[0].consumers)
+    finally:
+        shutil.rmtree(d)
+
+
 def test_contract_engine_failure_is_reported_not_swallowed():
     d = _repo({"openapi.yaml": "openapi: 3.0.0\npaths: {}\n"})
     try:

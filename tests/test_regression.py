@@ -504,6 +504,10 @@ def test_tree_scan_respects_call_budget():
         # now derives the propagation vector from it. A stub missing it was
         # silently diverging from the real shape.
         change_type = "field_removed"
+        # ...and method, which names the owning type consumer_query scopes a
+        # one-word field by.
+        method = "User"
+        path = "user.proto"
 
     result = wh._scan_repo_tree_for_consumers(
         "Aakash2408/user-proto", _Change(), "invalid", "", budget
@@ -818,13 +822,23 @@ def test_generate_fix_rag_accepts_the_webhook_call_shape():
     (change_type, language, field_name, consumer_code, repo) -- a TypeError
     on the first real invocation even once the module existed."""
     from app.rag_retriever import generate_fix_rag
-    go = "type R struct {\n\tName string\n\tPhoneNumber string\n}"
+    # TypeScript, not Go: an unverified removal (Go has no scanner) is now
+    # dropped by every RAG path and left to _generate_with_template's markers,
+    # so a Go input no longer exercises "a fix was produced". The call SHAPE is
+    # what this pins, and a verifiable language keeps that meaningful.
+    ts = "export interface R {\n  name: string;\n  phoneNumber: string;\n}\n"
     result = generate_fix_rag(
+        code=ts, file_path="handler.ts", field_name="phone_number",
+        change_type="field_removed", change_description="removed phone_number",
+    )
+    assert result.fixed_code != ts, "no fix produced"
+    assert "phoneNumber" not in result.fixed_code
+    go = "type R struct {\n\tName string\n\tPhoneNumber string\n}"
+    unverified = generate_fix_rag(
         code=go, file_path="handler.go", field_name="phone_number",
         change_type="field_removed", change_description="removed phone_number",
     )
-    assert result.fixed_code != go, "no fix produced"
-    assert "PhoneNumber" not in result.fixed_code
+    assert unverified.fixed_code == go, "an unverified Go removal shipped from RAG"
 
 
 def test_rag_exact_match_used_when_a_pattern_exists():

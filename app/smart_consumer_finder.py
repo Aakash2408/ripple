@@ -699,11 +699,63 @@ def consumer_query(change) -> tuple[str, str]:
         q = removed_operation_query(change)
         if q[0]:
             return q
+    if op in _FIELD_OPS:
+        owner = field_owner(change)
+        field = (change.field_name or "").strip()
+        if owner and field and not is_distinctive_name(field):
+            return f"{owner}.{field}", "scoped_field"
     try:
         vector = vector_for(change.change_type)
     except Exception:                                           # noqa: BLE001
         vector = "symbol"
     return (change.field_name or change.path), vector
+
+
+#: Operations whose consumers name the FIELD itself.
+_FIELD_OPS = ("remove_field", "rename_field", "change_field_type")
+
+
+def field_owner(change) -> str:
+    """The type a changed field belongs to (`AppExtension`, `TimeSeries`, the
+    SQL table), or "" when the change does not name one -- an OpenAPI change
+    carries an HTTP verb, an AsyncAPI one a channel, a JSON Schema one `root`.
+    """
+    m = (change.method or "").strip()
+    if (not m or m.lower() in _HTTP_VERBS + ("root",)
+            or not re.fullmatch(r"[A-Za-z_]\w*", m)):
+        return ""
+    return m
+
+
+def is_distinctive_name(name: str) -> bool:
+    """A field name made of two or more words (`prom_labels`, `searchData`,
+    `deviceAssetId`) is specific enough to search for on its own. A one-word
+    name (`target`, `status`, `password`, `static`, `type`) is not: on 12 real
+    commits each matched unrelated code -- DOM `e.target`, local `status:`
+    keys, a login DTO's `password`, `credentials.Static{` -- which the fixer
+    then deleted."""
+    words = re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", name.strip("_$"))
+    return len(words) >= 2
+
+
+def owner_referenced(content: str, owner: str) -> bool:
+    """Does this file name the owning type at all? Generated and derived names
+    count (`AppExtensionFragment`, `appExtension`, `app_extension`), and a
+    plural SQL table matches its singular model (`users` -> `User`)."""
+    from .fix_templates import to_camel, to_pascal, to_snake
+    names = {owner}
+    if owner.endswith("s") and len(owner) > 3:
+        names.add(owner[:-1])
+    variants = set()
+    for n in names:
+        variants |= {to_pascal(n), to_camel(n), to_snake(n)}
+    for v in filter(None, variants):
+        # PascalCase may follow a lowercase prefix (`publicAppExtension`);
+        # camel and snake forms must start an identifier.
+        left = r"" if v[:1].isupper() else r"(?<![A-Za-z0-9])"
+        if re.search(left + re.escape(v), content):
+            return True
+    return False
 
 
 def removed_operation_query(change) -> tuple[str, str]:
@@ -743,6 +795,8 @@ def search_terms_for(target: str, vector: str) -> list[str]:
     if vector == "channel":
         return [target.split("{", 1)[0].rstrip("/.") or target]
     if vector == "graphql_operation":
+        return [target.rpartition(".")[2]]
+    if vector == "scoped_field":
         return [target.rpartition(".")[2]]
     return [target]
 
@@ -880,6 +934,16 @@ def find_matches_in_file(
         return find_argument_consumers(
             file_content, file_path, target, language, min_confidence
         )
+    if vector == "scoped_field":
+        owner, _, field = target.rpartition(".")
+        # A .graphql operation document exists only to query the API, and its
+        # selections rarely spell the type (`me { email }` selects User.email
+        # without naming User), so the owner gate would drop exactly the
+        # consumers that break. Everywhere else the owner must appear.
+        if language != "graphql" and not owner_referenced(file_content, owner):
+            return []
+        return find_field_consumers(file_content, file_path, field, language,
+                                    min_confidence)
     if vector in ("channel", "table", "graphql_operation"):
         from .operation_sites import operation_sites
         src = file_content.split("\n")

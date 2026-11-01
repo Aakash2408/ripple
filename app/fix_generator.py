@@ -144,11 +144,12 @@ def generate_fix(
     # a real absence should raise.
     field = breaking_change.field_name or ""
     lang = (consumer.language or "").lower()
-    if (field and lang in _SCANNED
+    # A marker-only result changes no code -- it inserts comments the removal
+    # contract (which forbids insertions) would reject. It is checked by
+    # _is_marker_only instead: the original must survive line for line.
+    if (field and lang in _SCANNED and not _is_marker_only(original_code, fixed_code)
             and _canonical_op(breaking_change.change_type or "") == "remove_field"):
-        from .diff_contract import check as _diff_check
-
-        verdict = _diff_check(original_code, fixed_code, field, language=lang)
+        verdict = _diff_check_any_spelling(original_code, fixed_code, field, lang)
         if not verdict.ok:
             # Refuse the whole patch. Returning None is what the caller already
             # treats as "no fix", and it is the same decision the template path
@@ -196,6 +197,60 @@ def generate_fixes(
             seen_files.add(consumer.file_path)
             fixes.append(fix)
     
+    return fixes
+
+
+def generate_combined_fixes(
+    per_change: list,
+    use_llm: bool = True,
+    high_confidence_only: bool = True,
+    sources: dict = None,
+) -> list[GeneratedFix]:
+    """ONE fix per consumer file, folding in every breaking change that hits it.
+
+    `per_change` is [(breaking_change, consumer_matches)]. Each change is applied
+    to the file's CURRENT content, after the previous changes, through
+    generate_fix -- so every step still passes its own diff contract.
+
+    It was one fix per (change x file), each computed from the ORIGINAL file:
+    1,228 code-deleting fixes on one saleor commit, 58 overlapping PRs over 7
+    files on immich, each of which would conflict with the others on merge.
+    """
+    order, by_file = [], {}
+    for change, matches in per_change:
+        for m in matches:
+            if high_confidence_only and m.confidence != "high":
+                continue
+            if m.file_path not in by_file:
+                by_file[m.file_path] = []
+                order.append(m.file_path)
+            if not any(c is change for c, _ in by_file[m.file_path]):
+                by_file[m.file_path].append((change, m))
+
+    fixes = []
+    for path in order:
+        if sources and path in sources:
+            original = sources[path]
+        else:
+            try:
+                with open(path, "r") as fh:
+                    original = fh.read()
+            except IOError:
+                continue
+        current, notes, consumer = original, [], None
+        for change, match in by_file[path]:
+            consumer = consumer or match
+            fix = generate_fix(match, change, use_llm=use_llm,
+                               original_code=current)
+            if fix:
+                current = fix.fixed_code
+                notes.append(f"[{change.change_type} {change.field_name}] "
+                             f"{fix.explanation}")
+        if current != original:
+            fixes.append(GeneratedFix(
+                consumer=consumer, original_code=original, fixed_code=current,
+                explanation="\n".join(notes),
+                diff=_compute_diff(original, current, path)))
     return fixes
 
 
@@ -544,16 +599,26 @@ def _generate_with_template(
     if op == "remove_field":
         # Use the comprehensive template engine
         from .fix_templates import apply_fix_template
+        lang = (consumer.language or "unknown").lower()
         fixed, explanation = apply_fix_template(
             code=original_code,
-            language=consumer.language or "unknown",
+            language=lang,
             change_type="field_removed",
             field_name=field_name,
         )
-        if fixed != original_code:
+        if fixed != original_code and _removal_is_verified(
+                original_code, fixed, field_name, lang):
             return fixed, explanation
-        # Fallback to basic line removal
-        return _remove_field_references(original_code, field_name, consumer.language)
+        # A removal nothing can verify is not shipped as an edit. Measured on
+        # 12 real commits: the Go template turned `var s traceql.Static` +
+        # `for _, r := range rs {` into `var s traceql._, r := range rs {`,
+        # and the line-deleting fallback removed whole DOM handlers that named
+        # an unrelated `target`. Both reached a PR because neither Go nor the
+        # fallback has a checker. Mark the references instead: the reviewer
+        # gets the exact lines, and nothing is deleted on a guess.
+        why = ("template removal could not be verified for this language"
+               if fixed != original_code else "no removable shape matched")
+        return _mark_field_references(original_code, field_name, lang, why)
     
     if op == "rename_field":
         from .fix_templates import apply_fix_template, annotate_references
@@ -677,6 +742,84 @@ def _generate_with_template(
         site_hints=_call_site_hints(breaking_change, original_code,
                                     consumer.language or "unknown"),
     )
+
+
+def _is_marker_only(original: str, fixed: str) -> bool:
+    """True when `fixed` is `original` plus RIPPLE-ACTION-REQUIRED comment
+    lines and nothing else."""
+    from .fix_templates import MARKER
+    kept = [ln for ln in fixed.split("\n")
+            if not (MARKER in ln and ln.lstrip()[:2] in ("//", "# ", "--"))]
+    return kept == original.split("\n") and fixed != original
+
+
+def _diff_check_any_spelling(original: str, fixed: str, field_name: str, language: str):
+    """The diff contract's verdict, judged in the consumer's own SPELLING.
+
+    The contract matches the field literally, and a spec names it in its own
+    convention: proto `phone_number`, read in TypeScript as `phoneNumber`. Fed
+    the spec spelling, every correct cross-convention removal was rejected as
+    "deleted a line that does not reference 'phone_number'". Each case variant
+    that occurs in the file is tried; the removal is accepted if one of them
+    accounts for every change. A file mixing two spellings is refused -- the
+    conservative direction.
+    """
+    from .diff_contract import check
+    from .fix_templates import name_variants
+    first = None
+    for v in dict.fromkeys(name_variants(field_name).values()):
+        if not v or not re.search(rf"\b{re.escape(v)}\b", original):
+            continue
+        verdict = check(original, fixed, v, language=language)
+        if verdict.ok:
+            return verdict
+        first = first or verdict
+    return first or check(original, fixed, field_name, language=language)
+
+
+def _removal_is_verified(original: str, fixed: str, field_name: str,
+                         language: str) -> bool:
+    """May this template removal ship as an EDIT?
+
+    Only where a real scanner exists (source_regions.SCANNED) and the diff
+    contract accepts it. Checked here, inside _generate_with_template, because
+    the webhook calls that directly and never reaches generate_fix's check.
+    """
+    from .source_regions import SCANNED
+    if language not in SCANNED:
+        return False
+    return _diff_check_any_spelling(original, fixed, field_name, language).ok
+
+
+def _mark_field_references(code: str, field_name: str, language: str,
+                           why: str) -> tuple[str, str]:
+    """Marker-only answer for a removed field: annotate each CODE reference
+    (not strings or comments), delete nothing. Unchanged when there is none --
+    a file with no reference is not a consumer, and a file-top marker would
+    open a PR that says nothing."""
+    from .fix_templates import (MARKER, _STR_LITERAL, _comment_token,
+                                _matches_symbol, _symbol_names, name_variants)
+    names = _symbol_names(name_variants(field_name)) | {field_name}
+    token = _comment_token(language)
+    note = (f"field '{field_name}' was removed from the contract -- remove or "
+            f"replace this reference.")
+    out, sites = [], 0
+    for line in code.split("\n"):
+        s = line.strip()
+        bare = _STR_LITERAL.sub('""', line)
+        if (s and not s.startswith(token) and not s.startswith("*")
+                and not (out and MARKER in out[-1])
+                and _matches_symbol(bare, names)):
+            indent = line[:len(line) - len(line.lstrip())]
+            out.append(f"{indent}{token} {MARKER}: {note}")
+            sites += 1
+        out.append(line)
+    if not sites:
+        return code, f"No change: no code reference to '{field_name}' ({why})."
+    return "\n".join(out), (
+        f"PARTIAL: marked {sites} reference(s) to removed field '{field_name}' "
+        f"with {MARKER}. Ripple did NOT delete them: {why}, so an automated "
+        f"edit could break the file.")
 
 
 def _call_site_hints(breaking_change: BreakingChange, code: str = "",

@@ -154,7 +154,7 @@ def diff_contract(contract_type: str, old: str, new: str, path: str) -> list:
 
 
 def _contract_layer(cs, sources: dict, report: ImpactReport) -> None:
-    from .smart_consumer_finder import find_field_consumers
+    from .smart_consumer_finder import consumer_query, find_matches_in_file
     for fc in cs.files:
         ctype = contract_type_of(fc.path)
         if not ctype:
@@ -180,6 +180,9 @@ def _contract_layer(cs, sources: dict, report: ImpactReport) -> None:
         for bc in changes:
             if bc.severity != "breaking":
                 continue
+            # The same query every other consumer search uses, so a one-word
+            # field is scoped to its owning type here too.
+            target, vector = consumer_query(bc)
             cc = ContractChange(
                 spec_file=fc.path, contract_type=ctype,
                 change_type=bc.change_type, field_name=bc.field_name,
@@ -188,7 +191,8 @@ def _contract_layer(cs, sources: dict, report: ImpactReport) -> None:
                 if path == fc.path:
                     continue
                 lang = languages.detect(path)
-                for m in find_field_consumers(text, path, bc.field_name, lang):
+                for m in find_matches_in_file(text, path, target, lang,
+                                              vector=vector):
                     cc.consumers.append({
                         "path": path, "line": m.line_number,
                         "snippet": m.line_content[:160],
