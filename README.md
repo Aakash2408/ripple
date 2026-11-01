@@ -548,6 +548,10 @@ Output fields made non-null (`String` → `String!`) are safe for readers and ar
 
 For a newly required field, header or argument, consumers are found by what they call -- the endpoint (`POST /users`, matched only when the call uses that HTTP method) or the input type/table they build -- because the field itself is absent from exactly the consumers that break.
 
+A removed operation is found in the shape consumers actually write it: an endpoint as an HTTP call using that verb, an AsyncAPI channel as a quoted literal, a SQL table inside a query string or as an ORM table name, a GraphQL root field as a root selection in an operation of the right kind (`me { orders }` and a REST call to `/orders` do not count). A call is commented out with a marker; anything that only names the operation (a built URL, `__tablename__`, a topic constant, a GraphQL selection) is marked and left running, and nothing is ever inserted inside a query string.
+
+Client `.graphql`/`.gql` operation documents (queries, mutations, fragments) are scanned as consumers; schema files never are. A removed field is taken out of each selection set with its alias, arguments and sub-selection, leaving the rest of the line intact.
+
 **Database:**
 - [x] Column removed
 - [x] Column type changed

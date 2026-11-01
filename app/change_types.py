@@ -111,7 +111,6 @@ CHANGE_TYPE_MAP = {
     "type_removed": "remove_type",                 # graphql
     "struct_removed": "remove_type",               # thrift
     "structure_removed": "remove_type",            # smithy
-    "table_removed": "remove_type",                # sql
     "enum_removed": "remove_type",                 # proto
 
     # --- remove an enum value --------------------------------------------
@@ -142,6 +141,12 @@ CHANGE_TYPE_MAP = {
     "channel_removed": "remove_operation",         # asyncapi
     "server_removed": "remove_operation",          # asyncapi
     "service_removed": "remove_operation",         # proto
+    # A dropped TABLE is called, not imported: consumers name it inside SQL
+    # strings and ORM literals, and every query on it fails at runtime. As
+    # remove_type it reached the type-reference deletion template, which
+    # cannot see a string and so produced nothing -- or, on a matching
+    # identifier, deleted code. The queries need a replacement: judgment.
+    "table_removed": "remove_operation",           # sql
 
     # --- newly-required (judgment) ---------------------------------------
     "required_field_added": "add_required",

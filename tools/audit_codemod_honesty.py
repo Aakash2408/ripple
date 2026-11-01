@@ -516,6 +516,20 @@ CASES = {
             "  PENDING = 'PENDING',\n"
             "}\n"),
     },
+    # A client OPERATION document. Only `usage` exists: declarations, typed
+    # declarations, imports and enum definitions live in SCHEMA files, which are
+    # never consumers (smart_consumer_finder._graphql_consumer_ok). `profile` and
+    # `id` are neighbours a line-deleting remover would take with the field.
+    "graphql": {
+        "token": "phoneNumber",
+        "usage": (
+            "query Contact($id: ID!) {\n"
+            "  user(id: $id) {\n"
+            "    id email phoneNumber\n"
+            "    profile { phoneNumber avatar }\n"
+            "  }\n"
+            "}\n"),
+    },
     "yaml": {
         "token": "phone_number",
         "decl": (

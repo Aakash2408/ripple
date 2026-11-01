@@ -4663,6 +4663,13 @@ def _find_consumer_repos(source_repo: str, token: str,
     return repos
 
 
+#: Vectors matched structurally (endpoint path, quoted channel, SQL table,
+#: GraphQL selection, passed argument) rather than as an identifier, so code
+#: search is given their plain search term and the match uses the vector.
+_PRECISE_VECTORS = ("endpoint", "argument", "channel", "table",
+                    "graphql_operation")
+
+
 def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
                                exclude_path: str = "",
                                budget: dict = None) -> list[tuple[str, str, float]]:
@@ -4680,7 +4687,7 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
     target, vector = consumer_query(change)
     # The package vector keeps this path's existing symbol behaviour; the tree
     # fallback below is what routes package deletions.
-    match_vector = vector if vector in ("endpoint", "argument") else "symbol"
+    match_vector = vector if vector in _PRECISE_VECTORS else "symbol"
     field_name = target
     variants = generate_variants(field_name) if match_vector == "symbol" else []
     
@@ -4697,7 +4704,7 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
             continue
         if v not in core_variants:
             core_variants.append(v)
-    if match_vector in ("endpoint", "argument"):
+    if match_vector in _PRECISE_VECTORS:
         core_variants = [f'"{t}"' for t in search_terms_for(target, vector)]
     core_variants = core_variants[:4] or [field_name]
     

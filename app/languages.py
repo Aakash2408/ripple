@@ -71,6 +71,11 @@ EXTENSION_TO_LANGUAGE = {
     ".php": "php",
     ".scala": "scala", ".sc": "scala",
     ".dart": "dart",
+    # Client operation documents (Apollo/Relay `queries/*.graphql`). The same
+    # extension holds SCHEMA files, which are not consumers: every matcher
+    # gates on content (smart_consumer_finder._graphql_consumer_ok), since a
+    # path cannot tell the two apart.
+    ".graphql": "graphql", ".gql": "graphql",
     ".yaml": "yaml", ".yml": "yaml",
     ".sh": "shell", ".bash": "shell", ".zsh": "shell",
 }

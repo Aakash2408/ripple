@@ -363,7 +363,62 @@ def _remove_field_csharp(code: str, variants: dict[str, str]) -> str:
 _LAST_CODEMOD_RESULT: dict = {}
 
 
+def _skip_balanced(code: str, j: int, opener: str, closer: str) -> int:
+    """Index past a balanced `opener ... closer` group starting at j (after
+    optional whitespace), or j unchanged when none starts there."""
+    k = re.match(r'\s*' + re.escape(opener), code[j:])
+    if not k:
+        return j
+    depth, j = 0, j + k.end() - 1
+    while j < len(code):
+        depth += {opener: 1, closer: -1}.get(code[j], 0)
+        j += 1
+        if depth == 0:
+            break
+    return j
+
+
+def _remove_field_graphql(code: str, variants: dict[str, str]) -> str:
+    """Remove a field's SELECTIONS from a GraphQL operation document.
+
+    Which names are selections comes from operation_sites.graphql_selections,
+    the parser the consumer finder admits the file by, so an argument or input
+    name (`email: $email`), a variable, a string, a comment or anything inside
+    parentheses is never touched. Each selection is removed with its alias,
+    arguments, directives and sub-selection -- not its line: `{ id email }`
+    keeps `id`, where the generic line remover deleted both. A line left
+    empty by the removal is dropped.
+    """
+    from .operation_sites import graphql_selections
+    names = {n for n in (variants.get('literal'), variants.get('camel')) if n}
+    spans = []
+    for off, _kind, name, _depth in graphql_selections(code):
+        if name not in names:
+            continue
+        line_start = code.rfind('\n', 0, off) + 1
+        alias = re.search(r'[_A-Za-z]\w*\s*:\s*$', code[line_start:off])
+        start = line_start + alias.start() if alias else off
+        j = _skip_balanced(code, off + len(name), '(', ')')      # arguments
+        while True:                                                 # directives
+            d = re.match(r'\s*@\w+(?:\s*\([^)]*\))?', code[j:])
+            if not d:
+                break
+            j += d.end()
+        j = _skip_balanced(code, j, '{', '}')                     # sub-selection
+        spans.append((start, j))
+    if not spans:
+        return code
+    text = code
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + text[end:]
+    old_lines = set(code.split('\n'))
+    kept = [ln for ln in text.split('\n') if ln.strip() or ln in old_lines]
+    return '\n'.join(ln if ln in old_lines else re.sub(r'(\S)[ \t]{2,}(?=\S)', r'\1 ', ln)
+                     for ln in kept)
+
+
 REMOVE_HANDLERS: dict[str, Callable[[str, dict[str, str]], str]] = {
+    'graphql': _remove_field_graphql,
     'go': _remove_field_go,
     'typescript': _remove_field_typescript,
     'javascript': _remove_field_typescript,
@@ -882,7 +937,7 @@ _LINE_COMMENT = {
     'go': '//', 'typescript': '//', 'javascript': '//', 'java': '//',
     'rust': '//', 'kotlin': '//', 'csharp': '//', 'c#': '//',
     'swift': '//', 'scala': '//', 'dart': '//', 'php': '//',
-    'python': '#', 'ruby': '#', 'shell': '#', 'yaml': '#',
+    'python': '#', 'ruby': '#', 'shell': '#', 'yaml': '#', 'graphql': '#',
 }
 
 MARKER = 'RIPPLE-ACTION-REQUIRED'
@@ -957,35 +1012,84 @@ def _annotate_hint_sites(code: str, hints, lang: str, note: str) -> tuple[str, i
     return '\n'.join(out), count
 
 
-def _comment_out_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:
-    """Comment OUT lines referencing the symbol, with a marker above.
-
-    Used only for remove_operation: the call target no longer exists, so the
-    line cannot compile as written. Commenting it out keeps the original
-    visible in the diff, whereas deleting it would hide that functionality was
-    dropped.
-
-    This does NOT guarantee a compiling file -- commenting out an assignment
-    can leave dependent statements referencing undefined variables. Resolving
-    that is the human decision the marker exists to prompt.
-    """
-    token = _comment_token(lang)
-    out = []
-    count = 0
-    for line in code.split('\n'):
-        stripped = line.strip()
-        is_comment = stripped.startswith(token) or stripped.startswith('*')
-        if not is_comment and stripped and _matches_symbol(line, names):
-            indent = line[:len(line) - len(line.lstrip())]
-            out.append(f"{indent}{token} {MARKER}: {note}")
-            out.append(f"{indent}{token} {stripped}")
-            count += 1
-            continue
-        out.append(line)
-    return '\n'.join(out), count
-
-
 # --- Main entry point ---
+
+_STR_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`')
+
+
+def _mark_operation_sites(code: str, name: str, lang: str, comment_sites=(),
+                          mark_sites=()) -> tuple[str, int, int]:
+    """Comment out `comment_sites` and mark `mark_sites` (0-based lines) for
+    the removed operation `name`. Returns (code, commented, marked).
+
+    Commenting out keeps the original visible in the diff, whereas deleting it
+    would hide that functionality was dropped. It does NOT guarantee a
+    compiling file -- that is the human decision the marker prompts.
+
+    A line INSIDE a multi-line string (a gql`` document, a SQL triple-quoted
+    block) is never edited: a marker or a commented-out line there becomes
+    part of the query and breaks it. The marker goes above the line the
+    string opens on instead, once per string. A .graphql file is only marked.
+    """
+    from .operation_sites import multiline_string_opens
+    opens = multiline_string_opens(code)
+    token = _comment_token(lang)
+    comment_lines, mark_lines = set(), set()
+    for i in comment_sites:
+        if i in opens:
+            mark_lines.add(opens[i])
+        elif lang == "graphql":
+            mark_lines.add(i)
+        else:
+            comment_lines.add(i)
+    for i in mark_sites:
+        mark_lines.add(opens.get(i, i))
+    mark_lines -= comment_lines
+    cut = (f"'{name}' was removed from the contract. This call is commented "
+           f"out -- restore an equivalent or delete deliberately.")
+    keep = (f"'{name}' was removed from the contract -- this call no longer "
+            f"works; replace it or remove it deliberately.")
+    out, commented, marked = [], 0, 0
+    for i, line in enumerate(code.split('\n')):
+        indent = line[:len(line) - len(line.lstrip())]
+        if i in comment_lines:
+            out.append(f"{indent}{token} {MARKER}: {cut}")
+            out.append(f"{indent}{token} {line.strip()}")
+            commented += 1
+            continue
+        if i in mark_lines and not (out and MARKER in out[-1]):
+            out.append(f"{indent}{token} {MARKER}: {keep}")
+            marked += 1
+        out.append(line)
+    return '\n'.join(out), commented, marked
+
+
+def _symbol_operation_sites(code: str, names: set, lang: str) -> tuple[list, list]:
+    """Removed RPC / method: (call lines, other code references), 0-based.
+
+    The old rule commented out every line naming the symbol anywhere,
+    including inside a string (`log("DeleteUser failed")`). Now mentions in
+    string literals and comments are ignored; `name(` is a CALL, to be
+    commented out; any other code reference (a method passed as a value, a
+    map key) is only marked, since commenting it out removes behaviour that
+    may not depend on the operation at all.
+    """
+    from .operation_sites import multiline_string_opens
+    opens = multiline_string_opens(code)
+    token = _comment_token(lang)
+    call_rx = [re.compile(rf'(?<![A-Za-z0-9]){re.escape(n)}\s*\(') for n in names]
+    calls, refs = [], []
+    for i, line in enumerate(code.split('\n')):
+        stripped = line.strip()
+        if (not stripped or stripped.startswith(token) or stripped.startswith('*')
+                or i in opens):
+            continue
+        bare = _STR_LITERAL.sub('""', line)
+        if not _matches_symbol(bare, names):
+            continue
+        (calls if any(rx.search(bare) for rx in call_rx) else refs).append(i)
+    return calls, refs
+
 
 def annotate_references(code: str, language: str, symbol: str,
                         note: str) -> tuple[str, str]:
@@ -1026,6 +1130,8 @@ def apply_fix_template(
     old_type: str = '',
     new_type: str = '',
     site_hints: tuple = (),
+    site_target: str = '',
+    site_vector: str = '',
 ) -> tuple[str, str]:
     """
     Apply a deterministic fix template to source code.
@@ -1042,6 +1148,11 @@ def apply_fix_template(
             name) used ONLY by add_required, whose field is absent from consumer
             code by definition. Without them the fix can only mark the file, not
             the line. Substring-matched, so `"/users"` works.
+        site_target, site_vector: the consumer finder's query
+            (smart_consumer_finder.consumer_query). For a removed endpoint,
+            channel, table or GraphQL root field the call sites are located by
+            app/operation_sites.py from these -- the same lines the finder
+            admitted the file by.
 
     Returns:
         Tuple of (fixed_code, explanation_string).
@@ -1273,12 +1384,25 @@ def apply_fix_template(
         # compile as written. Comment it out rather than delete it: deleting
         # would hide that functionality was dropped, and commenting keeps the
         # original line visible in the diff for whoever decides the fix.
-        note = (f"'{field_name}' was removed from the contract. This call is "
-                f"commented out -- restore an equivalent or delete deliberately.")
-        result, sites = _comment_out_sites(code, _symbol_names(variants), lang, note)
+        from .operation_sites import OPERATION_VECTORS, operation_site_kinds
+        if site_vector in OPERATION_VECTORS:
+            # The consumer finder admitted this file by these exact lines.
+            calls, refs = operation_site_kinds(code, site_target, site_vector,
+                                               lang)
+            if not (calls or refs):
+                return code, (f"No change: this file never calls "
+                              f"'{site_target}', so it is unaffected.")
+        else:
+            calls, refs = _symbol_operation_sites(code, _symbol_names(variants),
+                                                  lang)
+        result, commented, marked = _mark_operation_sites(
+            code, field_name, lang, comment_sites=calls, mark_sites=refs)
+        if commented + marked == 0:
+            return code, f"No change: no reference to '{field_name}' in code."
         explanation = (
             f"PARTIAL: '{field_name}' was removed from the service contract. "
-            f"Commented out {sites} call site(s) and marked each with {MARKER}. "
+            f"Commented out {commented} call site(s) and marked {marked} "
+            f"more with {MARKER}. "
             f"NOTE: this file may still not compile -- commenting out an "
             f"assignment can leave dependent statements referencing undefined "
             f"variables. Removing an operation drops functionality, so the "

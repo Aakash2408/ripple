@@ -641,12 +641,16 @@ def _generate_with_template(
         # wire_incompatible) has its handler in fix_templates, which applies
         # the safe part and marks the rest, or reports a wire-only break.
         from .fix_templates import apply_fix_template
+        from .smart_consumer_finder import consumer_query
+        site_target, site_vector = consumer_query(breaking_change)
         return apply_fix_template(
             code=original_code,
             language=consumer.language or "unknown",
             change_type=breaking_change.change_type,
             field_name=field_name,
             new_name=breaking_change.new_name,
+            site_target=site_target,
+            site_vector=site_vector,
         )
 
     # DELEGATE, like every other change type above. This branch used to carry

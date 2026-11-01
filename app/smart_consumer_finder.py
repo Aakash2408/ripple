@@ -360,6 +360,16 @@ def _classify_csharp(line: str, variant: str) -> tuple[str, float]:
 # Main Search Function
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _graphql_consumer_ok(content: str, language: str) -> bool:
+    """A .graphql file is a consumer only when it holds operations (queries,
+    mutations, fragments). A schema file is the contract itself: matching it
+    would have Ripple "fix" a downstream schema as if it consumed the API."""
+    if language != "graphql":
+        return True
+    from .operation_sites import is_operation_document
+    return is_operation_document(content)
+
+
 def find_field_consumers(
     file_content: str,
     file_path: str,
@@ -387,6 +397,22 @@ def find_field_consumers(
     order used to be randomised per process, so the same file scored 0.95 on
     one run and 0.70 on the next.
     """
+    if not _graphql_consumer_ok(file_content, language):
+        return []
+    if language == "graphql":
+        # An operation document: a name in a selection set IS a use of the
+        # field, so score it as one rather than by the generic patterns,
+        # which could only call a bare `email` line "medium".
+        from .operation_sites import graphql_field_selection_lines
+        from .fix_templates import to_camel
+        names = {field_name, to_camel(field_name)} if field_name else set()
+        src = file_content.split("\n")
+        hits = [SmartMatch(file_path=file_path, line_number=i + 1,
+                           line_content=src[i].strip(),
+                           match_type="graphql_selection", confidence=0.90,
+                           variant_matched=field_name)
+                for i in graphql_field_selection_lines(file_content, names)]
+        return [m for m in hits if m.confidence >= min_confidence]
     variants = generate_variants(field_name)
     matches = []
     
@@ -669,11 +695,35 @@ def consumer_query(change) -> tuple[str, str]:
         gql_op, _arg = graphql_argument(change.field_name)
         if gql_op:
             return change.field_name.strip(), "argument"
+    if op == "remove_operation":
+        q = removed_operation_query(change)
+        if q[0]:
+            return q
     try:
         vector = vector_for(change.change_type)
     except Exception:                                           # noqa: BLE001
         vector = "symbol"
     return (change.field_name or change.path), vector
+
+
+def removed_operation_query(change) -> tuple[str, str]:
+    """(target, vector) for a removed endpoint, channel, table or GraphQL root
+    field -- each named by consumers in a shape a symbol search cannot see
+    (app/operation_sites.py). ("", "") keeps the symbol search, which is right
+    for RPCs: consumers call `client.DeleteUser(...)`."""
+    ct = (change.change_type or "").strip()
+    path = (change.path or "").strip()
+    method = (change.method or "").strip()
+    field = (change.field_name or "").strip()
+    if (change.location or "") == "graphql" and method and field:
+        return f"{method}.{field}", "graphql_operation"
+    if path.startswith("/") and method.lower() in _HTTP_VERBS:
+        return f"{method.upper()} {path}", "endpoint"
+    if ct == "channel_removed" and field:
+        return field, "channel"
+    if ct == "table_removed" and field:
+        return field, "table"
+    return "", ""
 
 
 def search_terms_for(target: str, vector: str) -> list[str]:
@@ -690,6 +740,10 @@ def search_terms_for(target: str, vector: str) -> list[str]:
     if vector == "argument":
         # Code search indexes the field name; the argument is matched after.
         return [graphql_argument(target)[0] or target]
+    if vector == "channel":
+        return [target.split("{", 1)[0].rstrip("/.") or target]
+    if vector == "graphql_operation":
+        return [target.rpartition(".")[2]]
     return [target]
 
 
@@ -812,6 +866,8 @@ def find_matches_in_file(
     query scored 38.5% while the correct package query scores 90.9% on the same
     PR, with no change to the matchers themselves.
     """
+    if not _graphql_consumer_ok(file_content, language):
+        return []
     if vector == "package":
         return find_package_consumers(
             file_content, file_path, target, language, min_confidence
@@ -824,6 +880,15 @@ def find_matches_in_file(
         return find_argument_consumers(
             file_content, file_path, target, language, min_confidence
         )
+    if vector in ("channel", "table", "graphql_operation"):
+        from .operation_sites import operation_sites
+        src = file_content.split("\n")
+        return [SmartMatch(file_path=file_path, line_number=i + 1,
+                           line_content=src[i].strip(),
+                           match_type=f"{vector}_call", confidence=0.90,
+                           variant_matched=target)
+                for i in operation_sites(file_content, target, vector, language)
+                if 0.90 >= min_confidence]
     return find_field_consumers(
         file_content, file_path, target, language, min_confidence
     )
