@@ -1053,27 +1053,50 @@ def _matches_symbol(line: str, names: set) -> bool:
     )
 
 
-def _annotate_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:
-    """Insert a marker comment above each line referencing the symbol.
+def _insert_markers(code: str, matches, lang: str, note: str) -> tuple[str, int]:
+    """Insert `note` as a marker comment above every line `matches(line)`
+    accepts. Returns (annotated_code, sites_annotated).
 
-    Returns (annotated_code, sites_annotated). Skips lines that are already
-    comments, and never annotates the same line twice.
+    Skips comment lines and never marks one line twice. A matching line
+    INSIDE a multi-line string -- a gql`` document, a SQL triple-quoted block,
+    a template literal -- is not marked where it is: a `//` line inserted there
+    becomes part of the string and breaks the query. The marker goes above the
+    line the string opens on instead, once per string. Measured on
+    saleor-dashboard: a type change marked `name` inside two GraphQL
+    documents this way.
     """
+    from .operation_sites import multiline_string_opens
+    opens = multiline_string_opens(code)
     token = _comment_token(lang)
-    out = []
-    count = 0
-    prev_was_marker = False
-    for line in code.split('\n'):
+    src = code.split('\n')
+    targets = set()
+    for i, line in enumerate(src):
         stripped = line.strip()
-        is_comment = stripped.startswith(token) or stripped.startswith('*')
-        if (not is_comment and stripped and _matches_symbol(line, names)
-                and not prev_was_marker):
+        if not stripped or MARKER in line:
+            continue
+        if i not in opens and (stripped.startswith(token)
+                               or stripped.startswith('*')):
+            continue
+        if matches(line):
+            targets.add(opens.get(i, i))
+    out, count = [], 0
+    for i, line in enumerate(src):
+        if i in targets and not (out and MARKER in out[-1]):
             indent = line[:len(line) - len(line.lstrip())]
             out.append(f"{indent}{token} {MARKER}: {note}")
             count += 1
         out.append(line)
-        prev_was_marker = MARKER in line
     return '\n'.join(out), count
+
+
+def _annotate_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:
+    """Insert a marker comment above each line referencing the symbol.
+
+    Returns (annotated_code, sites_annotated). See _insert_markers for the
+    comment and multi-line-string rules.
+    """
+    return _insert_markers(code, lambda ln: _matches_symbol(ln, names), lang,
+                           note)
 
 
 def _annotate_hint_sites(code: str, hints, lang: str, note: str) -> tuple[str, int]:
@@ -1091,23 +1114,10 @@ def _annotate_hint_sites(code: str, hints, lang: str, note: str) -> tuple[str, i
 
     Returns (annotated_code, sites_annotated).
     """
-    token = _comment_token(lang)
-    out = []
-    count = 0
-    prev_was_marker = False
     # Short hints match too much: a 2-char anchor would tag half the file.
     usable = [h for h in hints if h and len(h) >= 3]
-    for line in code.split('\n'):
-        stripped = line.strip()
-        is_comment = stripped.startswith(token) or stripped.startswith('*')
-        if (not is_comment and stripped and not prev_was_marker
-                and any(h in line for h in usable)):
-            indent = line[:len(line) - len(line.lstrip())]
-            out.append(f"{indent}{token} {MARKER}: {note}")
-            count += 1
-        out.append(line)
-        prev_was_marker = MARKER in line
-    return '\n'.join(out), count
+    return _insert_markers(code, lambda ln: any(h in ln for h in usable), lang,
+                           note)
 
 
 # --- Main entry point ---

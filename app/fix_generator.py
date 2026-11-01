@@ -613,6 +613,16 @@ def _generate_with_template(
         # every rename fell through to "Unsupported change type", leaving the
         # code unchanged, which opens no PR. Detection became silence.
         new_name = breaking_change.new_name
+        from .smart_consumer_finder import is_distinctive_name
+        if new_name and not is_distinctive_name(field_name):
+            # Same rule as removal: a one-word field (`name`) cannot be tied to
+            # its owning type per reference, and the rename template rewrote a
+            # function PARAMETER `name` -- and `${name}` inside a query string
+            # -- to the new name. Mark instead.
+            return annotate_references(
+                original_code, consumer.language or "unknown", field_name,
+                f"field '{field_name}' was renamed to '{new_name}' -- update "
+                f"the references that read this field.")
         if new_name:
             fixed, expl = apply_fix_template(
                 code=original_code,

@@ -358,6 +358,48 @@ def test_gql_in_ts_only_for_graphql_changes_and_tagged_templates():
     assert len(embedded_graphql_docs("graphql(`{ a }`); /* GraphQL */ `{ b }`")) == 2
 
 
+# ── 6. markers from every operation stay out of multi-line strings ──────────
+
+def test_type_change_markers_are_hoisted_out_of_query_strings():
+    # saleor 3093be1b7: `name` String! -> String put `//` lines inside a
+    # cypress mutation template and a gql`` introspection query.
+    js = ('export function createApp(name) {\n'
+          '  const mutation = `mutation{\n'
+          '    appCreate(input:{name:"${name}"}){\n'
+          '      app { name id }\n'
+          '    }\n'
+          '  }`;\n'
+          '  return mutation;\n'
+          '}\n')
+    for ct, extra in (("field_type_changed", {}), ("field_renamed",
+                                                    {"new_name": "title"})):
+        bc = _bc("name", change_type=ct, method="App", location="graphql")
+        for k, v in extra.items():
+            setattr(bc, k, v)
+        bc.old_type, bc.new_type = "String!", "String"
+        fixed, why = _template(js, "javascript", bc)
+        lines = fixed.split("\n")
+        assert [ln for ln in lines if MARKER not in ln] == js.split("\n"), fixed
+        # Every marker line is outside the backtick string.
+        from app.operation_sites import multiline_string_opens
+        inside = multiline_string_opens(fixed)
+        assert not any(MARKER in lines[i] for i in inside), (ct, fixed)
+        assert MARKER in fixed, (ct, why)
+
+
+def test_add_required_hint_markers_are_hoisted_too():
+    from app.fix_templates import _annotate_hint_sites
+    py = 'q = """\n  INSERT INTO users (name)\n"""\nrun(q)\n'
+    out, n = _annotate_hint_sites(py, ["INSERT INTO users"], "python", "x")
+    assert n == 1 and out.split("\n")[0].startswith("# " + MARKER), out
+    # A string line that merely LOOKS like a comment (`*, name` in SQL) is
+    # still string content, so it still counts -- hoisted like any other.
+    from app.fix_templates import _annotate_sites
+    sql = 'q = """\nSELECT\n  *, name FROM t\n"""\n'
+    out, n = _annotate_sites(sql, {"name"}, "python", "x")
+    assert n == 1 and out.split("\n")[0].startswith("# " + MARKER), out
+
+
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _runner import run
