@@ -378,6 +378,104 @@ def _skip_balanced(code: str, j: int, opener: str, closer: str) -> int:
     return j
 
 
+#: A tagged GraphQL document inside source: gql`...`, graphql`...`, or a
+#: template marked with the /* GraphQL */ comment convention. An untagged
+#: template is NOT one: `${u.email} ${u.phoneNumber}` is a message, not a query.
+_GQL_TAGGED = re.compile(
+    r'(?:\b(?:gql|graphql)\s*(?:<[^`>]*>\s*)?\(?\s*|/\*\s*GraphQL\s*\*/\s*)`'
+    r'((?:\\.|[^`\\])*)`', re.S)
+
+
+def embedded_graphql_docs(code: str) -> list:
+    """(start, end) of every tagged GraphQL document body in source code."""
+    return [(m.start(1), m.end(1)) for m in _GQL_TAGGED.finditer(code)]
+
+
+def remove_graphql_selections(code: str, field: str, owner: str,
+                              spans=None) -> tuple[str, int, int]:
+    """Remove selections of `owner.field` from GraphQL documents in `code`.
+
+    Returns (code, removed, unproven). A selection is removed only where the
+    document itself PROVES it is made on `owner`: directly inside
+    `fragment X on Owner { ... }` or `... on Owner { ... }`. A selection inside
+    a field's sub-selection (`order { status }`) belongs to whatever type
+    `order` returns, which only the schema knows -- removing it there could
+    delete a same-named field on an unrelated type, the defect that made most
+    of 1,500 real-repo fixes wrong. Those are counted in `unproven` and left
+    for markers.
+
+    The edit is structural and checked: after removal every document must
+    still have exactly its original selections minus the removed ones, and no
+    selection set may be left empty (`order { }` is invalid GraphQL). On any
+    violation the WHOLE input is returned unchanged.
+    """
+    from .operation_sites import graphql_typed_selections
+    if spans is None:
+        spans = [(0, len(code))]
+    cuts, unproven = [], 0
+    for start, end in spans:
+        doc = code[start:end]
+        for off, _kind, name, _depth, ctx in graphql_typed_selections(doc):
+            if name != field:
+                continue
+            if ctx != owner:
+                unproven += 1
+                continue
+            a = start + off
+            line_start = code.rfind('\n', 0, a) + 1
+            alias = re.search(r'[_A-Za-z]\w*\s*:\s*$', code[line_start:a])
+            s0 = line_start + alias.start() if alias else a
+            j = _skip_balanced(code, a + len(name), '(', ')')
+            while True:
+                d = re.match(r'\s*@\w+(?:\s*\([^)]*\))?', code[j:])
+                if not d:
+                    break
+                j += d.end()
+            j = _skip_balanced(code, j, '{', '}')
+            cuts.append((s0, j))
+    if not cuts:
+        return code, 0, unproven
+    out = code
+    for s0, j in sorted(cuts, reverse=True):
+        out = out[:s0] + out[j:]
+    old_lines = set(code.split('\n'))
+    kept = [ln for ln in out.split('\n') if ln.strip() or ln in old_lines]
+    out = '\n'.join(ln if ln in old_lines
+                    else re.sub(r'(\S)[ \t]{2,}(?=\S)', r'\1 ', ln) for ln in kept)
+    if not _graphql_removal_is_exact(code, out, field, len(cuts), spans):
+        return code, 0, unproven + len(cuts)
+    return out, len(cuts), unproven
+
+
+def _graphql_removal_is_exact(before: str, after: str, field: str,
+                              removed: int, spans) -> bool:
+    """The structural verifier for remove_graphql_selections: outside the
+    documents nothing changed, inside them the selection sequence lost exactly
+    `removed` selections, all named `field` (sub-selections of a removed field
+    may go with it), and no selection set became empty."""
+    from .operation_sites import graphql_typed_selections
+    new_spans = embedded_graphql_docs(after) if spans != [(0, len(before))] \
+        else [(0, len(after))]
+    if len(new_spans) != len(spans):
+        return False
+    outside = lambda txt, sp: "".join(  # noqa: E731
+        txt[e0:s1] for (_s0, e0), (s1, _e1) in zip([(0, 0)] + sp, sp + [(len(txt), len(txt))]))
+    if outside(before, spans) != outside(after, new_spans):
+        return False
+    lost = 0
+    for (s0, e0), (s1, e1) in zip(spans, new_spans):
+        old = [n for _o, _k, n, _d, _t in graphql_typed_selections(before[s0:e0])]
+        new = [n for _o, _k, n, _d, _t in graphql_typed_selections(after[s1:e1])]
+        if re.search(r'\{\s*\}', re.sub(r'#[^\n]*', '', after[s1:e1])):
+            return False
+        it = iter(new)
+        # `new` must be a subsequence of `old` ...
+        if not all(any(n == o for o in it) for n in new):
+            return False
+        lost += sum(1 for n in old if n == field) - sum(1 for n in new if n == field)
+    return lost == removed
+
+
 def _remove_field_graphql(code: str, variants: dict[str, str]) -> str:
     """Remove a field's SELECTIONS from a GraphQL operation document.
 

@@ -117,10 +117,25 @@ def graphql_root_selections(doc: str) -> list:
 def graphql_selections(doc: str) -> list:
     """[(offset, kind, field name, depth)] for every field selection in a
     GraphQL document; depth 1 is the operation's root selection set."""
+    return [(o, k, n, d) for o, k, n, d, _t in graphql_typed_selections(doc)]
+
+
+_SPREAD_ON = re.compile(r'\.\.\.\s*on\s+([_A-Za-z]\w*)\s*(?:@\w+\s*(?:\([^)]*\))?\s*)*$')
+_SPREAD_NAME = re.compile(r'\.\.\.\s*$')
+
+
+def graphql_typed_selections(doc: str) -> list:
+    """[(offset, kind, field name, depth, enclosing type)] for every field
+    selection. `enclosing type` is the type the selection is PROVABLY made on
+    from the document alone -- the type condition of the fragment or inline
+    fragment (`... on Order`) whose selection set directly contains it, or the
+    operation kind at the root -- and None inside a field's sub-selection,
+    whose type only the schema knows."""
     text = _blank(doc, r'\$\{.*?\}')            # ${FRAGMENT} interpolations
     text = _blank(text, r'"(?:\\.|[^"\\])*"')    # string values
     text = _blank(text, r'#[^\n]*')              # comments
-    out, depth, paren, kind, last_end = [], 0, 0, "", 0
+    out, paren, kind, last_end = [], 0, "", 0
+    stack = []                                   # enclosing type per open set
     i = 0
     while i < len(text):
         ch = text[i]
@@ -129,7 +144,7 @@ def graphql_selections(doc: str) -> list:
         elif ch == ")":
             paren = max(0, paren - 1)
         elif ch == "{" and paren == 0:
-            if depth == 0:
+            if not stack:
                 header = re.findall(r'[_A-Za-z]\w*', text[last_end:i])
                 if not header:
                     kind = "query"                       # anonymous `{ ... }`
@@ -139,21 +154,28 @@ def graphql_selections(doc: str) -> list:
                     kind = header[header.index("on") + 1]
                 else:
                     kind = ""
-            depth += 1
+                stack.append(kind or None)
+            else:
+                m = _SPREAD_ON.search(text, max(0, i - 200), i)
+                stack.append(m.group(1) if m else None)
         elif ch == "}" and paren == 0:
-            depth = max(0, depth - 1)
-            if depth == 0:
+            if stack:
+                stack.pop()
+            if not stack:
                 last_end = i + 1
-        elif depth >= 1 and paren == 0 and (ch.isalpha() or ch == "_"):
+        elif stack and paren == 0 and (ch.isalpha() or ch == "_"):
             m = re.compile(r'[_A-Za-z]\w*').match(text, i)
             name = m.group(0)
             after = text[m.end():m.end() + 40].lstrip()
-            before = text[max(0, i - 3):i]
-            # `alias:` names the result, not the field; `...Frag` is a
-            # spread; `@skip` is a directive.
-            if (not after.startswith(":") and before != "..." and name != "on"
-                    and not before.endswith("@")):
-                out.append((i, kind, name, depth))
+            head = text[max(0, i - 200):i]
+            # `alias:` names the result, not the field; `...Frag` is a spread
+            # and `... on T` a type condition; `@skip` is a directive.
+            is_spread = bool(_SPREAD_NAME.search(head))
+            is_condition = bool(re.search(r'\.\.\.\s*on\s+$', head))
+            if (not after.startswith(":") and not is_spread and not is_condition
+                    and not (name == "on" and re.search(r'\.\.\.\s*$', head))
+                    and not head.endswith("@")):
+                out.append((i, kind, name, len(stack), stack[-1]))
             i = m.end()
             continue
         i += 1

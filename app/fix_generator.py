@@ -71,7 +71,8 @@ def generate_fix(
     # through to the template for the same reason. Reaching the real Anthropic API
     # still requires a key, so nothing can be sent to a third party by accident.
     from .llm_config import is_configured as _llm_ready
-    if use_llm and _llm_ready():
+    from_llm = bool(use_llm and _llm_ready())
+    if from_llm:
         fixed_code, explanation = _generate_with_llm(
             original_code, consumer, breaking_change
         )
@@ -147,7 +148,13 @@ def generate_fix(
     # A marker-only result changes no code -- it inserts comments the removal
     # contract (which forbids insertions) would reject. It is checked by
     # _is_marker_only instead: the original must survive line for line.
-    if (field and lang in _SCANNED and not _is_marker_only(original_code, fixed_code)
+    # The TEMPLATE path verifies its own removals (_remove_field_fix: each
+    # step through its own checker, unverifiable ones only marked), and its
+    # output can legitimately combine a structural GraphQL removal with marker
+    # lines -- which a single removal contract would reject. So this guards
+    # what nothing else checks: model output.
+    if (field and lang in _SCANNED and from_llm
+            and not _is_marker_only(original_code, fixed_code)
             and _canonical_op(breaking_change.change_type or "") == "remove_field"):
         verdict = _diff_check_any_spelling(original_code, fixed_code, field, lang)
         if not verdict.ok:
@@ -597,29 +604,8 @@ def _generate_with_template(
     op = canonical_op(breaking_change.change_type or "")
 
     if op == "remove_field":
-        # Use the comprehensive template engine
-        from .fix_templates import apply_fix_template
-        lang = (consumer.language or "unknown").lower()
-        fixed, explanation = apply_fix_template(
-            code=original_code,
-            language=lang,
-            change_type="field_removed",
-            field_name=field_name,
-        )
-        if fixed != original_code and _removal_is_verified(
-                original_code, fixed, field_name, lang):
-            return fixed, explanation
-        # A removal nothing can verify is not shipped as an edit. Measured on
-        # 12 real commits: the Go template turned `var s traceql.Static` +
-        # `for _, r := range rs {` into `var s traceql._, r := range rs {`,
-        # and the line-deleting fallback removed whole DOM handlers that named
-        # an unrelated `target`. Both reached a PR because neither Go nor the
-        # fallback has a checker. Mark the references instead: the reviewer
-        # gets the exact lines, and nothing is deleted on a guess.
-        why = ("template removal could not be verified for this language"
-               if fixed != original_code else "no removable shape matched")
-        return _mark_field_references(original_code, field_name, lang, why)
-    
+        return _remove_field_fix(original_code, consumer, breaking_change)
+
     if op == "rename_field":
         from .fix_templates import apply_fix_template, annotate_references
         # Was getattr(breaking_change, 'new_name', '') on a dataclass with no
@@ -744,6 +730,76 @@ def _generate_with_template(
     )
 
 
+def _remove_field_fix(original_code: str, consumer: ConsumerMatch,
+                      breaking_change: BreakingChange) -> tuple[str, str]:
+    """remove_field: verified edits only; everything else becomes a marker.
+
+    1. GraphQL documents embedded in TS/JS (gql`...`): selections the document
+       PROVES are made on the owning type are removed structurally and checked
+       (fix_templates.remove_graphql_selections). Unproven ones -- inside a
+       field's sub-selection, whose type only the schema knows -- are marked.
+    2. The source itself: the language template, kept only where a scanner
+       exists and the diff contract accepts it.
+    3. Any reference neither step removed gets a marker. Nothing is deleted on
+       a guess.
+
+    Measured on 12 real commits before this existed: the Go template turned
+    `var s traceql.Static` + `for _, r := range rs {` into `var s traceql._, r
+    := range rs {`, and the line-deleting fallback removed whole DOM handlers
+    that named an unrelated `target`.
+    """
+    from .fix_templates import (apply_fix_template, embedded_graphql_docs,
+                                remove_graphql_selections)
+    from .smart_consumer_finder import field_owner
+    field_name = breaking_change.field_name
+    lang = (consumer.language or "unknown").lower()
+    code, notes = original_code, []
+
+    owner = field_owner(breaking_change)
+    if (lang in ("typescript", "javascript") and owner
+            and breaking_change.location == "graphql"):
+        docs = embedded_graphql_docs(code)
+        if docs:
+            code, removed, unproven = remove_graphql_selections(
+                code, field_name, owner, docs)
+            if removed:
+                notes.append(f"Removed {removed} selection(s) of "
+                             f"'{owner}.{field_name}' from GraphQL documents.")
+            if unproven:
+                notes.append(f"{unproven} selection(s) of '{field_name}' sit "
+                             f"inside a sub-selection whose type the document "
+                             f"does not state; not removed.")
+
+    fixed, explanation = apply_fix_template(
+        code=code, language=lang, change_type="field_removed",
+        field_name=field_name)
+    from .smart_consumer_finder import is_distinctive_name
+    if fixed != code and not is_distinctive_name(field_name):
+        # A one-word field (`status`, `target`) cannot be tied to its owning
+        # type at the source level without type information: `u.status` in a
+        # file that also uses TransactionItem may be any object's status. The
+        # template would edit every one (it removed `${u.status}` from an
+        # unrelated message), so a one-word name gets markers in source code.
+        notes.append(f"'{field_name}' is too generic to tie each source "
+                     f"reference to '{owner or 'its type'}'; not edited.")
+    elif fixed != code and _removal_is_verified(code, fixed, field_name, lang):
+        code = fixed
+        notes.append(explanation)
+    elif fixed != code:
+        notes.append("The source template's edit could not be verified for "
+                     "this language and was not applied.")
+
+    marked, why = _mark_field_references(
+        code, field_name, lang, "an automated edit could not be verified here")
+    if marked != code:
+        code = marked
+        notes.append(why)
+    if code == original_code:
+        return original_code, why if why.startswith("No change") else (
+            notes[-1] if notes else why)
+    return code, " ".join(notes)
+
+
 def _is_marker_only(original: str, fixed: str) -> bool:
     """True when `fixed` is `original` plus RIPPLE-ACTION-REQUIRED comment
     lines and nothing else."""
@@ -799,17 +855,33 @@ def _mark_field_references(code: str, field_name: str, language: str,
     open a PR that says nothing."""
     from .fix_templates import (MARKER, _STR_LITERAL, _comment_token,
                                 _matches_symbol, _symbol_names, name_variants)
+    from .fix_templates import embedded_graphql_docs
+    from .operation_sites import graphql_typed_selections, multiline_string_opens
     names = _symbol_names(name_variants(field_name)) | {field_name}
     token = _comment_token(language)
     note = (f"field '{field_name}' was removed from the contract -- remove or "
             f"replace this reference.")
-    out, sites = [], 0
-    for line in code.split("\n"):
+    # A line INSIDE a multi-line string gets no marker of its own: a `//` line
+    # inserted into a gql`` document becomes part of the query and breaks it.
+    # A GraphQL document that still selects the field is marked once, above
+    # the line its string opens on; any other multi-line string is text.
+    opens = multiline_string_opens(code)
+    targets = set()
+    for start, end in embedded_graphql_docs(code):
+        if any(n == field_name for _o, _k, n, _d, _t in
+               graphql_typed_selections(code[start:end])):
+            line = code.count("\n", 0, start)
+            targets.add(opens.get(line + 1, line) if line + 1 in opens else line)
+    src = code.split("\n")
+    for i, line in enumerate(src):
         s = line.strip()
-        bare = _STR_LITERAL.sub('""', line)
-        if (s and not s.startswith(token) and not s.startswith("*")
-                and not (out and MARKER in out[-1])
-                and _matches_symbol(bare, names)):
+        if i in opens or not s or s.startswith(token) or s.startswith("*"):
+            continue
+        if _matches_symbol(_STR_LITERAL.sub('""', line), names):
+            targets.add(i)
+    out, sites = [], 0
+    for i, line in enumerate(src):
+        if i in targets and not (out and MARKER in out[-1]):
             indent = line[:len(line) - len(line.lstrip())]
             out.append(f"{indent}{token} {MARKER}: {note}")
             sites += 1

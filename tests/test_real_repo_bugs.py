@@ -271,6 +271,93 @@ def test_find_consumers_reads_the_tree_once():
     assert calls == [], "find_consumers re-walked the tree"
 
 
+# ── 5. GraphQL documents embedded in TypeScript ─────────────────────────────
+
+_GQL_TS = ('import { gql } from "@apollo/client";\n'
+           'export const F = gql`\n'
+           '  fragment TransactionItem on TransactionItem {\n'
+           '    id\n'
+           '    status\n'
+           '    events { status name }\n'
+           '    ... on Payment { status }\n'
+           '  }\n'
+           '`;\n'
+           'const msg = `${u.status} done`;\n'
+           'export const Q = gql`\n'
+           '  query { order(id: 1) { status total } }\n'
+           '`;\n')
+
+
+def _gql_bc(field="status", owner="TransactionItem"):
+    return _bc(field, method=owner, location="graphql")
+
+
+def test_typed_selections_resolve_fragment_and_inline_types():
+    from app.operation_sites import graphql_typed_selections as T
+    doc = ('fragment TI on TransactionItem { id status events { status } '
+           '... on Payment { status } ...Other ... Spaced }')
+    got = [(n, t) for _o, _k, n, _d, t in T(doc)]
+    assert got == [("id", "TransactionItem"), ("status", "TransactionItem"),
+                   ("events", "TransactionItem"), ("status", None),
+                   ("status", "Payment")], got
+
+
+def test_gql_in_ts_removes_only_proven_selections():
+    fixed, why = _fix(_GQL_TS, "typescript", _gql_bc())
+    lines = fixed.split("\n")
+    # TransactionItem.status removed from the fragment...
+    assert "    status" not in lines, fixed
+    # ...but events { status } (TransactionEvent), Payment.status, the
+    # order { status } of another query and the message template are kept.
+    for kept in ("    events { status name }", "    ... on Payment { status }",
+                 "const msg = `${u.status} done`;",
+                 "  query { order(id: 1) { status total } }"):
+        assert kept in lines, (kept, fixed)
+    # Unproven selections get ONE marker above each gql`` opening line, and
+    # nothing is inserted inside a document.
+    assert fixed.count(MARKER) == 2, fixed
+    for i, ln in enumerate(lines):
+        if MARKER in ln:
+            assert lines[i + 1].rstrip().endswith("gql`"), (i, fixed)
+    assert "Removed 1 selection" in why and "3 selection(s)" in why, why
+
+
+def test_gql_in_ts_nothing_left_unproven_needs_no_marker():
+    ts = ('const F = gql`\n  fragment T on TransactionItem {\n    id\n'
+          '    status { code }\n  }\n`;\n')
+    fixed, why = _fix(ts, "typescript", _gql_bc())
+    assert fixed == ('const F = gql`\n  fragment T on TransactionItem {\n'
+                     '    id\n  }\n`;\n'), fixed
+    assert MARKER not in fixed
+
+
+def test_gql_in_ts_removes_an_aliased_selection_with_its_alias():
+    ts = ('const F = gql`\n  fragment T on TransactionItem {\n    id\n'
+          '    st: status @include(if: $x)\n  }\n`;\n')
+    fixed, _ = _fix(ts, "typescript", _gql_bc())
+    assert fixed == ('const F = gql`\n  fragment T on TransactionItem {\n'
+                     '    id\n  }\n`;\n'), fixed
+
+
+def test_gql_in_ts_refuses_to_leave_an_empty_selection_set():
+    from app.fix_templates import (embedded_graphql_docs,
+                                   remove_graphql_selections)
+    ts = 'const F = gql`fragment T on TransactionItem { status }`;\n'
+    out, removed, unproven = remove_graphql_selections(
+        ts, "status", "TransactionItem", embedded_graphql_docs(ts))
+    assert (out, removed, unproven) == (ts, 0, 1), out
+
+
+def test_gql_in_ts_only_for_graphql_changes_and_tagged_templates():
+    from app.fix_templates import embedded_graphql_docs
+    # A proto/OpenAPI change has no business editing a GraphQL document.
+    fixed, _ = _fix(_GQL_TS, "typescript", _bc("status", method="TransactionItem"))
+    assert "    status" in fixed.split("\n")
+    assert len(embedded_graphql_docs(_GQL_TS)) == 2
+    assert embedded_graphql_docs("const a = `fragment X on T { status }`;") == []
+    assert len(embedded_graphql_docs("graphql(`{ a }`); /* GraphQL */ `{ b }`")) == 2
+
+
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _runner import run
