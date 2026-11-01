@@ -209,3 +209,40 @@ def _fstring_runs(code: str, start: int, quote: str, raw: bool,
         j += 1
     out.append((run_start, min(j, n), "string"))
     return out
+
+
+def mask(code: str, language: str = "typescript") -> str:
+    """`code` with every comment and string replaced by spaces, newlines kept,
+    so offsets and line numbers still line up with the original. What is left
+    is the text a bracket or a keyword can be counted in without a `{` in a
+    message or a `)` in a comment throwing the count off."""
+    chars = list(code)
+    for start, end, _kind in regions(code, language):
+        for i in range(start, end):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "".join(chars)
+
+
+_BRACKETS = (("{", "}"), ("(", ")"), ("[", "]"))
+
+
+def bracket_depths(code: str, language: str = "typescript") -> tuple:
+    """Net (opened - closed) count of each bracket kind outside strings and
+    comments: ({}, (), []). Zero for a file whose brackets close."""
+    m = mask(code, language)
+    return tuple(m.count(o) - m.count(c) for o, c in _BRACKETS)
+
+
+def brackets_preserved(before: str, after: str,
+                       language: str = "typescript") -> bool:
+    """Did an edit keep every bracket kind's net balance?
+
+    The deletion that broke 9 files of 15 wrong fixes on real saleor commits
+    removed the OPENING line of a construct and left its body: `orderLine: {`
+    with `id: ..., }` still below it, `if (x === E.VOID) {` with `onVoid(); }`.
+    Each such edit shifts a net bracket count, whatever template made it, so
+    this is checked once for every template edit rather than per template.
+    Necessary, not sufficient: a removal that keeps the balance can still be
+    wrong, which is what the per-template contracts are for."""
+    return bracket_depths(before, language) == bracket_depths(after, language)

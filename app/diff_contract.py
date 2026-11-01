@@ -95,6 +95,7 @@ def check(before: str, after: str, field: str,
 
     b_lines = before.splitlines(keepends=True)
     a_lines = after.splitlines(keepends=True)
+    owned = _owned_block_lines(before, b_lines, field, language)
     sm = difflib.SequenceMatcher(None, b_lines, a_lines, autojunk=False)
 
     violations = []
@@ -116,8 +117,10 @@ def check(before: str, after: str, field: str,
                     f"`{line.strip()[:70]}`")
         elif tag == "delete":
             deleted += i2 - i1
-            for line in b_lines[i1:i2]:
+            for k, line in enumerate(b_lines[i1:i2], i1):
                 removed_chunks.append(line)
+                if k in owned and owned[k] >= i1 and owned[k] in range(i1, i2):
+                    continue             # body of a deleted `field: {` block
                 if not re.search(rf"\b{re.escape(field)}\b", line):
                     violations.append(
                         f"DELETED a line that does not reference {field!r} -- "
@@ -145,9 +148,11 @@ def check(before: str, after: str, field: str,
                     violations.append(
                         f"REMOVED text that does not reference {field!r}: "
                         f"{dele!r}")
-            for bl in b_block[len(a_block):]:
+            for k, bl in enumerate(b_block[len(a_block):], i1 + len(a_block)):
                 deleted += 1
                 removed_chunks.append(bl)
+                if k in owned and owned[k] in range(i1 + len(a_block), i2):
+                    continue
                 if not re.search(rf"\b{re.escape(field)}\b", bl):
                     violations.append(
                         f"DELETED a line that does not reference {field!r}: "
@@ -190,6 +195,42 @@ def check(before: str, after: str, field: str,
         summary={"deleted_lines": deleted, "modified_lines": modified,
                  "added_lines": added, "field": field},
     )
+
+
+def _owned_block_lines(before: str, b_lines: list, field: str,
+                       language: str) -> dict:
+    """{line index: index of the line that owns it} for every line inside a
+    block opened by a line that references `field`.
+
+    `orderLine: {` / `  id: 1,` / `},` is ONE property. Judged line by line,
+    removing it whole read as two lines of collateral damage, so the only
+    removal the contract accepted was the one that left the body behind.
+    Ownership runs from the opening line to the line where the bracket it
+    opened closes, counted outside strings and comments. The caller accepts an
+    owned line only when its owner is deleted in the same hunk -- deleting the
+    body and keeping the head is still collateral damage.
+    """
+    from .source_regions import mask
+    m_lines = mask(before, language).splitlines(keepends=True)
+    if len(m_lines) != len(b_lines):
+        return {}
+    ref = re.compile(rf"\b{re.escape(field)}\b")
+    owned, i = {}, 0
+    while i < len(b_lines):
+        ml = m_lines[i]
+        depth = sum(ml.count(c) for c in "{([") - sum(ml.count(c) for c in "})]")
+        if depth > 0 and ref.search(b_lines[i]):
+            j = i + 1
+            while j < len(b_lines) and depth > 0:
+                ml = m_lines[j]
+                depth += (sum(ml.count(c) for c in "{([")
+                          - sum(ml.count(c) for c in "})]"))
+                owned[j] = i
+                j += 1
+            i = j
+            continue
+        i += 1
+    return owned
 
 
 def _char_delta(before_line: str, after_line: str) -> tuple:

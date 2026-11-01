@@ -209,34 +209,85 @@ def remove_field(code: str, field: str) -> CodemodResult:
     decl = re.compile(rf"^[ \t]*{esc}\??[ \t]*:[ \t]*(?P<value>[^=\n]*?)[;,]?[ \t]*$\n?",
                       re.MULTILINE)
     SIDE_EFFECTS = ("(", "await ", "=>", "new ", "++", "--", "yield ")
-    keep = []
     # A reference must produce exactly ONE reason. Without this, a side-effecting
     # value was refused here AND again by the final classification pass, so the PR
     # body would say the same thing twice and the counts would double.
     _refused_lines: set = set()
+    # Comments and strings blanked, offsets unchanged: brackets are counted here.
+    from .source_regions import mask as _mask
+    masked = _mask(out, "typescript")
+    cuts: list = []
+
+    def _refuse(m, why):
+        line_no = out[:m.start()].count("\n") + 1
+        refusals.append(f"line {line_no}: `{m.group(0).strip()[:70]}` -- {why} "
+                        f"A human must decide.")
+        _refused_lines.add(m.group(0).strip())
+
     for m in list(decl.finditer(out)):
+        if cuts and m.start() < cuts[-1][1]:
+            continue                     # inside a block already being removed
         value = m.group("value")
-        marker = next((t for t in SIDE_EFFECTS if t in value), None)
-        if marker:
-            line_no = out[:m.start()].count("\n") + 1
-            refusals.append(
-                f"line {line_no}: `{m.group(0).strip()[:70]}` -- the value contains "
-                f"`{marker.strip()}`, so removing the property would also remove "
-                f"something that may have effects. Whether that is correct depends "
-                f"on what it does. A human must decide.")
-            keep.append(m.span())
-            _refused_lines.add(m.group(0).strip())
+        # A value that OPENS a bracket it does not close continues on later
+        # lines (`orderLine: {` / `  id: ...` / `},`). Removing only this line
+        # left the body and its `}` behind -- 7 files of broken syntax on one
+        # real saleor commit. Such a property is removed with its whole
+        # balanced block or not at all.
+        head = masked[m.start():m.end()]
+        opened = sum(head.count(c) for c in "{([") - sum(head.count(c) for c in "})]")
+        if opened < 0:
+            _refuse(m, "the line closes a bracket it did not open, so the "
+                       "property's extent is unclear.")
+            continue
+        # `orderLine: { a: 1 }, x: 2,` -- the value pattern accepts commas, so
+        # the match ran on into the NEXT property and deleted `x: 2` with it.
+        # A separator at bracket depth 0 means the line holds more than this
+        # property.
+        vstart = m.start("value")
+        vmask = masked[vstart:vstart + len(value)].rstrip(" \t,;")
+        depth0 = 0
+        for ch in vmask:
+            depth0 += {"{": 1, "(": 1, "[": 1, "}": -1, ")": -1, "]": -1}.get(ch, 0)
+            if depth0 == 0 and ch in ",;":
+                _refuse(m, "other properties share this line, so the "
+                           "property cannot be removed on its own.")
+                break
         else:
-            edits.append({"shape": "keyed property (inert value)",
-                          "removed": m.group(0).strip()})
-    # Rebuild without the removable matches, preserving the refused ones.
-    if any(m.span() not in keep for m in decl.finditer(out)):
-        pieces, last = [], 0
-        for m in decl.finditer(out):
-            if m.span() in keep:
+            depth0 = None
+        if depth0 is not None:
+            continue
+        cut_end, text = m.end(), m.group(0)
+        if opened > 0:
+            j, depth = m.end(), opened
+            while j < len(masked) and depth:
+                depth += {"{": 1, "(": 1, "[": 1,
+                          "}": -1, ")": -1, "]": -1}.get(masked[j], 0)
+                j += 1
+            line_end = out.find("\n", j)
+            line_end = len(out) if line_end == -1 else line_end
+            if depth or not re.fullmatch(r"[ \t]*[,;]?[ \t]*", out[j:line_end]):
+                _refuse(m, "the value spans several lines and its block does "
+                           "not end on a line of its own, so removing the "
+                           "property cleanly is not provable.")
                 continue
-            pieces.append(out[last:m.start()])
-            last = m.end()
+            cut_end = min(line_end + 1, len(out))
+            text = out[m.start():cut_end]
+        marker = next((t for t in SIDE_EFFECTS if t in text[text.index(":") + 1:]),
+                      None)
+        if marker:
+            _refuse(m, f"the value contains `{marker.strip()}`, so removing the "
+                       f"property would also remove something that may have "
+                       f"effects. Whether that is correct depends on what it does.")
+            continue
+        shape = ("keyed property (inert value)" if cut_end == m.end()
+                 else "keyed property (inert multi-line value)")
+        edits.append({"shape": shape, "removed": text.strip()})
+        cuts.append((m.start(), cut_end))
+    if cuts:
+        pieces, last = [], 0
+        for a, b in cuts:
+            pieces.append(out[last:a])
+            last = b
         pieces.append(out[last:])
         out = "".join(pieces)
 

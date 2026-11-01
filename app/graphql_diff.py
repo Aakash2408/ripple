@@ -227,6 +227,28 @@ def _root_types(content: str) -> set:
     return {"Query", "Mutation", "Subscription"}
 
 
+#: Change types whose field_name is a FIELD of the type in `method`.
+_FIELD_CHANGES = ("field_removed", "field_type_changed", "field_made_required",
+                  "field_renamed", "argument_removed", "argument_type_changed")
+
+
+def _mark_shared_names(changes: list, new_types: dict) -> None:
+    """Set name_shared where the changed field (or enum value) still exists on
+    another type (or enum) of the NEW schema. Those are the names a consumer's
+    code can mention for reasons that have nothing to do with this change."""
+    for c in changes:
+        if c.change_type in _FIELD_CHANGES:
+            name = c.field_name.split(".")[0].split("(")[0]
+            c.name_shared = any(
+                t.name != c.method and name in t.fields
+                for t in new_types.values()
+                if t.kind in ("type", "input", "interface"))
+        elif c.change_type == "enum_value_removed":
+            c.name_shared = any(
+                t.name != c.method and c.field_name in t.enum_values
+                for t in new_types.values() if t.kind == "enum")
+
+
 def diff_graphql(old_content: str, new_content: str, file_path: str = "schema.graphql") -> list[BreakingChange]:
     """Compare two GraphQL schemas and return breaking changes."""
     old_types = parse_graphql(old_content)
@@ -442,6 +464,7 @@ def diff_graphql(old_content: str, new_content: str, file_path: str = "schema.gr
                     description=f"Union member '{member}' removed from '{type_name}'. Fragment spreads on this type will fail.",
                 ))
     
+    _mark_shared_names(changes, new_types)
     return changes
 
 

@@ -590,6 +590,41 @@ def _generate_with_template(
     consumer: ConsumerMatch,
     breaking_change: BreakingChange,
 ) -> tuple[str, str]:
+    """Template fix, with one check every template's EDIT must pass: the net
+    bracket balance of the file is unchanged.
+
+    Each template has its own contract, but 9 of 15 wrong fixes on real saleor
+    commits slipped past them the same way -- deleting the line that OPENS a
+    construct (`orderLine: {`, `if (x === E.VOID) {`, `case E.X:` with half its
+    arm) and leaving the rest. That always shifts a bracket count, so it is
+    caught here once, for every template and every change type. A refused edit
+    becomes markers on the same references; nothing is deleted on a guess.
+    """
+    fixed, explanation = _template_fix(original_code, consumer, breaking_change)
+    if fixed == original_code or _is_marker_only(original_code, fixed):
+        return fixed, explanation
+    from .source_regions import brackets_preserved
+    lang = (consumer.language or "unknown").lower()
+    if brackets_preserved(original_code, fixed, lang):
+        return fixed, explanation
+    from .fix_templates import annotate_references
+    field = breaking_change.field_name or ""
+    print(f"[fix_generator] template edit for {consumer.file_path} changed the "
+          f"file's bracket balance; refused, marking instead")
+    marked, why = annotate_references(
+        original_code, lang, field,
+        f"'{field}' changed in the contract ({breaking_change.change_type}); "
+        f"an automated edit here would have left unbalanced brackets -- "
+        f"update this reference by hand.")
+    return marked, ("The automated edit was refused because it would have left "
+                    "unbalanced brackets. " + why)
+
+
+def _template_fix(
+    original_code: str,
+    consumer: ConsumerMatch,
+    breaking_change: BreakingChange,
+) -> tuple[str, str]:
     """
     Template-based fix (no LLM needed).
     Works for the common case: "add a field to a JSON payload."
@@ -606,6 +641,9 @@ def _generate_with_template(
     if op == "remove_field":
         return _remove_field_fix(original_code, consumer, breaking_change)
 
+    if op == "remove_enum_value":
+        return _remove_enum_value_fix(original_code, consumer, breaking_change)
+
     if op == "rename_field":
         from .fix_templates import apply_fix_template, annotate_references
         # Was getattr(breaking_change, 'new_name', '') on a dataclass with no
@@ -613,8 +651,8 @@ def _generate_with_template(
         # every rename fell through to "Unsupported change type", leaving the
         # code unchanged, which opens no PR. Detection became silence.
         new_name = breaking_change.new_name
-        from .smart_consumer_finder import is_distinctive_name
-        if new_name and not is_distinctive_name(field_name):
+        from .smart_consumer_finder import needs_owner_scope
+        if new_name and needs_owner_scope(breaking_change):
             # Same rule as removal: a one-word field (`name`) cannot be tied to
             # its owning type per reference, and the rename template rewrote a
             # function PARAMETER `name` -- and `${name}` inside a query string
@@ -783,15 +821,17 @@ def _remove_field_fix(original_code: str, consumer: ConsumerMatch,
     fixed, explanation = apply_fix_template(
         code=code, language=lang, change_type="field_removed",
         field_name=field_name)
-    from .smart_consumer_finder import is_distinctive_name
-    if fixed != code and not is_distinctive_name(field_name):
+    from .smart_consumer_finder import needs_owner_scope
+    if fixed != code and needs_owner_scope(breaking_change):
         # A one-word field (`status`, `target`) cannot be tied to its owning
         # type at the source level without type information: `u.status` in a
         # file that also uses TransactionItem may be any object's status. The
         # template would edit every one (it removed `${u.status}` from an
         # unrelated message), so a one-word name gets markers in source code.
-        notes.append(f"'{field_name}' is too generic to tie each source "
-                     f"reference to '{owner or 'its type'}'; not edited.")
+        why_scope = ("is used by other types in the spec too" if
+                     breaking_change.name_shared else "is too generic")
+        notes.append(f"'{field_name}' {why_scope}, so source references cannot "
+                     f"be tied to '{owner or 'its type'}' by name; not edited.")
     elif fixed != code and _removal_is_verified(code, fixed, field_name, lang):
         code = fixed
         notes.append(explanation)
@@ -808,6 +848,146 @@ def _remove_field_fix(original_code: str, consumer: ConsumerMatch,
         return original_code, why if why.startswith("No change") else (
             notes[-1] if notes else why)
     return code, " ".join(notes)
+
+
+def _enum_ref(owner: str, value: str) -> "re.Pattern":
+    """`Owner.VALUE`, `Owner_VALUE` (Go/protobuf) or `Owner::VALUE`, the value
+    ending at a real boundary. `_` is NOT a boundary here: the previous matcher
+    accepted it, so the removed `VOID` also matched `TRANSACTION_VOID_REQUESTED`."""
+    return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(owner)}(?:\.|::|_)"
+                      rf"{re.escape(value)}(?![A-Za-z0-9_])")
+
+
+#: A statement that ends a switch arm, optionally after its own label
+#: (`case A: return 1;`).
+_ARM_END = re.compile(r"^\s*(?:(?:case\b[^:]*|default\s*):\s*)?"
+                      r"(?:return|break|throw|continue)\b")
+
+
+def _stmt_start(mlines: list, k: int) -> str:
+    """The masked line on which the statement ENDING on line k begins: walk
+    back until the brackets closed since then are all opened again."""
+    balance = 0
+    for j in range(k, -1, -1):
+        ml = mlines[j]
+        balance += (sum(ml.count(c) for c in "})]") - sum(ml.count(c) for c in "{(["))
+        if balance <= 0:
+            return ml
+    return mlines[0] if mlines else ""
+
+
+def _remove_enum_value_fix(original_code: str, consumer: ConsumerMatch,
+                           breaking_change: BreakingChange) -> tuple[str, str]:
+    """A removed enum value: edit only what is provably that enum's, mark the rest.
+
+    On a real saleor commit removing `TransactionActionEnum.VOID`, the shared
+    template deleted every line containing `<anything>.VOID` -- also
+    `OrderAction.VOID`, `TransactionKind.VOID` and
+    `OrderErrorCode.VOID_INACTIVE_PAYMENT`, which still exist -- and deleted
+    `if (action === TransactionActionEnum.VOID) {` while leaving its body.
+
+    So, with the owning enum known from the spec:
+      * only `Owner.VALUE` (and its `_` / `::` spellings) counts as a reference;
+      * TS/JS edits are two shapes: the member line inside `enum Owner { }`
+        (generated client types), and a whole `case Owner.VALUE:` arm -- label
+        plus body, its end found by bracket depth, refused if the arm above
+        falls through into it;
+      * every other reference -- a comparison, a list entry, an argument --
+        is marked. Deleting the line it is on deletes whatever else it does.
+    Without an owner nothing is edited.
+    """
+    from .fix_templates import MARKER, _comment_token
+    from .smart_consumer_finder import field_owner
+    from .source_regions import mask
+    value = breaking_change.field_name or ""
+    owner = field_owner(breaking_change)
+    lang = (consumer.language or "unknown").lower()
+    if not value:
+        return original_code, "No change: the enum value has no name."
+    ref = _enum_ref(owner, value) if owner else re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])")
+    lines = original_code.split("\n")
+    mlines = mask(original_code, lang).split("\n")
+    drop: set = set()
+    edits = []
+
+    if owner and lang in ("typescript", "javascript"):
+        # 1. The member inside `enum Owner { ... }`.
+        enum_head = re.compile(rf"\benum\s+{re.escape(owner)}\s*\{{\s*$")
+        member = re.compile(rf"^\s*{re.escape(value)}\s*(?:=\s*[^,]+)?,?\s*$")
+        i = 0
+        while i < len(lines):
+            if enum_head.search(mlines[i]):
+                j = i + 1
+                while j < len(lines) and not mlines[j].strip().startswith("}"):
+                    if member.match(lines[j]) and "{" not in mlines[j]:
+                        drop.add(j)
+                        edits.append(f"member of enum {owner}")
+                    j += 1
+                i = j
+            i += 1
+        # 2. Whole `case Owner.VALUE:` arms.
+        label = re.compile(rf"^\s*case\s+{ref.pattern}\s*:\s*$")
+        code_idx = [k for k, ml in enumerate(mlines) if ml.strip()]
+        for pos, i in enumerate(code_idx):
+            if not label.match(lines[i]):
+                continue
+            prev = mlines[code_idx[pos - 1]] if pos else ""
+            nxt = mlines[code_idx[pos + 1]] if pos + 1 < len(code_idx) else ""
+            prev_is_label = bool(re.match(r"^\s*(?:case\b.*|default\s*):\s*$", prev))
+            if prev_is_label or re.match(r"^\s*(?:case\b|default\b)", nxt):
+                drop.add(i)                 # one label of a group: the body stays
+                edits.append(f"case label {owner}.{value}")
+                continue
+            # The arm above must not fall through into this one. Judged on the
+            # line its last STATEMENT starts on: `return intl.formatMessage({`
+            # ends on `});`, which on its own says nothing.
+            prev_stmt = _stmt_start(mlines, code_idx[pos - 1]) if pos else ""
+            if not (re.search(r"\bswitch\b.*\{\s*$", prev_stmt)
+                    or _ARM_END.search(prev_stmt)):
+                continue
+            depth, j, end = 0, i + 1, None
+            while j < len(lines):
+                ml = mlines[j]
+                if depth == 0 and re.match(r"^\s*(?:case\b|default\b)", ml):
+                    end = j
+                    break
+                d = depth + sum(ml.count(c) for c in "{([") - sum(ml.count(c) for c in "})]")
+                if d < 0:
+                    end = j                 # the switch's own closing brace
+                    break
+                depth, j = d, j + 1
+            if end is None or depth != 0:
+                continue
+            last_k = next((k for k in range(end - 1, i, -1) if mlines[k].strip()), None)
+            if last_k is None or not _ARM_END.search(_stmt_start(mlines, last_k)):
+                continue                    # the arm itself falls through
+            drop.update(range(i, end))
+            edits.append(f"case arm {owner}.{value}")
+
+    token = _comment_token(lang)
+    note = (f"enum value '{owner + '.' if owner else ''}{value}' was removed "
+            f"from the contract -- replace or remove this reference.")
+    out, marked = [], 0
+    for k, line in enumerate(lines):
+        if k in drop:
+            continue
+        if ref.search(mlines[k]) and not (out and MARKER in out[-1]):
+            out.append(f"{line[:len(line) - len(line.lstrip())]}{token} {MARKER}: {note}")
+            marked += 1
+        out.append(line)
+    result = "\n".join(out)
+    if result == original_code:
+        return original_code, (f"No change: no code reference to "
+                               f"'{owner + '.' if owner else ''}{value}'.")
+    parts = []
+    if edits:
+        parts.append(f"Removed {len(edits)} reference(s) to the deleted enum value "
+                     f"'{owner}.{value}': " + ", ".join(dict.fromkeys(edits)) + ".")
+    if marked:
+        parts.append(f"PARTIAL: marked {marked} other reference(s) with {MARKER}; "
+                     f"they need a replacement value a human must choose.")
+    return result, " ".join(parts)
 
 
 def _is_marker_only(original: str, fixed: str) -> bool:
@@ -1105,21 +1285,25 @@ def _field_variants(field_name: str) -> list[str]:
 
 
 def _compute_diff(original: str, fixed: str, filepath: str) -> str:
-    """Compute a unified diff between original and fixed code."""
+    """A unified diff that `git apply` / `patch` accept.
+
+    This used lineterm="" with keepends=True, so the `---`, `+++` and `@@`
+    header lines had no newline and ran together (`--- a/x+++ b/x@@ -1 +1 @@`)
+    while content lines kept theirs: the CLI printed diffs no tool could apply.
+    A last line with no trailing newline also ran into the next line; it now
+    gets the standard `\\ No newline at end of file` marker.
+    """
     import difflib
-    
-    original_lines = original.splitlines(keepends=True)
-    fixed_lines = fixed.splitlines(keepends=True)
-    
-    diff = difflib.unified_diff(
-        original_lines,
-        fixed_lines,
-        fromfile=f"a/{filepath}",
-        tofile=f"b/{filepath}",
-        lineterm="",
-    )
-    
-    return "".join(diff)
+
+    def _lines(text: str) -> list:
+        out = text.splitlines(keepends=True)
+        if out and not out[-1].endswith(("\n", "\r")):
+            out[-1] += "\n\\ No newline at end of file\n"
+        return out
+
+    return "".join(difflib.unified_diff(
+        _lines(original), _lines(fixed),
+        fromfile=f"a/{filepath}", tofile=f"b/{filepath}"))
 
 
 def format_fixes(fixes: list[GeneratedFix]) -> str:

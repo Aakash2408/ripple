@@ -508,6 +508,9 @@ def test_tree_scan_respects_call_budget():
         # one-word field by.
         method = "User"
         path = "user.proto"
+        # ...and name_shared, which says whether the spec uses this name on
+        # another type too (it then needs the owner as well).
+        name_shared = False
 
     result = wh._scan_repo_tree_for_consumers(
         "Aakash2408/user-proto", _Change(), "invalid", "", budget

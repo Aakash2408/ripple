@@ -47,6 +47,13 @@ class BreakingChange:
     new_name: str = ""        # rename_field / rename_type: the new name
     old_type: str = ""        # change_field_type: the type before
     new_type: str = ""        # change_field_type: the type after
+    # The changed name also exists on ANOTHER type in the new spec (saleor's
+    # `orderLine`, removed from CustomerEvent but kept on FulfillmentLine and
+    # six more). A multi-word name looks specific and is not, so source
+    # references cannot be tied to the owner by name -- see
+    # smart_consumer_finder.needs_owner_scope. Set by engines that know their
+    # types; False means "not known to be shared", not "proven unique".
+    name_shared: bool = False
 
 
 @dataclass

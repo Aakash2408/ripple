@@ -702,7 +702,7 @@ def consumer_query(change) -> tuple[str, str]:
     if op in _FIELD_OPS:
         owner = field_owner(change)
         field = (change.field_name or "").strip()
-        if owner and field and not is_distinctive_name(field):
+        if owner and field and needs_owner_scope(change):
             return f"{owner}.{field}", "scoped_field"
     try:
         vector = vector_for(change.change_type)
@@ -736,6 +736,17 @@ def is_distinctive_name(name: str) -> bool:
     then deleted."""
     words = re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", name.strip("_$"))
     return len(words) >= 2
+
+
+def needs_owner_scope(change) -> bool:
+    """Must a reference to this change's field be tied to its owning type
+    before anything is done with it? Yes for a one-word name, and yes for any
+    name the spec itself uses on another type: on a real saleor commit,
+    `orderLine` was removed from CustomerEvent and Ripple deleted it from
+    fixtures, an intl message map and generated types for FulfillmentLine,
+    whose `orderLine` still exists."""
+    field = (change.field_name or "").strip()
+    return not is_distinctive_name(field) or change.name_shared
 
 
 def owner_referenced(content: str, owner: str) -> bool:

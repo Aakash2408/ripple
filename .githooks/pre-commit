@@ -84,6 +84,7 @@ GATES=(
     "tests/test_contract_matrix.py"
     "tests/test_operation_sites.py"
     "tests/test_real_repo_bugs.py"
+    "tests/test_saleor_rerun_bugs.py"
     "tools/audit_diff_engines.py"
     "tools/audit_change_types.py"
     "tools/coverage_matrix.py"
