@@ -400,6 +400,65 @@ def test_add_required_hint_markers_are_hoisted_too():
     assert n == 1 and out.split("\n")[0].startswith("# " + MARKER), out
 
 
+def test_validation_containers_run_as_the_caller():
+    # The 12-commit replay left 205 ripple-validate-py-* dirs (17 GB) behind:
+    # the container ran as root, so the venv it built inside the mounted copy
+    # was root-owned and the host could not delete it. Every `docker run` must
+    # therefore carry the caller's uid:gid, whatever the language.
+    import tempfile
+    import app.validation as v
+    if not hasattr(os, "getuid"):
+        return
+    seen = []
+
+    def fake_run(cmd, cwd, timeout, limits=None):
+        seen.append(cmd)
+        return 0, "", ""          # both containers "succeed": every call is built
+
+    real = v._run
+    v._run = fake_run
+    try:
+        for lang, files in (("python", ("requirements-dev.txt", "mypy.ini")),
+                            ("typescript", ("package.json", "tsconfig.json")),
+                            ("go", ("go.mod",))):
+            ws = tempfile.mkdtemp()
+            for f in files:
+                open(os.path.join(ws, f), "w").close()
+            before = len(seen)
+            v.RUNNERS[lang](ws, backend="docker")
+            assert len(seen) > before, f"{lang} never reached docker run"
+    finally:
+        v._run = real
+    docker = [c for c in seen if c[:2] == ["docker", "run"]]
+    assert len(docker) == 6, seen   # install + check, per language
+    want = f"{os.getuid()}:{os.getgid()}"
+    for cmd in docker:
+        assert "--user" in cmd and cmd[cmd.index("--user") + 1] == want, cmd
+        assert "HOME=/tmp" in cmd, cmd
+
+
+def test_validation_cleanup_failure_is_logged_not_swallowed():
+    import logging
+    import tempfile
+    import app.validation as v
+    tmp = tempfile.mkdtemp()
+    open(os.path.join(tmp, "f"), "w").close()
+    records = []
+    h = logging.Handler()
+    h.emit = records.append
+    v._log.addHandler(h)
+    real = v.shutil.rmtree
+    v.shutil.rmtree = lambda p, onerror=None: onerror(os.unlink, p + "/f", None)
+    try:
+        v._remove_workdir(tmp)          # must not raise
+    finally:
+        v.shutil.rmtree = real
+        v._log.removeHandler(h)
+    assert records and "not fully removed" in records[0].getMessage(), records
+    v._remove_workdir(tmp)              # real delete: gone, nothing logged
+    assert not os.path.exists(tmp)
+
+
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _runner import run

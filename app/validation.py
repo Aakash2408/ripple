@@ -40,6 +40,7 @@ come first.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -48,6 +49,8 @@ import tempfile
 from dataclasses import dataclass, field
 
 from app.capability_claims import ValidationState
+
+_log = logging.getLogger(__name__)
 
 #: Pinned. A floating tag would make a verdict unreproducible, and "it validated
 #: last week" is not evidence about today.
@@ -229,6 +232,37 @@ def _host_limits():
     return _apply
 
 
+def _as_caller() -> list:
+    """`docker run` args that make the container write files as the CALLING user.
+
+    Without them the container runs as root, so the venv, node_modules and Go
+    module cache it creates inside the mounted work dir are root-owned, and the
+    host process -- not root -- cannot delete them afterwards. Every validation
+    then leaked its whole copy (~80 MB for a Python project) into the temp dir.
+    HOME=/tmp because the caller's uid has no home inside the image, and npm, pip
+    and go all want a writable one.
+    """
+    if not hasattr(os, "getuid"):
+        return []
+    return ["--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"]
+
+
+def _remove_workdir(tmp: str) -> None:
+    """Delete a validation work dir, and SAY so when it cannot be deleted.
+
+    ignore_errors=True hid the root-owned-files leak for months; a work dir that
+    survives is disk the host never gets back, so it is logged, not swallowed.
+    Never raised: validation already has its verdict, and cleanup must not
+    replace it with an exception.
+    """
+    failed: list = []
+    shutil.rmtree(tmp, onerror=lambda _fn, path, _exc: failed.append(path))
+    if failed or os.path.exists(tmp):
+        _log.warning("validation work dir %s was not fully removed "
+                     "(%d path(s) left, first: %s)", tmp, len(failed),
+                     failed[0] if failed else tmp)
+
+
 def _run(cmd: list, cwd: str, timeout: int, limits=None) -> tuple:
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
@@ -327,7 +361,7 @@ def validate_typescript(workspace: str, backend: str = "",
             install = ["docker", "run", "--rm",
                        "-v", f"{work}:/w", "-w", "/w",
                        "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
-                       "--security-opt", "no-new-privileges",
+                       "--security-opt", "no-new-privileges", *_as_caller(),
                        DOCKER_IMAGE] + npm_cmd
         else:
             node_dir = os.path.dirname(_host_node())
@@ -357,7 +391,7 @@ def validate_typescript(workspace: str, backend: str = "",
             check = ["docker", "run", "--rm", "--network", "none",
                      "-v", f"{work}:/w:ro", "-w", "/w",
                      "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
-                     "--security-opt", "no-new-privileges",
+                     "--security-opt", "no-new-privileges", *_as_caller(),
                      DOCKER_IMAGE,
                      "./node_modules/.bin/tsc", "--noEmit", "--skipLibCheck"] + _project_arg
         else:
@@ -383,7 +417,7 @@ def validate_typescript(workspace: str, backend: str = "",
                                for e in errors] or [out.strip()[-300:]],
                        evidence=ev)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _remove_workdir(tmp)
 
 
 #: Pinned for the same reason as DOCKER_IMAGE. Alpine because mypy needs no wheels
@@ -508,7 +542,7 @@ def validate_python(workspace: str, backend: str = "",
         install = ["docker", "run", "--rm",
                    "-v", f"{work}:/w", "-w", "/w",
                    "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
-                   "--security-opt", "no-new-privileges",
+                   "--security-opt", "no-new-privileges", *_as_caller(),
                    PYTHON_DOCKER_IMAGE, "sh", "-c",
                    f"python -m venv {VENV_DIR} && "
                    f"{VENV_DIR}/bin/pip install -q --no-cache-dir "
@@ -534,7 +568,7 @@ def validate_python(workspace: str, backend: str = "",
         check = ["docker", "run", "--rm", "--network", "none",
                  "-v", f"{work}:/w:ro", "-w", "/w",
                  "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
-                 "--security-opt", "no-new-privileges",
+                 "--security-opt", "no-new-privileges", *_as_caller(),
                  PYTHON_DOCKER_IMAGE,
                  f"{VENV_DIR}/bin/mypy", "--disallow-untyped-defs",
                  "--no-error-summary", "--cache-dir=/tmp/.mypy_cache",
@@ -582,7 +616,7 @@ def validate_python(workspace: str, backend: str = "",
                        "mypy --disallow-untyped-defs accepted the generated code",
                        evidence=ev)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _remove_workdir(tmp)
 
 
 #: Pinned, same reasoning as the other images.
@@ -681,7 +715,7 @@ def validate_go(workspace: str, backend: str = "",
         install = ["docker", "run", "--rm",
                    "-v", f"{work}:/w", "-w", "/w"] + env + [
                    "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
-                   "--security-opt", "no-new-privileges",
+                   "--security-opt", "no-new-privileges", *_as_caller(),
                    GO_DOCKER_IMAGE, "go", "mod", "download", "all"]
         code, out, err = _run(install, work, INSTALL_TIMEOUT, None)
         ev["install_exit"] = code
@@ -697,7 +731,7 @@ def validate_go(workspace: str, backend: str = "",
         check = ["docker", "run", "--rm", "--network", "none",
                  "-v", f"{work}:/w:ro", "-w", "/w"] + env + [
                  "--memory", MEMORY_LIMIT, "--cpus", CPU_LIMIT,
-                 "--security-opt", "no-new-privileges",
+                 "--security-opt", "no-new-privileges", *_as_caller(),
                  GO_DOCKER_IMAGE, "go", "build", target]
         ev["typecheck"] = f"go build {target}"
 
@@ -724,7 +758,7 @@ def validate_go(workspace: str, backend: str = "",
             errors=[f"{r['file']}({r['line']}): {r['message']}" for r in rows],
             evidence=ev)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _remove_workdir(tmp)
 
 
 #: language -> runner. A language absent here is UNABLE_TO_VALIDATE, which is the
