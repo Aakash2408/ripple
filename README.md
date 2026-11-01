@@ -505,7 +505,7 @@ Get the template: `GET /config/template`
 
 ## Supported Change Types
 
-All 55 change types emitted by the 10 diff engines reach a fix handler, in one of
+All 56 change types emitted by the 10 diff engines reach a fix handler, in one of
 four categories. Not every category produces a finished fix, and the PR says
 which one it got:
 
@@ -534,11 +534,19 @@ which one it got:
 
 **GraphQL:**
 - [x] Field removed from type
-- [x] Field made non-nullable (String → String!)
+- [x] Query/Mutation/Subscription field removed (reported as a removed operation: call sites are marked, never deleted)
+- [x] Argument removed (queries that still pass it fail validation; only those queries are flagged, and the argument is marked, not deleted)
+- [x] Field type changed (`Int` → `String`, `ID!` → `Int!`, `[Post]` → `Post`), on fields and arguments
+- [x] Output field made nullable (`String!` → `String`: readers that assumed a value break)
+- [x] Input field or argument made non-null with no default (`String` → `String!`)
+- [x] Required field added to an input type, or required argument added
 - [x] Type removed
-- [x] Required argument added
 - [x] Enum value removed
 - [x] Union member removed
+
+Output fields made non-null (`String` → `String!`) are safe for readers and are not reported.
+
+For a newly required field, header or argument, consumers are found by what they call -- the endpoint (`POST /users`, matched only when the call uses that HTTP method) or the input type/table they build -- because the field itself is absent from exactly the consumers that break.
 
 **Database:**
 - [x] Column removed

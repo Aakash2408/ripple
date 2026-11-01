@@ -175,16 +175,25 @@ def generate_fixes(
     use_llm: bool = True,
     high_confidence_only: bool = True,
 ) -> list[GeneratedFix]:
-    """Generate fixes for all consumers."""
+    """Generate fixes for all consumers.
+
+    One fix per FILE. Consumers arrive one per matched line, and each fix is a
+    whole-file rewrite, so a file with two matching lines produced the same fix
+    twice -- two identical diffs, and a doubled count in every summary.
+    """
     fixes = []
-    
+    seen_files = set()
+
     for consumer in consumers:
         # Skip low-confidence matches
         if high_confidence_only and consumer.confidence != "high":
             continue
-        
+        if consumer.file_path in seen_files:
+            continue
+
         fix = generate_fix(consumer, breaking_change, use_llm=use_llm)
         if fix:
+            seen_files.add(consumer.file_path)
             fixes.append(fix)
     
     return fixes
@@ -524,8 +533,15 @@ def _generate_with_template(
     Works for the common case: "add a field to a JSON payload."
     """
     field_name = breaking_change.field_name
-    
-    if breaking_change.change_type in ("removed_field", "field_removed"):
+    # Branch on the CANONICAL operation, not the engine's dialect. This matched
+    # five literal strings, so response_field_removed, column_removed,
+    # member_removed, rpc_removed, endpoint_removed, required_argument_added
+    # and every other dialect the taxonomy maps returned "Unsupported change
+    # type": detected, then silence -- on the CLI and in the webhook fallback.
+    from .change_types import canonical_op
+    op = canonical_op(breaking_change.change_type or "")
+
+    if op == "remove_field":
         # Use the comprehensive template engine
         from .fix_templates import apply_fix_template
         fixed, explanation = apply_fix_template(
@@ -539,7 +555,7 @@ def _generate_with_template(
         # Fallback to basic line removal
         return _remove_field_references(original_code, field_name, consumer.language)
     
-    if breaking_change.change_type in ("field_renamed", "renamed_field"):
+    if op == "rename_field":
         from .fix_templates import apply_fix_template, annotate_references
         # Was getattr(breaking_change, 'new_name', '') on a dataclass with no
         # such field, so new_name was ALWAYS '' and this branch never fired --
@@ -571,7 +587,7 @@ def _generate_with_template(
             f"field '{field_name}' was renamed, but the diff engine did not "
             f"report the new name -- rename these references by hand.")
 
-    if breaking_change.change_type in ("field_type_changed", "type_changed"):
+    if op == "change_field_type":
         from .fix_templates import apply_fix_template, annotate_references
         # PRECEDENCE BUG: this read
         #     getattr(bc,'old_type','') or bc.field_type.split(...)[0] if COND else ''
@@ -617,8 +633,21 @@ def _generate_with_template(
             f"type of '{field_name}' changed, but the diff engine did not "
             f"report the old and new types -- verify these references.")
     
-    if breaking_change.change_type != "added_required_field":
-        return original_code, "Unsupported change type for template fix"
+    if op != "add_required":
+        if not op:
+            return original_code, "Unsupported change type for template fix"
+        # Every other operation (remove_type, remove_enum_value,
+        # remove_operation, restrict_schema, rename_type, remove_package,
+        # wire_incompatible) has its handler in fix_templates, which applies
+        # the safe part and marks the rest, or reports a wire-only break.
+        from .fix_templates import apply_fix_template
+        return apply_fix_template(
+            code=original_code,
+            language=consumer.language or "unknown",
+            change_type=breaking_change.change_type,
+            field_name=field_name,
+            new_name=breaking_change.new_name,
+        )
 
     # DELEGATE, like every other change type above. This branch used to carry
     # its own inline implementation for typescript/python/java, which was a
@@ -641,11 +670,13 @@ def _generate_with_template(
         language=consumer.language or "unknown",
         change_type="add_required",
         field_name=field_name,
-        site_hints=_call_site_hints(breaking_change),
+        site_hints=_call_site_hints(breaking_change, original_code,
+                                    consumer.language or "unknown"),
     )
 
 
-def _call_site_hints(breaking_change: BreakingChange) -> tuple[str, ...]:
+def _call_site_hints(breaking_change: BreakingChange, code: str = "",
+                     language: str = "unknown") -> tuple[str, ...]:
     """Anchors for locating the construction site of an affected request.
 
     add_required cannot anchor on the field: a newly required field is by
@@ -659,6 +690,26 @@ def _call_site_hints(breaking_change: BreakingChange) -> tuple[str, ...]:
     matched -- a spurious anchor costs a stray comment, never a code edit.
     """
     hints: list[str] = []
+    from .smart_consumer_finder import add_required_anchor
+    anchor, kind = add_required_anchor(breaking_change)
+    if kind == "symbol":
+        # Non-HTTP engines put the SPEC FILE in `path` and the containing
+        # type/table/struct in `method`; anchoring on `path` tagged lines
+        # mentioning `schema.graphql`, i.e. nothing. Same anchor the consumer
+        # finder used to decide this file is a consumer.
+        hints.append(anchor)
+        hints.extend(n for n in _field_variants(anchor) if n != anchor)
+        return tuple(hints)
+    if kind == "endpoint" and code:
+        # Anchor on the exact lines the consumer finder scored as calling THIS
+        # operation. The `/users` substring also tagged `get('/users')` and
+        # `/users/{id}` with "supply a value", and a GET sends no body.
+        from .smart_consumer_finder import find_endpoint_consumers
+        calls = [m.line_content for m in
+                 find_endpoint_consumers(code, "", anchor, language)
+                 if m.match_type == "endpoint_call"]
+        if calls:
+            return tuple(dict.fromkeys(calls))
     path = (breaking_change.path or "").strip()
     if path:
         hints.append(path)

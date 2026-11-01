@@ -38,15 +38,36 @@ def main():
         sys.exit(1)
 
 
+def diff_any(old_path: str, new_path: str):
+    """DiffResult from the engine for this spec type.
+
+    diff/scan/run called the OpenAPI engine for every file, so a .proto,
+    .graphql, .avsc, .thrift, .smithy, AsyncAPI, JSON Schema or SQL spec
+    crashed with a YAML traceback (or, for JSON, was silently diffed as
+    OpenAPI and reported nothing). The type comes from the file name, the same
+    rule `ripple impact` and the MCP server use; a name that names no type is
+    treated as OpenAPI, as before.
+    """
+    from .diff_engine import DiffResult, diff_specs
+    from .local_impact import contract_type_of, diff_contract
+
+    ctype = contract_type_of(new_path) or contract_type_of(old_path)
+    if not ctype or ctype == "openapi":
+        return diff_specs(old_path, new_path)
+    texts = [Path(p).read_text(encoding="utf-8") for p in (old_path, new_path)]
+    return DiffResult(old_spec_path=old_path, new_spec_path=new_path,
+                      breaking_changes=diff_contract(ctype, texts[0], texts[1],
+                                                     new_path))
+
+
 def cmd_diff():
     """Just detect breaking changes."""
     if len(sys.argv) < 4:
         print("Usage: ripple diff <old-spec> <new-spec>")
         sys.exit(1)
     
-    from .diff_engine import diff_specs
     
-    result = diff_specs(sys.argv[2], sys.argv[3])
+    result = diff_any(sys.argv[2], sys.argv[3])
     print(result.format())
     
     if result.has_breaking_changes:
@@ -59,7 +80,6 @@ def cmd_scan():
         print("Usage: ripple scan <old-spec> <new-spec> --repos <dir1> <dir2> ...")
         sys.exit(1)
     
-    from .diff_engine import diff_specs
     from .consumer_finder import find_consumers, format_consumers
     
     old_path = sys.argv[2]
@@ -80,7 +100,7 @@ def cmd_scan():
     print("━" * 60)
     print()
     
-    result = diff_specs(old_path, new_path)
+    result = diff_any(old_path, new_path)
     print(result.format())
     
     if not result.has_breaking_changes:
@@ -110,7 +130,6 @@ def cmd_run():
         print("Usage: ripple run <old-spec> <new-spec> --repos <dir1> <dir2> ...")
         sys.exit(1)
     
-    from .diff_engine import diff_specs
     from .consumer_finder import find_consumers, format_consumers
     from .fix_generator import generate_fixes, format_fixes
     from .pr_engine import create_prs, format_prs
@@ -136,7 +155,7 @@ def cmd_run():
     print("━" * 60)
     print()
     
-    result = diff_specs(old_path, new_path)
+    result = diff_any(old_path, new_path)
     print(result.format())
     
     if not result.has_breaking_changes:

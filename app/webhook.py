@@ -64,6 +64,7 @@ from .thrift_diff import diff_thrift
 from .jsonschema_diff import diff_jsonschema
 from .smithy_diff import diff_smithy
 from .change_types import is_wire_only, is_judgment, category as change_category
+from .smart_consumer_finder import consumer_query
 from .github_app_auth import (
     is_app_configured, get_installation_token,
     list_installation_repositories, AppAuthError,
@@ -1035,11 +1036,14 @@ async def bitbucket_webhook(request: FastAPIRequest):
                                                 event["repo_slug"], change.path)
                     if c.get("path") and c.get("path") != spec_path
                 ]
+                # Same query every other consumer search uses (see consumer_query).
+                _cq_target, _cq_vector = consumer_query(change)
                 admitted = _admit_consumers(
                     candidates,
                     lambda p: client.get_file(event["workspace"],
                                              event["repo_slug"], p),
-                    field_name=change.field_name,
+                    field_name=_cq_target,
+                    vector=_cq_vector,
                     language_of=_detect_lang,
                     max_consumers=5,
                     budget=_admission_budget,
@@ -1330,10 +1334,13 @@ async def gitlab_webhook(request: FastAPIRequest):
                 candidates = [c.get("path", "")
                               for c in client.search_code(event["project_id"], change.path)
                               if c.get("path") and c.get("path") != spec_path]
+                # Same query every other consumer search uses (see consumer_query).
+                _cq_target, _cq_vector = consumer_query(change)
                 admitted = _admit_consumers(
                     candidates,
                     lambda p: client.get_file(event["project_id"], p),
-                    field_name=change.field_name,
+                    field_name=_cq_target,
+                    vector=_cq_vector,
                     language_of=_detect_lang,
                     max_consumers=5,
                     budget=_admission_budget,
@@ -2634,7 +2641,8 @@ def _mmr_rerank(scored: list, limit: int, lambda_: float = _MMR_LAMBDA) -> list:
 
 def _admit_consumers(candidates, fetch, *, field_name: str, language_of,
                      max_consumers: int, budget: dict,
-                     candidate_window: int = _CANDIDATE_WINDOW) -> list:
+                     candidate_window: int = _CANDIDATE_WINDOW,
+                     vector: str = "symbol") -> list:
     """Read a bounded window of candidates, ADMIT on match strength, then cap.
 
     WHY THE ORDER MATTERS
@@ -2690,7 +2698,7 @@ def _admit_consumers(candidates, fetch, *, field_name: str, language_of,
             continue
         try:
             matches = find_matches_in_file(
-                content, path, field_name, language_of(path))
+                content, path, field_name, language_of(path), vector=vector)
         except Exception as exc:                                # noqa: BLE001
             _log_activity("admission_scoring_failed", {
                 "file": path, "err": f"{type(exc).__name__}: {str(exc)[:120]}"})
@@ -4663,12 +4671,18 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
     For monorepo support: exclude_path filters out the spec file itself
     so we don't try to 'fix' the spec that was just changed.
     """
-    from .smart_consumer_finder import generate_variants, file_is_consumer
+    from .smart_consumer_finder import (generate_variants, file_is_consumer,
+                                        consumer_query, search_terms_for)
     from urllib.parse import quote
     
-    # Generate search terms from the field name (not just the path)
-    field_name = change.field_name
-    variants = generate_variants(field_name)
+    # What to search for comes from the change, not change.field_name: for a
+    # newly required field that is the endpoint or type the consumer calls.
+    target, vector = consumer_query(change)
+    # The package vector keeps this path's existing symbol behaviour; the tree
+    # fallback below is what routes package deletions.
+    match_vector = vector if vector in ("endpoint", "argument") else "symbol"
+    field_name = target
+    variants = generate_variants(field_name) if match_vector == "symbol" else []
     
     # Search for ALL naming variants, not just the proto snake_case name.
     # GitHub code search treats phone_number / phoneNumber / PhoneNumber as
@@ -4683,6 +4697,8 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
             continue
         if v not in core_variants:
             core_variants.append(v)
+    if match_vector in ("endpoint", "argument"):
+        core_variants = [f'"{t}"' for t in search_terms_for(target, vector)]
     core_variants = core_variants[:4] or [field_name]
     
     term_query = " OR ".join(core_variants)
@@ -4726,7 +4742,8 @@ def _search_repo_for_consumers(repo: str, change: BreakingChange, token: str,
             
             # Smart filtering: only include if it's a REAL consumer (not just a comment)
             is_consumer, confidence, matches = file_is_consumer(
-                content, file_path, field_name, language, min_confidence=0.5
+                content, file_path, field_name, language, min_confidence=0.5,
+                vector=match_vector,
             )
             
             if is_consumer:
@@ -4762,15 +4779,14 @@ def _scan_repo_tree_for_consumers(
     closing connections. `budget` caps total content fetches per spec change
     and is reported when exhausted, so a truncated scan is never silent.
     """
-    from .smart_consumer_finder import file_is_consumer
-    from .change_types import vector_for
+    from .smart_consumer_finder import file_is_consumer, consumer_query
 
-    field_name = change.field_name
     # Derived from the change, not passed in, so no call site can forget to
     # route a package deletion. For vector="package", field_name is the deleted
     # PATH and consumers are importers of it or files that lived inside it --
-    # a symbol search over a path finds almost nothing.
-    vector = vector_for(change.change_type)
+    # a symbol search over a path finds almost nothing. For a newly required
+    # field it is the endpoint ("POST /users") or type the consumer calls.
+    field_name, vector = consumer_query(change)
     max_files = int(os.environ.get("RIPPLE_MAX_TREE_FILES", "40"))
     max_blob_bytes = int(os.environ.get("RIPPLE_MAX_BLOB_BYTES", "200000"))
 

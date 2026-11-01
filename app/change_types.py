@@ -159,6 +159,10 @@ CHANGE_TYPE_MAP = {
     "procedure_type_changed": "restrict_schema",
     "input_schema_changed": "restrict_schema",
     "additional_properties_restricted": "restrict_schema",
+    # GraphQL argument removed. JUDGMENT, not remove_field: deleting
+    # `limit: 10` from a query makes it valid again but silently changes what
+    # it returns (no limit = every row), so the call site is marked, not edited.
+    "argument_removed": "restrict_schema",
 
     # --- wire-only -------------------------------------------------------
     "field_number_changed": "wire_incompatible",   # proto

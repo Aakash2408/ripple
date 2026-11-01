@@ -80,6 +80,8 @@ GATES=(
     "tests/test_mcp_server.py"
     "tests/test_learned_edits.py"
     "tests/test_dry_run.py"
+    "tests/test_consumer_query.py"
+    "tests/test_contract_matrix.py"
     "tools/audit_diff_engines.py"
     "tools/audit_change_types.py"
     "tools/coverage_matrix.py"

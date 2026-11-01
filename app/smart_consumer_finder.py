@@ -533,6 +533,253 @@ def find_package_consumers(
     return matches
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# What to search for (ENDPOINT vector for newly required inputs)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A newly required field, header or argument is by definition ABSENT from
+# consumer code: the consumers that break are exactly the ones that never
+# wrote it. Searching for the field name therefore finds the consumers that
+# are already fine and misses every one that breaks -- measured on the three
+# POST /users consumers in tests/consumers: 0 of 3 found for `country`.
+#
+# The consumer is found by what it CALLS instead: the endpoint for HTTP
+# contracts, and the containing type/table/struct/channel for the others,
+# which every non-HTTP engine puts in BreakingChange.method.
+
+_HTTP_VERBS = ("get", "post", "put", "patch", "delete", "head", "options")
+
+
+def graphql_argument(field_name: str) -> tuple[str, str]:
+    """("users", "limit") for a GraphQL argument label "users(limit)", else
+    ("", ""). The diff engine labels argument changes this way; neither half is
+    something to search for as a whole string."""
+    field = (field_name or "").strip()
+    if "(" in field and field.endswith(")"):
+        op, arg = field[:-1].split("(", 1)
+        if op.strip() and arg.strip():
+            return op.strip(), arg.strip()
+    return "", ""
+
+
+def graphql_argument_sites(content: str, target: str) -> list[int]:
+    """0-based line numbers where a call to the GraphQL field passes the
+    argument: `users(limit: 10)`, or `limit: $limit` on its own line inside a
+    multi-line `users(...)`. Empty when the field is only called without it --
+    that query is unaffected by the argument's removal.
+
+    The ONE rule for this change: the consumer finder admits a file by it and
+    the fixer marks exactly these lines, so they cannot disagree.
+    """
+    op, arg = graphql_argument(target)
+    if not op:
+        return []
+    op_rx = re.compile(r'(?<![\w.$])' + re.escape(op) + r'\s*\(')
+    arg_rx = re.compile(r'(?<![\w.])\$?' + re.escape(arg) + r'\s*:')
+    lines = set()
+    for m in op_rx.finditer(content):
+        line_start = content.rfind("\n", 0, m.start()) + 1
+        line_end = content.find("\n", m.start())
+        line = content[line_start:line_end if line_end != -1 else None]
+        if _is_comment(line.strip(), "unknown"):
+            continue
+        depth, end = 0, None
+        for i in range(m.end() - 1, min(len(content), m.end() + 4000)):
+            ch = content[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            continue
+        for a in arg_rx.finditer(content, m.end(), end):
+            lines.add(content.count("\n", 0, a.start()))
+    return sorted(lines)
+
+
+def find_argument_consumers(
+    file_content: str,
+    file_path: str,
+    target: str,
+    language: str,
+    min_confidence: float = 0.5,
+) -> list[SmartMatch]:
+    """Lines that pass a removed GraphQL argument ("users(limit)")."""
+    src = file_content.split("\n")
+    out = [SmartMatch(file_path=file_path, line_number=i + 1,
+                      line_content=src[i].strip(), match_type="argument_passed",
+                      confidence=0.90, variant_matched=target)
+           for i in graphql_argument_sites(file_content, target)]
+    return [m for m in out if m.confidence >= min_confidence]
+
+
+def add_required_anchor(change) -> tuple[str, str]:
+    """(anchor, kind) naming what an add_required consumer calls or constructs.
+
+    kind is "endpoint" (anchor "POST /users") for an HTTP operation, "symbol"
+    for a type/table/operation name, or "" when the change names nothing a
+    consumer would write (e.g. a JSON Schema root), so callers keep their old
+    behaviour rather than search for a guess.
+
+    Shared by the consumer finder and fix_generator._call_site_hints, so the
+    file Ripple decides is a consumer and the line it then annotates come from
+    the same rule.
+    """
+    path = (change.path or "").strip()
+    method = (change.method or "").strip()
+    field = (change.field_name or "").strip()
+    if path.startswith("/") and method.lower() in _HTTP_VERBS:
+        return f"{method.upper()} {path}", "endpoint"
+    # GraphQL argument: field_name is "users(offset)"; the consumer names the
+    # operation field `users`, not its parent type `Query`.
+    op, _arg = graphql_argument(field)
+    if op:
+        return op, "symbol"
+    if (method and method.lower() not in ("root", "") + _HTTP_VERBS
+            and not method.startswith("/")):
+        return method, "symbol"
+    return "", ""
+
+
+def consumer_query(change) -> tuple[str, str]:
+    """(target, vector) to search consumers for, derived from the change.
+
+    Every consumer search -- the CLI directory walk, the GitHub search and tree
+    scan, GitLab/Bitbucket admission -- calls this instead of reading
+    change.field_name directly, so no entry point can go back to searching for
+    a field that the breaking consumers do not contain.
+    """
+    from .change_types import canonical_op, vector_for
+
+    try:
+        op = canonical_op(change.change_type)
+    except Exception:                                           # noqa: BLE001
+        op = ""
+    if op == "add_required":
+        anchor, kind = add_required_anchor(change)
+        if anchor:
+            return anchor, kind
+    if op == "restrict_schema":
+        # A removed GraphQL argument: only queries that still PASS it break,
+        # so search for that, not every use of the field. "users(limit)" as a
+        # literal is in no file; the argument vector matches it structurally.
+        gql_op, _arg = graphql_argument(change.field_name)
+        if gql_op:
+            return change.field_name.strip(), "argument"
+    try:
+        vector = vector_for(change.change_type)
+    except Exception:                                           # noqa: BLE001
+        vector = "symbol"
+    return (change.field_name or change.path), vector
+
+
+def search_terms_for(target: str, vector: str) -> list[str]:
+    """Plain-text terms a platform code search should be given for a query.
+
+    For an endpoint that is the static path prefix (`/users` for
+    `/users/{id}`): code search indexes literals, and the parameter part is
+    written differently by every consumer.
+    """
+    if vector == "endpoint":
+        path = target.split(" ", 1)[-1]
+        static = path.split("{", 1)[0].rstrip("/") or path
+        return [static]
+    if vector == "argument":
+        # Code search indexes the field name; the argument is matched after.
+        return [graphql_argument(target)[0] or target]
+    return [target]
+
+
+def _endpoint_path_regex(path: str) -> "re.Pattern":
+    """Regex for an OpenAPI path as consumers write it.
+
+    `{param}` matches one built segment (`123`, `${id}`, `{user_id}`) or the
+    end of a string literal, for `"/users/" + id`. The path must END at a
+    non-path character, so `/users` does not match `/users/{id}` or
+    `/usersettings` -- a different operation. A prefix is allowed, so a
+    consumer that writes the full `/api/v1/users` still matches.
+    """
+    parts = re.split(r"(\{[^}]+\})", path.rstrip("/") or "/")
+    rx = ""
+    for part in parts:
+        if part.startswith("{") and part.endswith("}"):
+            rx += r"(?:[^/\s\"'`?#]+|(?=[\"'`]))"
+        else:
+            rx += re.escape(part)
+    return re.compile(rx + r"(?![\w/{$-])")
+
+
+def _verbs_in(line: str) -> set:
+    """HTTP verbs a line expresses: `.post(`, `"POST"`, `@PostMapping`,
+    `http.MethodPost`, `HttpMethod.POST`, Java `.POST(`."""
+    found = set()
+    for v in _HTTP_VERBS:
+        cap = v.capitalize()
+        if (re.search(rf"(?i)(?:\.|\b){v}\s*\(", line)
+                or re.search(rf"(?i)[\"']{v}[\"']", line)
+                or re.search(rf"@{cap}Mapping\b", line)
+                or re.search(rf"\bMethod{cap}\b", line)
+                or re.search(rf"(?i)HttpMethod\.{v}\b", line)):
+            found.add(v)
+    return found
+
+
+def find_endpoint_consumers(
+    file_content: str,
+    file_path: str,
+    target: str,
+    language: str,
+    min_confidence: float = 0.5,
+) -> list[SmartMatch]:
+    """Lines that call the HTTP operation `target` ("POST /users").
+
+    Scoring is by which verb the call uses, read from the same line first and
+    otherwise from the nearest 3 lines either side (builders such as Java's
+    HttpRequest put `.uri(...)` and `.POST(...)` on separate lines):
+
+        the target verb                  0.90  endpoint_call
+        no verb anywhere nearby          0.60  endpoint_ref   (cannot tell)
+        only OTHER verbs                 0.30  endpoint_other_method
+
+    The last band is below every caller's floor on purpose: `get('/users')`
+    does not send the POST body, so it is not broken by a new required field.
+    """
+    verb, _, path = target.partition(" ")
+    verb = verb.lower()
+    if not path:
+        return []
+    rx = _endpoint_path_regex(path)
+    lines = file_content.split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or _is_comment(stripped, language):
+            continue
+        if not rx.search(line):
+            continue
+        verbs = _verbs_in(line)
+        if not verbs:
+            for j in range(max(0, i - 3), min(len(lines), i + 4)):
+                if j != i and not _is_comment(lines[j].strip(), language):
+                    verbs |= _verbs_in(lines[j])
+        if verb in verbs:
+            kind, conf = "endpoint_call", 0.90
+        elif not verbs:
+            kind, conf = "endpoint_ref", 0.60
+        else:
+            kind, conf = "endpoint_other_method", 0.30
+        if conf >= min_confidence:
+            out.append(SmartMatch(
+                file_path=file_path, line_number=i + 1, line_content=stripped,
+                match_type=kind, confidence=conf, variant_matched=path,
+            ))
+    out.sort(key=lambda m: m.confidence, reverse=True)
+    return out
+
+
 def find_matches_in_file(
     file_content: str,
     file_path: str,
@@ -567,6 +814,14 @@ def find_matches_in_file(
     """
     if vector == "package":
         return find_package_consumers(
+            file_content, file_path, target, language, min_confidence
+        )
+    if vector == "endpoint":
+        return find_endpoint_consumers(
+            file_content, file_path, target, language, min_confidence
+        )
+    if vector == "argument":
+        return find_argument_consumers(
             file_content, file_path, target, language, min_confidence
         )
     return find_field_consumers(

@@ -1323,6 +1323,44 @@ def apply_fix_template(
         return result, explanation
 
     elif op == 'restrict_schema':
+        from .smart_consumer_finder import graphql_argument, graphql_argument_sites
+        gql_op, gql_arg = graphql_argument(field_name)
+        if gql_arg:
+            # A removed GraphQL argument. Only a query that still PASSES it
+            # breaks; the lines come from the same rule the consumer finder
+            # admitted this file by. A file that calls the field without it
+            # is unaffected and gets no marker.
+            note = (f"argument '{gql_arg}' was removed from '{gql_op}' -- "
+                    f"drop it (and its variable, if now unused); check the "
+                    f"result is still what you want without it.")
+            sites = set(graphql_argument_sites(code, field_name))
+            if not sites:
+                return code, (f"No change: this file calls '{gql_op}' but never "
+                              f"passes argument '{gql_arg}', so it is unaffected.")
+            src = code.split('\n')
+            out, marked = [], 0
+            for i, line in enumerate(src):
+                if i in sites and not (out and MARKER in out[-1]):
+                    # Inside a query string (`gql\`...\``, a """ block) the
+                    # marker is GraphQL text, and GraphQL comments are `#`:
+                    # a `//` line there would make the query itself invalid.
+                    before = '\n'.join(src[:i])
+                    in_doc = (before.count('`') % 2 == 1
+                              or before.count('"""') % 2 == 1)
+                    token = '#' if in_doc else _comment_token(lang)
+                    indent = line[:len(line) - len(line.lstrip())]
+                    out.append(f"{indent}{token} {MARKER}: {note}")
+                    marked += 1
+                out.append(line)
+            if not marked:          # every site already carries a marker
+                return code, (f"No change: argument '{gql_arg}' sites are "
+                              f"already marked.")
+            explanation = (
+                f"PARTIAL: argument '{gql_arg}' was removed from '{gql_op}'. "
+                f"Marked {marked} site(s) with {MARKER}. Ripple did NOT delete "
+                f"the argument: the query would then run without it and could "
+                f"return different data.")
+            return '\n'.join(out), explanation
         note = (f"schema for '{field_name}' was narrowed (signature/type/"
                 f"additionalProperties) -- verify this call still satisfies it.")
         result, sites = _annotate_sites(code, _symbol_names(variants), lang, note)

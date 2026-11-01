@@ -229,6 +229,29 @@ def diff_specs(old_path: str, new_path: str) -> DiffResult:
                     severity="breaking",
                     description=f"Response field '{field_name}' was removed. Consumers reading this field will get null/undefined.",
                 ))
+
+            # Response field type changed: consumers parse the old type. The
+            # request-body check above never looked at responses, so
+            # `age: integer -> string` in a returned schema was invisible.
+            old_rprops = _get_response_properties(old_operation, old_spec)
+            new_rprops = _get_response_properties(operation, new_spec)
+            for field_name in sorted(set(old_rprops) & set(new_rprops)):
+                o, n = old_rprops[field_name], new_rprops[field_name]
+                old_type = o.get("type", "") if isinstance(o, dict) else ""
+                new_type = n.get("type", "") if isinstance(n, dict) else ""
+                if old_type and new_type and old_type != new_type:
+                    result.breaking_changes.append(BreakingChange(
+                        change_type="field_type_changed",
+                        path=path,
+                        method=method,
+                        field_name=field_name,
+                        field_type=f"{old_type} -> {new_type}",
+                        old_type=old_type,
+                        new_type=new_type,
+                        location="response_body",
+                        severity="breaking",
+                        description=f"Response field '{field_name}' type changed from '{old_type}' to '{new_type}'. Consumers parsing the old type will break.",
+                    ))
     
     # Detect required headers added
     for path, methods in new_paths.items():
@@ -338,6 +361,11 @@ def _get_body_properties(operation: dict, spec: dict) -> dict:
 
 def _get_response_fields(operation: dict, spec: dict) -> set:
     """Get all field names from the 200/201 response schema."""
+    return set(_get_response_properties(operation, spec))
+
+
+def _get_response_properties(operation: dict, spec: dict) -> dict:
+    """{name: property schema} of the 200/201 response schema."""
     responses = operation.get("responses", {})
     for status in ["200", "201", "2XX"]:
         if status in responses:
@@ -350,8 +378,9 @@ def _get_response_fields(operation: dict, spec: dict) -> set:
                     schema = content[media_type].get("schema", {})
                     if "$ref" in schema:
                         schema = _resolve_ref(schema["$ref"], spec)
-                    return set(schema.get("properties", {}).keys())
-    return set()
+                    props = schema.get("properties", {})
+                    return props if isinstance(props, dict) else {}
+    return {}
 
 
 def _get_required_parameters(operation: dict, spec: dict, location: str) -> set:

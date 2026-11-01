@@ -56,8 +56,7 @@ def find_consumers(
     matching.
     """
     from app.languages import detect as _detect, is_scannable
-    from app.smart_consumer_finder import find_matches_in_file
-    from app.change_types import vector_for
+    from app.smart_consumer_finder import find_matches_in_file, consumer_query
 
     if exclude_patterns is None:
         exclude_patterns = [
@@ -65,13 +64,10 @@ def find_consumers(
             "vendor", ".venv", "target", ".gradle",
         ]
 
-    # The symbol production searches for, and the vector derived FROM the change
-    # rather than passed in -- the same rule the webhook uses.
-    target = breaking_change.field_name or breaking_change.path
-    try:
-        vector = vector_for(breaking_change.change_type)
-    except Exception:
-        vector = "symbol"
+    # What production searches for, derived FROM the change by the same
+    # function the webhook uses. For a newly required field that is the
+    # endpoint or type the consumer calls, not the field it has not written.
+    target, vector = consumer_query(breaking_change)
 
     matches: list[ConsumerMatch] = []
 
