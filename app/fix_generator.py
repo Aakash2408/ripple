@@ -1042,7 +1042,13 @@ def _mark_field_references(code: str, field_name: str, language: str,
     """Marker-only answer for a removed field: annotate each CODE reference
     (not strings or comments), delete nothing. Unchanged when there is none --
     a file with no reference is not a consumer, and a file-top marker would
-    open a PR that says nothing."""
+    open a PR that says nothing.
+
+    Capped at 5 individual markers. Beyond that a file-top summary names the
+    total; a reviewer cannot act on line-level markers when every other line
+    has one (measured: `status` produced 757 markers on saleor 3093be1b7).
+    """
+    MAX_MARKERS = 5
     from .fix_templates import (MARKER, _STR_LITERAL, _comment_token,
                                 _matches_symbol, _symbol_names, name_variants)
     from .fix_templates import embedded_graphql_docs
@@ -1069,17 +1075,25 @@ def _mark_field_references(code: str, field_name: str, language: str,
             continue
         if _matches_symbol(_STR_LITERAL.sub('""', line), names):
             targets.add(i)
+    total = len(targets)
+    if not total:
+        return code, f"No change: no code reference to '{field_name}' ({why})."
+    mark_individually = sorted(targets)[:MAX_MARKERS]
+    mark_set = set(mark_individually)
     out, sites = [], 0
+    if total > MAX_MARKERS:
+        out.append(f"{token} {MARKER}: {note} ({total} sites in this file; "
+                   f"showing the first {MAX_MARKERS} below.)")
+        sites += 1
+        out.append("")
     for i, line in enumerate(src):
-        if i in targets and not (out and MARKER in out[-1]):
+        if i in mark_set and not (out and MARKER in out[-1]):
             indent = line[:len(line) - len(line.lstrip())]
             out.append(f"{indent}{token} {MARKER}: {note}")
             sites += 1
         out.append(line)
-    if not sites:
-        return code, f"No change: no code reference to '{field_name}' ({why})."
     return "\n".join(out), (
-        f"PARTIAL: marked {sites} reference(s) to removed field '{field_name}' "
+        f"PARTIAL: marked {total} reference(s) to removed field '{field_name}' "
         f"with {MARKER}. Ripple did NOT delete them: {why}, so an automated "
         f"edit could break the file.")
 

@@ -68,6 +68,7 @@ jobs:
           python tests/test_operation_sites.py
           python tests/test_real_repo_bugs.py
           python tests/test_saleor_rerun_bugs.py
+          python tests/test_marker_cap_and_graphql_proven.py
 
       - name: Diff-engine audit
         # Fails if any engine regains a non-nesting block regex or loses

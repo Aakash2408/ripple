@@ -248,15 +248,26 @@ def test_graphql_files_are_scanned_but_schemas_never_match():
 
 
 def test_graphql_remove_field_removes_selections_not_lines():
+    # With proven-only removal, all `email` selections in this document sit
+    # inside `me { ... }` -- a sub-selection whose type the document does not
+    # state -- so nothing is removed. The comment, the $email variable and
+    # the filter argument are unaffected in both the old and new code.
     out, _ = apply_fix_template(_DOC, "graphql", "field_removed", "email")
-    assert out == ('# show email here\n'
-                   'query Me($email: String) {\n'
-                   '  me {\n'
-                   '    id\n'
-                   '    posts(filter: {email: $email}) { id }\n'
-                   '    profile { avatar }\n'
-                   '  }\n'
-                   '}\n'), out
+    assert out == _DOC, (
+        "email in a sub-selection should NOT be removed (type unproven):\n" + out)
+
+
+def test_graphql_remove_field_proven_fragment():
+    """A fragment typed on User proves the selection; email is removed."""
+    doc = ('fragment F on User {\n'
+           '  id\n'
+           '  email\n'
+           '  name\n'
+           '}\n')
+    out, _ = apply_fix_template(doc, "graphql", "field_removed", "email")
+    assert 'email' not in out
+    assert 'id' in out
+    assert 'name' in out
 
 
 def test_cli_walk_finds_graphql_query_files():

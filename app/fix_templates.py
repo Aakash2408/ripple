@@ -477,42 +477,89 @@ def _graphql_removal_is_exact(before: str, after: str, field: str,
 
 
 def _remove_field_graphql(code: str, variants: dict[str, str]) -> str:
-    """Remove a field's SELECTIONS from a GraphQL operation document.
+    """Remove a field's SELECTIONS from a GraphQL operation document, but ONLY
+    where the document PROVES which type the selection belongs to.
 
-    Which names are selections comes from operation_sites.graphql_selections,
-    the parser the consumer finder admits the file by, so an argument or input
-    name (`email: $email`), a variable, a string, a comment or anything inside
-    parentheses is never touched. Each selection is removed with its alias,
-    arguments, directives and sub-selection -- not its line: `{ id email }`
-    keeps `id`, where the generic line remover deleted both. A line left
-    empty by the removal is dropped.
+    A selection directly inside `fragment X on Owner { ... }` or `... on Owner`
+    is provably on `Owner`; it is removed structurally using the same
+    `remove_graphql_selections` that handles gql strings in TS/JS. A selection
+    inside a field's sub-selection (`order { status }`) belongs to whatever type
+    `order` returns, which only the schema knows -- removing it could delete a
+    same-named field on an unrelated type. Those get markers instead.
+
+    Measured on saleor 3093be1b7: `type` and `status` sat inside field
+    sub-selections and were left alone (the correct answer -- safe but undone).
+    Before this, _remove_field_graphql removed EVERY selection regardless of
+    provability, which is the defect that produced 1,500 wrong fixes.
     """
-    from .operation_sites import graphql_selections
     names = {n for n in (variants.get('literal'), variants.get('camel')) if n}
-    spans = []
-    for off, _kind, name, _depth in graphql_selections(code):
-        if name not in names:
+    if not names:
+        return code
+    # Try each name; take the first that removes anything.
+    for name in names:
+        # We need an owner to prove the type. In a .graphql file, the owner is
+        # the fragment's type condition or the operation root type. Pass "" as
+        # owner: remove_graphql_selections uses graphql_typed_selections, which
+        # tags each selection with its enclosing type. We match ANY enclosing
+        # type -- we just need it to be provable.
+        result, removed, unproven = _remove_graphql_proven(code, name)
+        if removed:
+            _LAST_CODEMOD_RESULT.clear()
+            _LAST_CODEMOD_RESULT.update(
+                language="graphql", refusals=[], edits=[],
+                notes=(
+                    [f"{unproven} selection(s) of '{name}' could not be proved "
+                     f"safe to remove (inside a sub-selection whose type is not "
+                     f"stated); left in place."] if unproven else []),
+                diff_violations=[])
+            return result
+    return code
+
+
+def _remove_graphql_proven(code: str, field: str) -> tuple[str, int, int]:
+    """Remove selections of `field` from a .graphql document, ONLY where the
+    enclosing type is provable (fragment type condition or inline fragment).
+
+    Returns (code, removed, unproven). Any selection whose type is not proven
+    (inside a field's sub-selection) is counted in unproven and left alone.
+    """
+    from .operation_sites import graphql_typed_selections
+    cuts, unproven = [], 0
+    for off, _kind, name, _depth, ctx in graphql_typed_selections(code):
+        if name != field:
             continue
-        line_start = code.rfind('\n', 0, off) + 1
-        alias = re.search(r'[_A-Za-z]\w*\s*:\s*$', code[line_start:off])
-        start = line_start + alias.start() if alias else off
-        j = _skip_balanced(code, off + len(name), '(', ')')      # arguments
-        while True:                                                 # directives
+        if ctx is None:
+            # Inside a field's sub-selection -- type unknown from the document.
+            unproven += 1
+            continue
+        # ctx is the enclosing type (fragment type condition, inline fragment,
+        # or operation root). Provably on that type -- remove it.
+        a = off
+        line_start = code.rfind('\n', 0, a) + 1
+        alias = re.search(r'[_A-Za-z]\w*\s*:\s*$', code[line_start:a])
+        s0 = line_start + alias.start() if alias else a
+        j = _skip_balanced(code, a + len(name), '(', ')')
+        while True:
             d = re.match(r'\s*@\w+(?:\s*\([^)]*\))?', code[j:])
             if not d:
                 break
             j += d.end()
-        j = _skip_balanced(code, j, '{', '}')                     # sub-selection
-        spans.append((start, j))
-    if not spans:
-        return code
-    text = code
-    for start, end in sorted(spans, reverse=True):
-        text = text[:start] + text[end:]
+        j = _skip_balanced(code, j, '{', '}')
+        cuts.append((s0, j))
+    if not cuts:
+        return code, 0, unproven
+    out = code
+    for s0, j in sorted(cuts, reverse=True):
+        out = out[:s0] + out[j:]
+    # Verify: no empty selection sets and the removal is exact.
     old_lines = set(code.split('\n'))
-    kept = [ln for ln in text.split('\n') if ln.strip() or ln in old_lines]
-    return '\n'.join(ln if ln in old_lines else re.sub(r'(\S)[ \t]{2,}(?=\S)', r'\1 ', ln)
-                     for ln in kept)
+    kept = [ln for ln in out.split('\n') if ln.strip() or ln in old_lines]
+    out = '\n'.join(ln if ln in old_lines
+                    else re.sub(r'(\S)[ \t]{2,}(?=\S)', r'\1 ', ln) for ln in kept)
+    if not _graphql_removal_is_exact(code, out, field, len(cuts),
+                                      [(0, len(code))]):
+        return code, 0, unproven + len(cuts)
+    return out, len(cuts), unproven
 
 
 REMOVE_HANDLERS: dict[str, Callable[[str, dict[str, str]], str]] = {
@@ -1053,7 +1100,8 @@ def _matches_symbol(line: str, names: set) -> bool:
     )
 
 
-def _insert_markers(code: str, matches, lang: str, note: str) -> tuple[str, int]:
+def _insert_markers(code: str, matches, lang: str, note: str,
+                    max_markers: int = 5) -> tuple[str, int]:
     """Insert `note` as a marker comment above every line `matches(line)`
     accepts. Returns (annotated_code, sites_annotated).
 
@@ -1064,6 +1112,13 @@ def _insert_markers(code: str, matches, lang: str, note: str) -> tuple[str, int]
     line the string opens on instead, once per string. Measured on
     saleor-dashboard: a type change marked `name` inside two GraphQL
     documents this way.
+
+    When more than `max_markers` sites match, only the first `max_markers` are
+    marked individually and a summary is inserted at the top of the file. On
+    saleor 3093be1b7 `status` matched 757 lines, producing 757 markers that
+    were pure noise -- a reviewer cannot act on line-level markers when every
+    other line has one. The cap makes the output scannable while keeping the
+    count accurate for the explanation.
     """
     from .operation_sites import multiline_string_opens
     opens = multiline_string_opens(code)
@@ -1079,14 +1134,28 @@ def _insert_markers(code: str, matches, lang: str, note: str) -> tuple[str, int]
             continue
         if matches(line):
             targets.add(opens.get(i, i))
+    total = len(targets)
+    if total == 0:
+        return code, 0
+    # When the count exceeds the cap, mark only the first N individually and
+    # put a summary at the file top.
+    mark_individually = sorted(targets)[:max_markers]
+    mark_set = set(mark_individually)
     out, count = [], 0
+    if total > max_markers:
+        out.append(f"{token} {MARKER}: {note} ({total} sites in this file; "
+                   f"showing the first {max_markers} below.)")
+        count += 1
+        # A blank line separates the summary from the code so the first
+        # individual marker is not suppressed by the consecutive-MARKER guard.
+        out.append("")
     for i, line in enumerate(src):
-        if i in targets and not (out and MARKER in out[-1]):
+        if i in mark_set and not (out and MARKER in out[-1]):
             indent = line[:len(line) - len(line.lstrip())]
             out.append(f"{indent}{token} {MARKER}: {note}")
             count += 1
         out.append(line)
-    return '\n'.join(out), count
+    return '\n'.join(out), total
 
 
 def _annotate_sites(code: str, names: set, lang: str, note: str) -> tuple[str, int]:

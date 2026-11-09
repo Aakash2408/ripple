@@ -550,7 +550,7 @@ For a newly required field, header or argument, consumers are found by what they
 
 A removed operation is found in the shape consumers actually write it: an endpoint as an HTTP call using that verb, an AsyncAPI channel as a quoted literal, a SQL table inside a query string or as an ORM table name, a GraphQL root field as a root selection in an operation of the right kind (`me { orders }` and a REST call to `/orders` do not count). A call is commented out with a marker; anything that only names the operation (a built URL, `__tablename__`, a topic constant, a GraphQL selection) is marked and left running, and nothing is ever inserted inside a query string.
 
-Client `.graphql`/`.gql` operation documents (queries, mutations, fragments) are scanned as consumers; schema files never are. A removed field is taken out of each selection set with its alias, arguments and sub-selection, leaving the rest of the line intact.
+Client `.graphql`/`.gql` operation documents (queries, mutations, fragments) are scanned as consumers; schema files never are. A removed field is taken out of each selection set only where the document proves which type it belongs to (directly inside `fragment X on Owner` or `... on Owner`); a field inside a sub-selection (`order { status }`) whose type only the schema knows is left alone. In TypeScript/JavaScript, the same rule applies inside `gql` tagged templates. Generic field names (`status`, `target`, `password`) that match many lines in a file are capped at 5 individual markers with a file-level summary showing the true count.
 
 **Database:**
 - [x] Column removed
